@@ -31,9 +31,10 @@ class RequestIdMiddleware:
 
             async def send_wrapper(message: MutableMapping[str, Any]) -> None:
                 if message.get("type") == "http.response.start":
-                    headers = list(message.get("headers", []))
-                    headers.append((b"x-request-id", request_id.encode("utf-8")))
-                    message = {**message, "headers": headers}
+                    # ASGI 메시지는 가변 dict — 리스트·dict 사본 없이 제자리에서 추가한다.
+                    message.setdefault("headers", []).append(
+                        (b"x-request-id", request_id.encode("utf-8"))
+                    )
                 await send(message)
 
             await self.app(scope, receive, send_wrapper)

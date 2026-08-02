@@ -51,9 +51,6 @@ class FakeRedis:
         self.kv[key] = value
         return True
 
-    def pubsub(self):
-        raise NotImplementedError("FakeRedis는 pubsub 컨슈머를 흉내내지 않는다")
-
     async def delete(self, *keys):
         if self._fail_delete_substr is not None and any(
             self._fail_delete_substr in k for k in keys
@@ -91,6 +88,12 @@ class FakeRedis:
             raise ConnectionError("redis down")
         self.published.append((channel, message))
         return 1
+
+    async def evalsha(self, sha, numkeys, *args):
+        # 항상 빈 스크립트 캐시를 흉내낸다 — 호출부의 EVAL 폴백(재로드) 경로가 테스트에서 돈다.
+        from redis.exceptions import NoScriptError
+
+        raise NoScriptError()
 
     async def eval(self, script, numkeys, *args):
         keys = args[:numkeys]

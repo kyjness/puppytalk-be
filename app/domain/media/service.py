@@ -1,13 +1,13 @@
 # 미디어 비즈니스 로직. 순수 데이터 반환·커스텀 예외. HTTP·ApiResponse 없음. Full-Async.
 
-import asyncio
+
 import logging
 import secrets
 from collections.abc import Awaitable, Callable
-from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from app.common.exceptions import (
     ImageNotFoundException,
@@ -18,6 +18,7 @@ from app.common.exceptions import (
 from app.core.config import settings
 from app.core.ids import new_uuid7
 from app.domain.media.image_policy import (
+    CONTENT_TYPE_EXT,
     build_pending_file_key,
     sanitize_presign_filename,
     validate_image_content_type,
@@ -31,7 +32,8 @@ from app.domain.media.schema import (
     PresignUploadResponse,
     SignupImageUploadData,
 )
-from app.infra.redis import RedisLike
+from app.infra.lock import release_lock, try_acquire_lock
+from app.infra.redis import RedisLike, bulk_to_str
 from app.infra.storage import (
     build_url,
     head_pending_object,
@@ -49,21 +51,6 @@ _JOB_LOCK_SIGNUP_CLEANUP = "lock:media-signup-cleanup"
 _JOB_LOCK_TTL_SECONDS = 600
 
 
-async def _release_job_lock(redis: Any, *, lock_key: str, lock_value: str) -> None:
-    """락 소유자만 해제(compare-and-delete)."""
-    try:
-        await redis.eval(
-            "if redis.call('GET', KEYS[1]) == ARGV[1] then "
-            "return redis.call('DEL', KEYS[1]) else return 0 end",
-            1,
-            lock_key,
-            lock_value,
-        )
-    except Exception as e:
-        # TTL 기반 자동 해제를 신뢰하고, 실패 시 경고만 남긴다.
-        logger.warning("job lock release failed key=%s err=%s", lock_key, e)
-
-
 async def _try_acquire_job_lock(
     redis: RedisLike | None,
     *,
@@ -75,10 +62,8 @@ async def _try_acquire_job_lock(
         # Redis 미사용 환경은 단일 노드 개발 모드로 간주하고 작업을 진행한다.
         return True, None
     try:
-        r = cast(Any, redis)
-        lock_value = secrets.token_urlsafe(24)
-        acquired = bool(await r.set(lock_key, lock_value, nx=True, ex=ttl_seconds))
-        return acquired, (lock_value if acquired else None)
+        lock_value = await try_acquire_lock(redis, lock_key, ttl_seconds)
+        return (lock_value is not None), lock_value
     except Exception as e:
         # 스케줄러 작업의 보수적 가용성: RedisLike 장애 시 락 없이 진행.
         logger.warning("job lock unavailable key=%s fallback_without_lock err=%s", lock_key, e)
@@ -110,7 +95,7 @@ async def _keyset_cleanup(
         deletable_ids: list[UUID] = []
         for img in rows:
             try:
-                await asyncio.to_thread(storage_delete, img.file_key)
+                await run_in_threadpool(storage_delete, img.file_key)
                 deletable_ids.append(img.id)
             except Exception as e:
                 on_delete_failed(img, e)
@@ -131,7 +116,7 @@ class MediaService:
         safe_name = sanitize_presign_filename(body.filename, content_type)
         upload_id = new_uuid7()
         file_key = build_pending_file_key(upload_id, safe_name)
-        url, fields, _ = await issue_presigned_post(file_key, content_type)
+        url, fields = await issue_presigned_post(file_key, content_type)
         return PresignUploadResponse(url=url, fields=fields, file_key=file_key)
 
     @classmethod
@@ -156,7 +141,9 @@ class MediaService:
             raise InvalidImageFileException(message="Reported size does not match stored object.")
         validate_image_content_type(str(meta.get("ContentType") or ""))
         try:
-            dest_key, size, content_type = await promote_pending_object(key, purpose)
+            dest_key, size, content_type = await promote_pending_object(
+                key, purpose, ext_by_content_type=CONTENT_TYPE_EXT
+            )
         except ValueError as e:
             raise InvalidImageFileException(message="Uploaded object is missing or invalid.") from e
         # presign URL(15분)이 살아 있는 동안 head~promote 사이 재업로드로 위 검증을 우회할 수
@@ -169,7 +156,7 @@ class MediaService:
             validate_image_content_type(content_type)
         except Exception:
             try:
-                await asyncio.to_thread(storage_delete, dest_key)
+                await run_in_threadpool(storage_delete, dest_key)
             except Exception:
                 logger.warning("승격 후 검증 실패분 삭제 실패 dest_key=%s", dest_key)
             raise
@@ -201,7 +188,7 @@ class MediaService:
                 return ImageUploadResponse.model_validate(image)
         except Exception:
             try:
-                await asyncio.to_thread(storage_delete, dest_key)
+                await run_in_threadpool(storage_delete, dest_key)
             except Exception as rollback_e:
                 logger.warning(
                     "Rollback storage delete failed after confirm_presigned_upload DB error "
@@ -244,7 +231,7 @@ class MediaService:
                 if image is not None:
                     async with db.begin():
                         await MediaModel.delete_images_by_ids([image.id], db=db)
-                await asyncio.to_thread(storage_delete, dest_key)
+                await run_in_threadpool(storage_delete, dest_key)
             except Exception as rollback_e:
                 logger.warning(
                     "Rollback storage delete failed after confirm_presigned_signup_upload "
@@ -261,8 +248,7 @@ class MediaService:
         token = secrets.token_urlsafe(32)
         key = f"{_UPLOAD_TOKEN_KEY_PREFIX}{token}"
         # Token이 소유권 검증/첨부 단회성임을 보장하기 위해 TTL로 제한.
-        r = cast(Any, redis)
-        await r.set(key, str(image_id), ex=settings.SIGNUP_IMAGE_TOKEN_TTL_SECONDS)
+        await redis.set(key, str(image_id), ex=settings.SIGNUP_IMAGE_TOKEN_TTL_SECONDS)
         return token
 
     @classmethod
@@ -271,18 +257,11 @@ class MediaService:
             return None
         key = f"{_UPLOAD_TOKEN_KEY_PREFIX}{token}"
         try:
-            r = cast(Any, redis)
-            image_id_raw = await r.get(key)
-            if image_id_raw is None:
+            image_id = bulk_to_str(await redis.get(key))
+            if image_id is None:
                 return None
             # 사용 즉시 토큰 폐기(단일 사용). 경쟁 상황은 DB 첨부 조건(uploader_id is None)로 안전하게 처리.
-            await r.delete(key)
-            if isinstance(image_id_raw, bytes):
-                image_id = image_id_raw.decode("utf-8")
-            elif isinstance(image_id_raw, str):
-                image_id = image_id_raw
-            else:
-                return None
+            await redis.delete(key)
             if not image_id:
                 return None
             from app.core.ids import parse_public_id_value
@@ -305,7 +284,7 @@ class MediaService:
             file_key = image.file_key
             await MediaModel.delete_image_record(image, db=db)
         if file_key:
-            await asyncio.to_thread(storage_delete, file_key)
+            await run_in_threadpool(storage_delete, file_key)
 
     @classmethod
     async def sweep_unused_images(cls, db: AsyncSession, redis: RedisLike | None = None) -> int:
@@ -318,7 +297,6 @@ class MediaService:
         if not acquired:
             logger.info("skip sweep_unused_images: lock already held")
             return 0
-        r = cast(Any, redis) if redis is not None else None
         try:
 
             async def _fetch(after_id: UUID | None, limit: int) -> list[Image]:
@@ -336,12 +314,8 @@ class MediaService:
 
             return await _keyset_cleanup(db, fetch=_fetch, on_delete_failed=_on_fail)
         finally:
-            if lock_value and r is not None:
-                await _release_job_lock(
-                    r,
-                    lock_key=_JOB_LOCK_SWEEP_UNUSED,
-                    lock_value=lock_value,
-                )
+            if lock_value and redis is not None:
+                await release_lock(redis, _JOB_LOCK_SWEEP_UNUSED, lock_value)
 
     @classmethod
     async def cleanup_expired_signup_images(
@@ -355,7 +329,6 @@ class MediaService:
         if not acquired:
             logger.info("skip cleanup_expired_signup_images task_id=%s: lock already held", task_id)
             return 0, []
-        r = cast(Any, redis) if redis is not None else None
         try:
             failed_file_keys: list[str] = []
 
@@ -378,9 +351,5 @@ class MediaService:
             total_deleted = await _keyset_cleanup(db, fetch=_fetch, on_delete_failed=_on_fail)
             return total_deleted, failed_file_keys
         finally:
-            if lock_value and r is not None:
-                await _release_job_lock(
-                    r,
-                    lock_key=_JOB_LOCK_SIGNUP_CLEANUP,
-                    lock_value=lock_value,
-                )
+            if lock_value and redis is not None:
+                await release_lock(redis, _JOB_LOCK_SIGNUP_CLEANUP, lock_value)

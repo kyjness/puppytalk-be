@@ -16,8 +16,6 @@ def _redis_url_with_db(base: str, db_index: int) -> str:
     base = (base or "").strip().rstrip("/")
     if not base:
         return f"redis://127.0.0.1:6379/{db_index}"
-    if base.endswith(f"/{db_index}"):
-        return base
     # redis://host:6379 또는 redis://host:6379/0 형태 정규화
     if "/" in base.split("://", 1)[-1]:
         prefix = base.rsplit("/", 1)[0]

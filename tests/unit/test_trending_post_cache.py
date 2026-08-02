@@ -102,9 +102,11 @@ def test_lock_wait_timeout_falls_back_to_loader(monkeypatch):
         loader_calls.append(1)
         return [7]
 
+    from app.infra.redis import RedisLike
+
     result = asyncio.run(
         cache_mod.get_or_compute_json(
-            redis=_ContendedRedis(),
+            redis=cast(RedisLike, _ContendedRedis()),
             key="cache:test",
             lock_key="cache:test:lock",
             ttl_seconds=60,

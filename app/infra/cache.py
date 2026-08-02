@@ -3,13 +3,14 @@
 # Redis 부재·오류는 전부 fail-open으로 loader(DB) 직조회. TypeAdapter로 직렬화 계약을 고정한다.
 import asyncio
 import logging
-import os
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
 from pydantic import TypeAdapter, ValidationError
 
 from app.core.metrics import CACHE_EVENTS
+from app.infra.lock import release_lock, try_acquire_lock
+from app.infra.redis import RedisLike, bulk_to_str
 
 log = logging.getLogger(__name__)
 
@@ -20,17 +21,11 @@ _LOCK_TTL_SECONDS = 5
 _WAIT_MAX_SECONDS = 2.0
 _WAIT_INTERVAL_SECONDS = 0.1
 
-# 락 해제 CAS: 내가 건 락일 때만 삭제.
-_RELEASE_LOCK_LUA = (
-    "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) "
-    "else return 0 end"
-)
-
 
 def _decode(raw: Any, adapter: TypeAdapter[T], cache_name: str) -> T | None:
-    if not raw:
+    text = bulk_to_str(raw)
+    if not text:
         return None
-    text: str | bytes = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
     try:
         return adapter.validate_json(text)
     except ValidationError as e:
@@ -41,7 +36,7 @@ def _decode(raw: Any, adapter: TypeAdapter[T], cache_name: str) -> T | None:
 
 async def get_or_compute_json(
     *,
-    redis: Any | None,
+    redis: RedisLike | None,
     key: str,
     lock_key: str,
     ttl_seconds: int,
@@ -71,14 +66,13 @@ async def get_or_compute_json(
         log.warning("%s cache read failed (fallback to loader): %s", cache_name, e)
         return await loader()
 
-    lock_value = os.urandom(16).hex()
     try:
-        acquired = bool(await redis.set(lock_key, lock_value, nx=True, ex=_LOCK_TTL_SECONDS))
+        lock_value = await try_acquire_lock(redis, lock_key, _LOCK_TTL_SECONDS)
     except Exception as e:
         log.warning("%s cache lock failed (fallback to loader): %s", cache_name, e)
         return await loader()
 
-    if not acquired:
+    if lock_value is None:
         waited = 0.0
         while waited < _WAIT_MAX_SECONDS:
             await asyncio.sleep(_WAIT_INTERVAL_SECONDS)
@@ -99,7 +93,4 @@ async def get_or_compute_json(
             log.warning("%s cache write failed (ignore): %s", cache_name, e)
         return result
     finally:
-        try:
-            await redis.eval(_RELEASE_LOCK_LUA, 1, lock_key, lock_value)
-        except Exception:
-            pass
+        await release_lock(redis, lock_key, lock_value)

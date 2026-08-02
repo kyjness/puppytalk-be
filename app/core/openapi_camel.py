@@ -3,14 +3,16 @@
 
 from typing import Any
 
-
-def to_camel(name: str) -> str:
-    parts = name.split("_")
-    return parts[0].lower() + "".join(w.capitalize() for w in parts[1:])
+# 응답 직렬화(BaseSchema alias_generator)와 같은 함수를 써야 스펙과 실응답 키가 어긋나지 않는다.
+from app.common.schemas import to_camel
 
 
 def _convert_schema_object(obj: Any) -> Any:
-    """스키마 객체 내 'properties' 키를 camelCase로 변환. $ref는 유지."""
+    """스키마 객체 내 'properties' 키를 camelCase로 변환. $ref는 유지.
+
+    items·allOf·oneOf·anyOf 등 중첩 컨테이너는 아래 else의 재귀가 dict·list를
+    동일하게 처리하므로 별도 분기가 필요 없다.
+    """
     if obj is None:
         return None
     if isinstance(obj, list):
@@ -26,14 +28,6 @@ def _convert_schema_object(obj: Any) -> Any:
             out[k] = [to_camel(item) if isinstance(item, str) else item for item in v]
         elif k == "properties" and isinstance(v, dict):
             out[k] = {to_camel(key): _convert_schema_object(val) for key, val in v.items()}
-        elif k == "items" and isinstance(v, dict):
-            out[k] = _convert_schema_object(v)
-        elif k == "allOf" and isinstance(v, list):
-            out[k] = [_convert_schema_object(x) for x in v]
-        elif k == "oneOf" and isinstance(v, list):
-            out[k] = [_convert_schema_object(x) for x in v]
-        elif k == "anyOf" and isinstance(v, list):
-            out[k] = [_convert_schema_object(x) for x in v]
         else:
             out[k] = _convert_schema_object(v)
     return out

@@ -105,8 +105,8 @@ async def test_publish_after_commit_sends_single_channel_envelope_with_origin():
     assert channel == NOTIF_SSE_FANOUT_CHANNEL
     env = json.loads(raw)
     assert env["target_user_ids"] == [str(uid)]
-    # 롤링 배포 창 호환: 구버전 리스너가 읽는 스칼라 키를 첫 수신자로 병기한다.
-    assert env["target_user_id"] == str(uid)
+    # 구포맷 스칼라 병기는 롤링 창 종료로 제거됐다 — wire에 다시 스며들지 않게 고정.
+    assert "target_user_id" not in env
     assert env["origin"] == pubsub_mod._instance_id()  # 리스너의 자기 발행분 스킵 근거
     assert json.loads(env["payload"])["kind"] == "LIKE_POST"
 
@@ -270,10 +270,16 @@ async def test_listener_dispatches_by_channel(monkeypatch):
             ),
         },
         {
-            # 구포맷 스칼라 target_user_id — 롤링 배포 창의 구버전 발행분도 수용해야 한다
+            # 구포맷 스칼라 target_user_id — 롤링 창 종료로 파서가 버려야 한다(전달 0건)
             "type": "message",
             "channel": "ch:notif",
-            "data": json.dumps({"target_user_id": str(uid_notif), "payload": "notif"}),
+            "data": json.dumps({"target_user_id": str(uid_notif), "payload": "legacy"}),
+        },
+        {
+            # 채널별 핸들러 라우팅 — notif 채널 목록 포맷
+            "type": "message",
+            "channel": "ch:notif",
+            "data": json.dumps({"target_user_ids": [str(uid_notif)], "payload": "notif"}),
         },
         {
             # 자기 인스턴스 발행분 — 로컬은 발행 시 이미 직접 전달됐으므로 스킵돼야 한다

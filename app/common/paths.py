@@ -12,3 +12,6 @@ _prefix = settings.API_PREFIX.rstrip("/")
 LOGIN_PATH = f"{_prefix}/auth/login"
 SIGNUP_PRESIGN_PATH = f"{_prefix}/media/images/signup/presign"
 SIGNUP_CONFIRM_PATH = f"{_prefix}/media/images/signup/confirm"
+
+# 프로브·계측 경로(앱 루트, 인프라 전용) — rate limit·메트릭 미들웨어가 공유하는 스킵 목록.
+INFRA_PROBE_PATHS = frozenset({"/livez", "/readyz", "/metrics"})

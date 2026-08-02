@@ -4,7 +4,7 @@
 import hashlib
 import json
 import logging
-from typing import Any, cast
+from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, Request
@@ -15,8 +15,9 @@ from app.common.codes import ApiCode
 from app.common.responses import get_request_id
 from app.common.schemas import ApiResponse
 from app.core.config import settings
+from app.core.middleware.proxy_headers import client_ip_from_scope
 from app.domain.posts.schemas import PostIdData
-from app.infra.redis import get_app_redis
+from app.infra.redis import bulk_to_str, get_app_redis
 
 log = logging.getLogger(__name__)
 
@@ -30,11 +31,9 @@ _IDEMP_KEY_MAX = 128
 
 
 def get_client_identifier(request: Request) -> str:
-    """프록시 검증이 끝난 scope["client"]만 사용한다(신뢰 프록시 뒤에서는 ProxyHeadersMiddleware가
-    이미 실제 IP로 갱신). 원시 X-Forwarded-For를 직접 읽으면 임의 위조가 가능해 조회수 dedup
-    (viewer_key)을 요청마다 우회할 수 있다 — rate limit 키 산정과 동일 규약."""
-    client = request.scope.get("client") or ("0.0.0.0", 0)
-    return (client[0] or "0.0.0.0").strip()
+    """조회수 dedup(viewer_key)용 클라이언트 식별자 — rate limit 키 산정과 동일하게
+    프록시 검증이 끝난 scope["client"]만 쓴다(client_ip_from_scope가 규약을 소유)."""
+    return client_ip_from_scope(request.scope, default="0.0.0.0").strip()
 
 
 def _normalize_idempotency_key(raw: str | None) -> str | None:
@@ -89,18 +88,13 @@ async def post_create_idempotency_before(
         return None, None
 
     fp = _idempotency_fingerprint(user_id, norm)
-    rcli = cast(Any, get_app_redis(request.app))
+    rcli = get_app_redis(request.app)
     if rcli is None:
         return None, fp
 
     try:
-        cached = await rcli.get(_result_redis_key(fp))
-        if cached:
-            payload: bytes | str
-            if isinstance(cached, (bytes, bytearray)):
-                payload = bytes(cached)
-            else:
-                payload = str(cached)
+        payload = bulk_to_str(await rcli.get(_result_redis_key(fp)))
+        if payload:
             try:
                 validated = _IDEMP_ADAPTER.validate_json(payload)
             except ValidationError as e:
@@ -148,7 +142,7 @@ async def post_create_idempotency_after_success(
     if fp is None:
         return
 
-    rcli = cast(Any, get_app_redis(request.app))
+    rcli = get_app_redis(request.app)
     if rcli is None:
         return
 
@@ -174,7 +168,7 @@ async def post_create_idempotency_after_failure(
     if fp is None:
         return
 
-    rcli = cast(Any, get_app_redis(request.app))
+    rcli = get_app_redis(request.app)
     if rcli is None:
         return
 

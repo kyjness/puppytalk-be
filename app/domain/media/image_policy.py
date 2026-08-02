@@ -11,7 +11,7 @@ from app.common.exceptions import (
 from app.core.config import settings
 from app.infra.storage import PENDING_KEY_PREFIX
 
-_CONTENT_TYPE_EXT: dict[str, str] = {
+CONTENT_TYPE_EXT: dict[str, str] = {
     "image/jpeg": "jpg",
     "image/png": "png",
     "image/webp": "webp",
@@ -20,7 +20,7 @@ _CONTENT_TYPE_EXT: dict[str, str] = {
 
 def validate_image_content_type(content_type: str) -> str:
     ct = (content_type or "").split(";")[0].strip().lower()
-    if ct not in settings.ALLOWED_IMAGE_TYPES or ct not in _CONTENT_TYPE_EXT:
+    if ct not in settings.ALLOWED_IMAGE_TYPES or ct not in CONTENT_TYPE_EXT:
         raise InvalidFileTypeException()
     return ct
 
@@ -28,7 +28,7 @@ def validate_image_content_type(content_type: str) -> str:
 def sanitize_presign_filename(filename: str, content_type: str) -> str:
     """Presigned POST용 안전 파일명. 확장자는 Content-Type과 일치하도록 강제."""
     ct = validate_image_content_type(content_type)
-    ext = _CONTENT_TYPE_EXT[ct]
+    ext = CONTENT_TYPE_EXT[ct]
     base = os.path.basename((filename or "").strip())
     if not base or base in (".", ".."):
         raise InvalidImageFileException()

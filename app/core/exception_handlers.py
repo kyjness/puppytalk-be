@@ -11,8 +11,9 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError
 
 from app.common import ApiCode
+from app.common.codes import UNIQUE_CONSTRAINT_CODES
 from app.common.exceptions import BaseProjectException
-from app.common.responses import get_request_id
+from app.common.responses import error_body, get_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -26,18 +27,15 @@ def _error_payload(
     *,
     request: Request,
 ) -> dict[str, Any]:
-    return {
-        "code": code,
-        "message": message if message else "",
-        "data": data,
-        "requestId": get_request_id(request),
-    }
+    return error_body(code, message, data, request_id=get_request_id(request))
 
 
 def _log_error_structured(
     request: Request,
     event: str,
     exc: BaseException | None = None,
+    *,
+    level: int = logging.ERROR,
     **fields: Any,
 ) -> None:
     payload: dict[str, Any] = {
@@ -54,7 +52,7 @@ def _log_error_structured(
     if exc is not None:
         logger.exception("%s", line)
     else:
-        logger.error("%s", line)
+        logger.log(level, "%s", line)
 
 
 HTTP_STATUS_TO_CODE = {
@@ -82,7 +80,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         }
     )
 
-    def _pick_validation_code(request: Request, errors: Sequence[Any]) -> str:
+    def _pick_validation_code(errors: Sequence[Any]) -> str:
         for err in errors:
             msg = err.get("msg", "") if isinstance(err.get("msg"), str) else ""
             for name in _VALIDATION_CODE_NAMES:
@@ -103,7 +101,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
         errors = exc.errors()
-        code = _pick_validation_code(request, errors)
+        code = _pick_validation_code(errors)
         message = _first_validation_message(errors) or ""
         return JSONResponse(
             status_code=400,
@@ -119,8 +117,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             message = detail.get("message", "") if isinstance(detail.get("message"), str) else ""
             content = _error_payload(code_str, message, detail.get("data"), request=request)
         else:
-            code = HTTP_STATUS_TO_CODE.get(exc.status_code) or ApiCode.HTTP_ERROR
-            code_str = code.value if isinstance(code, ApiCode) else code
+            code_str = (HTTP_STATUS_TO_CODE.get(exc.status_code) or ApiCode.HTTP_ERROR).value
             message = ""
             if isinstance(exc.detail, str):
                 message = exc.detail
@@ -140,35 +137,16 @@ def register_exception_handlers(app: FastAPI) -> None:
         diag = getattr(orig, "diag", None) if orig else None
         constraint = (getattr(diag, "constraint_name", None) or "").lower()
         if sqlstate == "23505":
-            logger.warning(
-                "%s",
-                json.dumps(
-                    {
-                        "event": "db_integrity_duplicate",
-                        "request_id": get_request_id(request),
-                        "path": request.url.path,
-                        "constraint": constraint,
-                    },
-                    ensure_ascii=False,
-                ),
+            _log_error_structured(
+                request, "db_integrity_duplicate", level=logging.WARNING, constraint=constraint
             )
-            if "email" in constraint:
-                return JSONResponse(
-                    status_code=409,
-                    content=_error_payload(
-                        ApiCode.EMAIL_ALREADY_EXISTS.value, "", None, request=request
-                    ),
-                )
-            if "nickname" in constraint:
-                return JSONResponse(
-                    status_code=409,
-                    content=_error_payload(
-                        ApiCode.NICKNAME_ALREADY_EXISTS.value, "", None, request=request
-                    ),
-                )
+            code = next(
+                (c for frag, c in UNIQUE_CONSTRAINT_CODES if frag in constraint),
+                ApiCode.CONFLICT,
+            )
             return JSONResponse(
                 status_code=409,
-                content=_error_payload(ApiCode.CONFLICT.value, "", None, request=request),
+                content=_error_payload(code.value, "", None, request=request),
             )
         if sqlstate == "23503":
             _log_error_structured(request, "db_integrity_fk", exc, constraint=constraint)
@@ -182,19 +160,12 @@ def register_exception_handlers(app: FastAPI) -> None:
             content=_error_payload(ApiCode.INVALID_REQUEST.value, "", None, request=request),
         )
 
-    @app.exception_handler(OperationalError)
-    async def operational_error_handler(request: Request, exc: OperationalError):
-        _log_error_structured(request, "db_operational_error", exc)
-        return JSONResponse(
-            status_code=500,
-            content=_error_payload(
-                ApiCode.DB_ERROR.value, MASKED_500_MESSAGE, None, request=request
-            ),
-        )
-
     @app.exception_handler(DatabaseError)
     async def database_error_handler(request: Request, exc: DatabaseError):
-        _log_error_structured(request, "db_database_error", exc)
+        # OperationalError는 DatabaseError의 하위 클래스 — 핸들러 조회가 MRO를 따르므로
+        # 여기 하나로 잡고 로그 event 라벨만 구분한다(응답은 동일).
+        event = "db_operational_error" if isinstance(exc, OperationalError) else "db_database_error"
+        _log_error_structured(request, event, exc)
         return JSONResponse(
             status_code=500,
             content=_error_payload(

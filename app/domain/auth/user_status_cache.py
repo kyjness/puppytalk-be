@@ -2,7 +2,6 @@
 # auth 서비스와 인증 의존성(api.dependencies.auth)이 함께 쓰는 계약이라 공개 모듈로 둔다.
 
 import logging
-from typing import Any, cast
 from uuid import UUID
 
 from app.infra.redis import RedisLike
@@ -19,7 +18,7 @@ def user_status_cache_key(user_id: UUID) -> str:
 
 
 async def set_user_status_cache_best_effort(
-    redis_client: Any,
+    redis_client: RedisLike,
     user_id: UUID,
     status_value: str,
 ) -> None:
@@ -41,8 +40,7 @@ async def invalidate_user_status_cache(redis_client: RedisLike | None, user_id: 
     """
     if redis_client is None:
         return
-    r = cast(Any, redis_client)
     try:
-        await r.delete(user_status_cache_key(user_id))
+        await redis_client.delete(user_status_cache_key(user_id))
     except Exception as e:
         logger.warning("user status cache DEL failed user_id=%s err=%s", user_id, e)

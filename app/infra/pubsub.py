@@ -36,15 +36,15 @@ _HEALTHY_UPTIME_SEC = 5.0
 # envelope origin — 리스너가 자기 발행분을 식별해 건너뛴다.
 # import 시점 상수로 두면 preload-then-fork(gunicorn --preload)에서 전 워커가 같은 값을
 # 물려받아 형제 워커의 envelope까지 '자기 것'으로 오인·유실한다 — pid 기준 지연 생성.
-_instance_id_state: dict[str, Any] = {"pid": None, "id": ""}
+_instance_ids: dict[int, str] = {}
 
 
 def _instance_id() -> str:
     pid = os.getpid()
-    if _instance_id_state["pid"] != pid:
-        _instance_id_state["pid"] = pid
-        _instance_id_state["id"] = str(uuid4())
-    return _instance_id_state["id"]
+    iid = _instance_ids.get(pid)
+    if iid is None:
+        iid = _instance_ids[pid] = str(uuid4())
+    return iid
 
 
 # (target_user_id, payload) → 로컬 전달. payload는 클라이언트에 그대로 보낼 텍스트.
@@ -70,11 +70,6 @@ async def publish_user_envelope(
         {
             "origin": _instance_id(),
             "target_user_ids": [str(u) for u in target_user_ids],
-            # 구버전 리스너는 스칼라 키만 파싱한다 — 병기하지 않으면 롤링 배포 창에서
-            # 신 인스턴스 발행분을 구 인스턴스가 통째로 드롭한다(파서의 구포맷 수용은
-            # 구→신 방향만 커버). 구 리스너에는 첫 수신자만 전달되는 부분 열화로 낮춘다.
-            # 롤링 창 전용 — 전 인스턴스가 목록 파서로 교체된 다음 릴리스에서 제거.
-            "target_user_id": str(target_user_ids[0]),
             "payload": payload,
         },
         ensure_ascii=False,
@@ -88,16 +83,10 @@ async def publish_user_envelope(
 
 
 def parse_user_envelope(raw: str) -> tuple[list[UUID], str, str | None] | None:
-    """(target_user_ids, payload, origin). payload가 문자열이 아니면 규약 위반 — 버린다.
-
-    구포맷 스칼라 `target_user_id`도 수용한다 — 롤링 배포 창에서 구버전 인스턴스가
-    발행한 envelope를 신버전 리스너가 버리지 않게(둘 다 at-most-once 세맨틱 안)."""
+    """(target_user_ids, payload, origin). payload가 문자열이 아니면 규약 위반 — 버린다."""
     try:
         data = json.loads(raw)
-        if "target_user_ids" in data:
-            uids = [UUID(str(u)) for u in data["target_user_ids"]]
-        else:
-            uids = [UUID(str(data["target_user_id"]))]
+        uids = [UUID(str(u)) for u in data["target_user_ids"]]
         payload = data["payload"]
         if not isinstance(payload, str):
             log.warning("pubsub envelope payload가 str이 아님", exc_info=False)

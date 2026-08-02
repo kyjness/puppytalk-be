@@ -14,7 +14,7 @@ from app.api.dependencies import (
 from app.common import ApiCode, ApiResponse, PublicId, api_response
 from app.common.exceptions import TooManyRequestsException
 from app.core.config import settings
-from app.core.middleware.rate_limit import check_fixed_window
+from app.core.rate_limit import check_fixed_window
 from app.domain.media.schema import (
     ConfirmSignupUploadRequest,
     ConfirmUploadRequest,
