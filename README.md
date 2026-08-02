@@ -226,24 +226,30 @@ Dockerfile             # uv 멀티스테이지 · 비루트 · Gunicorn+Uvicorn
 
 ## 로컬 실행
 
-전체 스택(DB·Redis·MinIO·API + 프론트)을 한 번에 띄우는 `dev.sh`가 기본 경로입니다.
+전체 스택(DB·Redis·MinIO + API + 프론트)을 한 번에 띄우는 `dev.sh`가 기본 경로입니다.
+**의존 서비스만 컨테이너**로 띄우고 **앱은 호스트에서 reload**로 돌립니다 — 코드 수정이
+재빌드 없이 즉시 반영됩니다.
 
 ```bash
 git clone https://github.com/kyjness/2-kyjness-community-be && cd 2-kyjness-community-be
-./dev.sh                  # compose 기동 → /v1/health 대기 → 형제 폴더 프론트 pnpm dev
+./dev.sh                  # 인프라 compose → alembic → uvicorn --reload → 형제 폴더 프론트 pnpm dev
 ```
 
 - 뜨는 곳: API `localhost:8000`(Swagger `/v1/docs`) · 프론트 `localhost:5173` · MinIO 콘솔 `localhost:9001`.
-- `Ctrl+C`는 프론트만 멈춥니다(백엔드 스택은 유지 — 빠른 재시작용). 백엔드 종료는 `./dev.sh --down`.
-- 옵션: `--backend-only`(백엔드만) · `FE_DIR=`(프론트 경로 지정). poe 별칭 `stack`·`stack-backend`·`stack-down`도 동일.
+- 첫 실행이면 `.env`(없으면 `.env.example` 복사)와 `.venv`(`uv sync`)를 자동으로 준비합니다.
+- `Ctrl+C`는 호스트 프로세스(백엔드·프론트)만 멈춥니다. 컨테이너 종료는 `./dev.sh --down`.
+- 옵션: `--backend-only` · `--docker`(백엔드까지 컨테이너로 — 아래 참고) · `FE_DIR=`(프론트 경로).
+  poe 별칭 `stack`·`stack-backend`·`stack-docker`·`stack-down`도 동일.
 
-세부 경로(호스트 직접 실행·compose 단독)·검사/테스트·API 문서는 아래에 접어 두었습니다.
+세부 경로(전체 컨테이너 실행·수동 실행)·검사/테스트·API 문서는 아래에 접어 두었습니다.
 
 <details>
-<summary><b>다른 실행 방법 — Docker Compose 단독 · 호스트 직접 실행</b></summary>
+<summary><b>다른 실행 방법 — 전체 컨테이너 · 수동 실행</b></summary>
 
-**A. Docker Compose (백엔드만)** — 프론트 없이 백엔드 스택만. `docker-compose.yml`이 DB·Redis·MinIO·백엔드를
-함께 띄우며, 개발 자격은 compose에 인라인 주입되어 **별도 `.env` 없이 바로 동작**합니다.
+**A. 전체 컨테이너 (`docker compose`)** — `docker-compose.yml`은 DB·Redis·MinIO에 더해 **백엔드 서비스도
+정의**합니다. 개발 자격이 compose에 인라인 주입되어 **`.env`도 `.venv`도 없이 클론 직후 바로** 뜹니다.
+배포와 동일한 이미지(`alembic upgrade head && gunicorn`)라 환경 검증·데모용으로 씁니다. 대신 소스 마운트가
+없어 코드 수정마다 재빌드가 필요하므로, 개발 루프에는 위의 기본 경로를 쓰세요.
 
 ```bash
 docker compose up --build -d          # 전체 기동 (backend는 db/redis healthcheck 후 alembic → gunicorn)
@@ -252,20 +258,22 @@ docker compose logs -f backend        # 로그
 docker compose down -v                # 중지 + 볼륨 초기화
 ```
 
-MinIO 콘솔 `localhost:9001`(minioadmin/minioadmin), 미디어 버킷(`puppytalk`)은 `minio-init`가 자동 생성·공개.
-실 배포 이미지도 동일 `Dockerfile`을 ECS/PaaS가 사용(`alembic upgrade head && gunicorn ...`).
+`./dev.sh --docker`는 여기에 프론트 `pnpm dev`까지 붙여줍니다. MinIO 콘솔 `localhost:9001`
+(minioadmin/minioadmin), 미디어 버킷(`puppytalk`)은 `minio-init`가 자동 생성·공개. 실 배포 이미지도
+같은 `Dockerfile`을 ECS/PaaS가 사용합니다.
 
-**B. 호스트 직접 실행 (빠른 reload)** — 의존 서비스만 컨테이너로 띄우고 앱은 호스트에서. Python 3.11+ 필요.
+**B. 수동 실행** — `dev.sh`가 하는 일을 손으로. Python 3.11+ 필요.
 
 ```bash
-uv sync --extra dev            # 1. 의존성(런타임 + dev: pytest·ruff·pyright·vulture·poe)
+docker compose up -d db redis minio minio-init   # 1. 의존 서비스만
+uv sync --extra dev            # 2. 의존성(런타임 + dev: pytest·ruff·pyright·vulture·poe)
 
-cp .env.example .env           # 2. 환경 변수 — DB_*, JWT_SECRET_KEY, REDIS_URL 등
+cp .env.example .env           # 3. 환경 변수 — DB_*, JWT_SECRET_KEY, REDIS_URL 등
 #  - ENVIRONMENT=development(기본) | production — production 계열은 강한 JWT_SECRET_KEY(32자+) 필수
 #  - 스토리지: dev는 MinIO(S3_ENDPOINT_URL 지정), prod는 실제 S3 자격 필수
 
-uv run poe migrate             # 3. DB 스키마 = alembic upgrade head (새 마이그레이션 생기면 재실행)
-uv run poe run                 # 4. 서버 http://localhost:8000 (문서 /v1/docs · 헬스 /v1/health)
+uv run poe migrate             # 4. DB 스키마 = alembic upgrade head (새 마이그레이션 생기면 재실행)
+uv run poe run                 # 5. 서버 http://localhost:8000 (문서 /v1/docs · 헬스 /v1/health)
 
 uv run poe celery-worker       # (선택) Celery — CELERY_ENABLED=true 일 때만
 uv run poe celery-beat

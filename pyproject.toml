@@ -83,10 +83,11 @@ celery-worker = "celery -A app.core.celery:celery_app worker -Q default,high_pri
 celery-beat = "celery -A app.core.celery:celery_app beat -l info"
 migrate = "python3 -m alembic upgrade head"
 
-# 전체 스택 로컬 실행 (백엔드 docker compose + 프론트 pnpm dev). 자세한 옵션은 scripts/dev.sh 참고.
-stack = "bash scripts/dev.sh"
-stack-backend = "bash scripts/dev.sh --backend-only"
-stack-down = "bash scripts/dev.sh --down"
+# 전체 스택 로컬 실행 (인프라 docker + 백엔드·프론트 호스트 reload). 자세한 옵션은 dev.sh 참고.
+stack = "bash dev.sh"
+stack-backend = "bash dev.sh --backend-only"
+stack-docker = "bash dev.sh --docker"
+stack-down = "bash dev.sh --down"
 
 lint = "python3 -m ruff check . --fix"
 format = "python3 -m ruff format ."
