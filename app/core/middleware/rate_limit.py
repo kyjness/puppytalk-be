@@ -1,43 +1,24 @@
-# Redis 기반 분산 Rate Limit. Lua로 INCR+EXPIRE+TTL 원자 수행.
-# 순수 ASGI 미들웨어(scope/receive/send). Redis 장애 시 로그인/회원가입 업로드에 한해 In-memory Fallback(스마트 Fail-open).
-# 함수형 래퍼 없음. main에서 add_middleware(RateLimitMiddleware)로 등록.
+# HTTP 요청 rate limit 미들웨어 — 경로별 정책 테이블로 (키 접두사·한도·응답 코드·fail-open)을
+# 한 곳에서 결정하고, 검사 자체는 core.rate_limit(check_fixed_window)에 위임한다.
+# 순수 ASGI(scope/receive/send). main에서 add_middleware(RateLimitMiddleware)로 등록.
 import json
-import logging
-import time
-from typing import Any
+from collections.abc import Callable
+from typing import NamedTuple
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.common import ApiCode
 from app.common.paths import (
+    INFRA_PROBE_PATHS,
     LOGIN_PATH,
     SIGNUP_CONFIRM_PATH,
     SIGNUP_PRESIGN_PATH,
 )
+from app.common.responses import error_body
 from app.core.config import settings
-from app.core.metrics import RATE_LIMIT_REJECTIONS
+from app.core.middleware.proxy_headers import client_ip_from_scope
+from app.core.rate_limit import check_fixed_window
 from app.infra.redis import RedisLike, get_app_redis
-
-logger = logging.getLogger(__name__)
-
-# 프로브·계측 경로(앱 루트, 인프라 전용)만 한도 제외. /v1/health는 비인증 + 요청마다
-# DB 왕복이라 글로벌 한도를 그대로 태운다 — 프로브는 /livez·/readyz가 전담하므로
-# 한도 제외로 열어둘 이유가 없다(무한도 DB ping 표면).
-_SKIP_PATHS = frozenset({"/livez", "/readyz", "/metrics"})
-_KEY_PREFIX = "rl"
-
-# In-memory Fallback: 최대 10,000키, OOM 방지 eviction.
-_MEMORY_MAX_KEYS = 10_000
-_memory_store: dict[str, tuple[int, float]] = {}
-
-_LUA_FIXED_WINDOW = """
-local c = redis.call('INCR', KEYS[1])
-if c == 1 then
-    redis.call('EXPIRE', KEYS[1], ARGV[1])
-end
-local ttl = redis.call('TTL', KEYS[1])
-return {c, ttl}
-"""
 
 
 def _redis_from_scope(scope: Scope) -> RedisLike | None:
@@ -47,14 +28,6 @@ def _redis_from_scope(scope: Scope) -> RedisLike | None:
     갖지 않아 항상 None이 나온다(분산 rate limit이 조용히 비활성화되는 결함).
     """
     return get_app_redis(scope.get("app"))
-
-
-def get_client_ip_from_scope(scope: Scope) -> str:
-    """scope['client'] 사용. proxy_headers 미들웨어가 이미 실제 IP로 갱신한 상태를 가정."""
-    client = scope.get("client")
-    if client:
-        return client[0]
-    return "unknown"
 
 
 def _path_is_login(path: str) -> bool:
@@ -68,113 +41,60 @@ def _path_is_signup_upload(path: str) -> bool:
     return p in (SIGNUP_PRESIGN_PATH, SIGNUP_CONFIRM_PATH)
 
 
-def _is_critical_path(path: str) -> bool:
-    """Redis 장애 시 In-memory Fallback을 적용할 중요 경로(로그인·회원가입 업로드)."""
-    return _path_is_login(path) or _path_is_signup_upload(path)
+class _RatePolicy(NamedTuple):
+    """경로 한 갈래의 rate limit 정책. 한도는 테스트·런타임 재설정이 반영되도록
+    settings를 요청 시점에 읽는 thunk로 둔다."""
+
+    matches: Callable[[str], bool]
+    key_prefix: str
+    code: ApiCode
+    # False = Redis 장애 시 메모리 폴백(남용 방어 경로). True = 통과(가용성 우선).
+    fail_open: bool
+    limits: Callable[[], tuple[int, int]]  # (window_sec, max_count)
 
 
-def _memory_evict_if_needed(now: float) -> None:
-    """저장소가 최대 키 수 이상이면: 만료된 키 삭제 후, 여전히 초과 시 window_end_ts가 가장 작은 키 삭제."""
-    if len(_memory_store) < _MEMORY_MAX_KEYS:
-        return
-    expired = [k for k, (_, end) in _memory_store.items() if end < now]
-    for k in expired:
-        del _memory_store[k]
-    while len(_memory_store) >= _MEMORY_MAX_KEYS and _memory_store:
-        oldest_key = min(_memory_store.keys(), key=lambda k: _memory_store[k][1])
-        del _memory_store[oldest_key]
+# 매칭 우선순위 순. 글로벌은 항상 마지막 폴백 행 — 행 하나가 (매칭·키·코드·fail-open·한도)를
+# 전부 소유하므로, 경로를 추가할 때 별도 술어(_is_critical_path류)와 어긋날 표면이 없다.
+_POLICIES: tuple[_RatePolicy, ...] = (
+    _RatePolicy(
+        _path_is_login,
+        "login",
+        ApiCode.LOGIN_RATE_LIMIT_EXCEEDED,
+        False,
+        lambda: (settings.LOGIN_RATE_LIMIT_WINDOW, settings.LOGIN_RATE_LIMIT_MAX_ATTEMPTS),
+    ),
+    _RatePolicy(
+        _path_is_signup_upload,
+        "signup_upload",
+        ApiCode.RATE_LIMIT_EXCEEDED,
+        False,
+        lambda: (settings.SIGNUP_UPLOAD_RATE_LIMIT_WINDOW, settings.SIGNUP_UPLOAD_RATE_LIMIT_MAX),
+    ),
+    _RatePolicy(
+        lambda _path: True,
+        "global",
+        ApiCode.RATE_LIMIT_EXCEEDED,
+        True,
+        lambda: (settings.RATE_LIMIT_WINDOW, settings.RATE_LIMIT_MAX_REQUESTS),
+    ),
+)
 
 
-def _check_memory_fixed_window(key: str, window_sec: int, max_count: int) -> tuple[bool, int]:
-    """In-memory Fixed Window. (allowed, retry_after_seconds)."""
-    now = time.monotonic()
-    _memory_evict_if_needed(now)
-    if key not in _memory_store:
-        _memory_store[key] = (1, now + window_sec)
-        return True, 0
-    count, window_end = _memory_store[key]
-    if now >= window_end:
-        _memory_store[key] = (1, now + window_sec)
-        return True, 0
-    count += 1
-    _memory_store[key] = (count, window_end)
-    if count > max_count:
-        retry_after = max(0, int(window_end - now))
-        return False, retry_after
-    return True, 0
-
-
-async def _check_redis_fixed_window(
-    redis: RedisLike,
-    key: str,
-    window_sec: int,
-    max_count: int,
-) -> tuple[bool, int]:
-    full_key = f"{_KEY_PREFIX}:{key}"
-    try:
-        result: Any = await redis.eval(_LUA_FIXED_WINDOW, 1, full_key, window_sec)
-        count, ttl = int(result[0]), int(result[1])
-        retry_after = max(0, ttl) if ttl >= 0 else window_sec
-        if count > max_count:
-            return False, retry_after
-        return True, 0
-    except Exception as e:
-        logger.warning("Rate limit Redis 오류: %s. Fallback 또는 통과.", e)
-        raise
-
-
-async def check_fixed_window(
-    redis: RedisLike | None,
-    key: str,
-    *,
-    window_sec: int,
-    max_count: int,
-    fail_open: bool = False,
-) -> tuple[bool, int]:
-    """fixed-window 검사 단일 진입점(미들웨어·WS 수신 루프 공용). (allowed, retry_after).
-
-    Redis 우선(멀티 인스턴스 공유 한도). Redis 부재·장애 시: `fail_open=True`면 통과
-    (글로벌 한도 — 가용성 우선), False면 인스턴스 로컬 메모리 윈도로 폴백(로그인·업로드·
-    WS 같은 남용 방어 경로 — 근사 한도라도 유지).
-
-    key는 `종류:식별자` 규약 — 첫 콜론 앞이 거부 메트릭의 limit 라벨이 되므로
-    카디널리티가 유한한 접두사를 쓸 것(login·signup_upload·global·chat 등).
-    """
-    allowed = True
-    retry_after = 0
-    if redis is not None:
-        try:
-            allowed, retry_after = await _check_redis_fixed_window(
-                redis, key, window_sec, max_count
-            )
-        except Exception:
-            if not fail_open:
-                allowed, retry_after = _check_memory_fixed_window(key, window_sec, max_count)
-    elif not fail_open:
-        allowed, retry_after = _check_memory_fixed_window(key, window_sec, max_count)
-    if not allowed:
-        count_rejection(key.split(":", 1)[0])
-    return allowed, retry_after
-
-
-def count_rejection(limit: str) -> None:
-    """거부 계측 단일 창구. check_fixed_window를 거치지 않는 거부(WS 억제 창의 로컬
-    즉시 거부 등)도 반드시 이 함수로 센다 — 아니면 스팸 급증 구간에서 메트릭이
-    거부의 대부분을 놓쳐 대시보드가 '한도가 거의 안 걸린다'고 오판하게 된다."""
-    RATE_LIMIT_REJECTIONS.labels(limit=limit).inc()
+def _resolve_policy(path: str) -> _RatePolicy:
+    return next(p for p in _POLICIES if p.matches(path))
 
 
 async def _send_429(send: Send, scope: Scope, code: ApiCode, retry_after_seconds: int) -> None:
-    """순수 ASGI: 429 응답만 전송. ApiResponse·전역 에러와 동일 키(requestId 등)."""
+    """순수 ASGI: 429 응답만 전송. 바디 규격은 error_body가 단일 소스."""
     state = scope.get("state") or {}
     rid = state.get("request_id", "") or ""
     body = json.dumps(
-        {
-            "code": code.value,
-            "message": "",
-            "data": {"retry_after_seconds": retry_after_seconds},
-            "requestId": rid,
-        },
+        error_body(
+            code.value,
+            "",
+            {"retry_after_seconds": retry_after_seconds},
+            request_id=rid,
+        ),
         ensure_ascii=False,
     ).encode("utf-8")
     headers = [
@@ -192,7 +112,12 @@ async def _send_429(send: Send, scope: Scope, code: ApiCode, retry_after_seconds
 
 
 class RateLimitMiddleware:
-    """순수 ASGI 미들웨어. BaseHTTPMiddleware 미사용. scope/receive/send만 사용."""
+    """순수 ASGI 미들웨어. BaseHTTPMiddleware 미사용. scope/receive/send만 사용.
+
+    프로브·계측 경로만 한도 제외. /v1/health는 비인증 + 요청마다 DB 왕복이라 글로벌
+    한도를 그대로 태운다 — 프로브는 /livez·/readyz가 전담하므로 한도 제외로 열어둘
+    이유가 없다(무한도 DB ping 표면).
+    """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -204,50 +129,22 @@ class RateLimitMiddleware:
 
         path = scope.get("path", "")
         method = scope.get("method", "GET")
-        if method == "OPTIONS" or path in _SKIP_PATHS:
+        if method == "OPTIONS" or path in INFRA_PROBE_PATHS:
             await self.app(scope, receive, send)
             return
 
-        ip = get_client_ip_from_scope(scope)
-        redis: RedisLike | None = _redis_from_scope(scope)
-
-        if _path_is_login(path):
-            key = f"login:{ip}"
-            window = settings.LOGIN_RATE_LIMIT_WINDOW
-            max_count = settings.LOGIN_RATE_LIMIT_MAX_ATTEMPTS
-            code = ApiCode.LOGIN_RATE_LIMIT_EXCEEDED
-        elif _path_is_signup_upload(path):
-            key = f"signup_upload:{ip}"
-            window = settings.SIGNUP_UPLOAD_RATE_LIMIT_WINDOW
-            max_count = settings.SIGNUP_UPLOAD_RATE_LIMIT_MAX
-            code = ApiCode.RATE_LIMIT_EXCEEDED
-        else:
-            key = f"global:{ip}"
-            window = settings.RATE_LIMIT_WINDOW
-            max_count = settings.RATE_LIMIT_MAX_REQUESTS
-            code = ApiCode.RATE_LIMIT_EXCEEDED
-
-        # 정책(Redis 우선·폴백·거부 메트릭)은 check_fixed_window 한 곳 — 글로벌 한도만
-        # Redis 장애 시 fail-open, 로그인·회원가입 업로드는 메모리 폴백으로 방어 유지.
+        ip = client_ip_from_scope(scope)
+        policy = _resolve_policy(path)
+        window_sec, max_count = policy.limits()
         allowed, retry_after_seconds = await check_fixed_window(
-            redis,
-            key,
-            window_sec=window,
+            _redis_from_scope(scope),
+            f"{policy.key_prefix}:{ip}",
+            window_sec=window_sec,
             max_count=max_count,
-            fail_open=not _is_critical_path(path),
+            fail_open=policy.fail_open,
         )
         if not allowed:
-            await _send_429(send, scope, code, retry_after_seconds)
+            await _send_429(send, scope, policy.code, retry_after_seconds)
             return
 
         await self.app(scope, receive, send)
-
-
-def get_client_ip(request: Any) -> str:
-    """프록시 검증이 끝난 request.client 사용. scope가 있으면 get_client_ip_from_scope 활용."""
-    if getattr(request, "client", None):
-        return request.client[0]
-    scope = getattr(request, "scope", None)
-    if scope:
-        return get_client_ip_from_scope(scope)
-    return "unknown"

@@ -1,6 +1,7 @@
 # S3 파일 스토리지(단일 경로). dev/CI는 S3 호환 MinIO(엔드포인트만 다름), prod는 실제 S3.
 
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from starlette.concurrency import run_in_threadpool
@@ -65,7 +66,8 @@ def _get_s3_client():
 
 
 def storage_delete(key: str) -> None:
-    _s3_delete(key)
+    client = _get_s3_client()
+    client.delete_object(Bucket=settings.S3_BUCKET_NAME, Key=_s3_object_key(key))
 
 
 def build_url(key: str) -> str:
@@ -77,11 +79,6 @@ def build_url(key: str) -> str:
         f"https://{settings.S3_BUCKET_NAME}.s3.{settings.AWS_REGION}.amazonaws.com/"
         f"{_s3_object_key(key)}"
     )
-
-
-def _s3_delete(key: str) -> None:
-    client = _get_s3_client()
-    client.delete_object(Bucket=settings.S3_BUCKET_NAME, Key=_s3_object_key(key))
 
 
 def is_valid_pending_file_key(file_key: str) -> bool:
@@ -107,11 +104,11 @@ def _generate_presigned_post_sync(file_key: str, content_type: str) -> dict[str,
 async def issue_presigned_post(
     file_key: str,
     content_type: str,
-) -> tuple[str, dict[str, str], str]:
+) -> tuple[str, dict[str, str]]:
     """Presigned POST(url, fields) 발급. boto3 동기 호출은 스레드풀로 오프로딩."""
     payload = await run_in_threadpool(_generate_presigned_post_sync, file_key, content_type)
     fields = {str(k): str(v) for k, v in payload["fields"].items()}
-    return str(payload["url"]), fields, file_key
+    return str(payload["url"]), fields
 
 
 def _head_pending_object_sync(file_key: str) -> dict[str, Any]:
@@ -131,13 +128,16 @@ def _head_pending_object_sync(file_key: str) -> dict[str, Any]:
         raise
 
 
-def _promote_pending_object_sync(pending_key: str, dest_purpose: str) -> tuple[str, int, str]:
-    """pending/ 객체를 영구 purpose 경로로 copy 후 삭제."""
-    if not is_valid_pending_file_key(pending_key):
-        raise ValueError("invalid pending file_key")
-    if dest_purpose not in ("signup", "profile", "post"):
-        raise ValueError("invalid dest purpose")
+def _promote_pending_object_sync(
+    pending_key: str,
+    dest_purpose: str,
+    ext_by_content_type: Mapping[str, str],
+) -> tuple[str, int, str]:
+    """pending/ 객체를 영구 purpose 경로로 copy 후 삭제. 키 검증은 head가 담당한다.
 
+    purpose·Content-Type 허용 정책은 도메인(media image_policy) 소유 — 어댑터는
+    전달받은 확장자 매핑에 없는 타입만 거부한다.
+    """
     meta = _head_pending_object_sync(pending_key)
     size = int(meta.get("ContentLength") or 0)
     if size < 1 or size > PRESIGNED_MAX_BYTES:
@@ -146,7 +146,9 @@ def _promote_pending_object_sync(pending_key: str, dest_purpose: str) -> tuple[s
     if not content_type:
         raise ValueError("missing content type")
 
-    ext = _ext_from_content_type(content_type)
+    ext = ext_by_content_type.get(content_type.split(";")[0].strip().lower())
+    if not ext:
+        raise ValueError("unsupported content type")
     dest_key = f"{dest_purpose}/{new_ulid_str()}.{ext}"
     bucket = settings.S3_BUCKET_NAME
     client = _get_s3_client()
@@ -161,21 +163,16 @@ def _promote_pending_object_sync(pending_key: str, dest_purpose: str) -> tuple[s
     return dest_key, size, content_type
 
 
-def _ext_from_content_type(content_type: str) -> str:
-    mapping = {
-        "image/jpeg": "jpg",
-        "image/png": "png",
-        "image/webp": "webp",
-    }
-    ext = mapping.get(content_type.split(";")[0].strip().lower())
-    if not ext:
-        raise ValueError("unsupported content type")
-    return ext
-
-
 async def head_pending_object(file_key: str) -> dict[str, Any]:
     return await run_in_threadpool(_head_pending_object_sync, file_key)
 
 
-async def promote_pending_object(pending_key: str, dest_purpose: str) -> tuple[str, int, str]:
-    return await run_in_threadpool(_promote_pending_object_sync, pending_key, dest_purpose)
+async def promote_pending_object(
+    pending_key: str,
+    dest_purpose: str,
+    *,
+    ext_by_content_type: Mapping[str, str],
+) -> tuple[str, int, str]:
+    return await run_in_threadpool(
+        _promote_pending_object_sync, pending_key, dest_purpose, ext_by_content_type
+    )

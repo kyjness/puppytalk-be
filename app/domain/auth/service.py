@@ -3,7 +3,6 @@
 
 import logging
 from datetime import UTC, datetime
-from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
@@ -77,7 +76,7 @@ def _user_refresh_key(user_id: UUID) -> str:
 
 
 async def _refresh_rotation_sequential(
-    redis_client: Any,
+    redis_client: RedisLike,
     *,
     user_key: str,
     incoming_digest: str,
@@ -101,7 +100,7 @@ async def _refresh_rotation_sequential(
 
 
 async def _try_refresh_rotation_redis(
-    redis_client: Any,
+    redis_client: RedisLike,
     *,
     user_id: UUID,
     user_key: str,
@@ -154,7 +153,7 @@ async def _try_refresh_rotation_redis(
 
 
 async def _ensure_user_may_refresh(
-    redis_client: Any,
+    redis_client: RedisLike,
     user_id: UUID,
     db: AsyncSession,
 ) -> None:
@@ -164,7 +163,6 @@ async def _ensure_user_may_refresh(
     캐시 값은 ``UserStatus`` 문자열(ACTIVE|SUSPENDED|WITHDRAWN). ACTIVE만 통과, 그 외·무효는 401.
     """
     key = user_status_cache_key(user_id)
-    cached_raw: Any | None
     try:
         cached_raw = await redis_client.get(key)
     except Exception as e:
@@ -287,13 +285,12 @@ class AuthService:
             )
         # Refresh Token은 user_refresh:{user_id}에 단일 값으로 저장 (RTR 전제).
         if redis is not None and refresh_ttl_seconds > 0:
-            r = cast(Any, redis)
-            await r.set(
+            await redis.set(
                 _user_refresh_key(payload.id),
                 refresh_token_digest(refresh_token),
                 ex=refresh_ttl_seconds,
             )
-            await set_user_status_cache_best_effort(r, payload.id, UserStatus.ACTIVE.value)
+            await set_user_status_cache_best_effort(redis, payload.id, UserStatus.ACTIVE.value)
         return (payload, refresh_token)
 
     @classmethod
@@ -315,17 +312,15 @@ class AuthService:
         ttl = _remaining_ttl_seconds_from_access_payload(access_payload)
         jti = access_payload.get("jti")
         if ttl > 0 and isinstance(jti, str) and jti.strip():
-            await cast(Any, redis).set(
-                access_jti_blacklist_redis_key(jti.strip()), "logout", ex=ttl
-            )
+            await redis.set(access_jti_blacklist_redis_key(jti.strip()), "logout", ex=ttl)
 
         # 2) refresh token 폐기(회전 전제이므로 user_id 키 삭제).
-        await cast(Any, redis).delete(_user_refresh_key(user_id))
+        await redis.delete(_user_refresh_key(user_id))
 
     @classmethod
     async def revoke_refresh_for_user(cls, user_id: UUID, redis: RedisLike | None = None) -> None:
         if redis:
-            await cast(Any, redis).delete(_user_refresh_key(user_id))
+            await redis.delete(_user_refresh_key(user_id))
 
     @classmethod
     async def invalidate_user_status_cache(cls, redis: RedisLike | None, user_id: UUID) -> None:
@@ -363,17 +358,16 @@ class AuthService:
             raise UnauthorizedException(
                 message="인증을 갱신할 수 없습니다. 잠시 후 다시 시도하세요."
             )
-        r = cast(Any, redis)
         incoming_digest = refresh_token_digest(refresh_token)
         user_key = _user_refresh_key(user_uuid)
 
-        await _ensure_user_may_refresh(r, user_uuid, db)
+        await _ensure_user_may_refresh(redis, user_uuid, db)
 
         new_refresh = create_refresh_token(sub=user_uuid)
         new_digest = refresh_token_digest(new_refresh)
 
         rotated = await _try_refresh_rotation_redis(
-            r,
+            redis,
             user_id=user_uuid,
             user_key=user_key,
             incoming_digest=incoming_digest,

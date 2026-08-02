@@ -11,7 +11,7 @@ from typing import Any, cast
 
 import pytest
 from app.common.exceptions import ForbiddenException
-from app.core.middleware.rate_limit import check_fixed_window
+from app.core.rate_limit import check_fixed_window
 from app.domain.chat.schema import ChatMessageSend
 from app.domain.chat.service import ChatService
 from app.domain.users.model import UsersModel

@@ -31,7 +31,7 @@ async def test_confirm_rejects_size_mismatch_before_promote(monkeypatch):
     async def fake_head(key):
         return _meta(size=100)
 
-    async def fail_promote(key, purpose):
+    async def fail_promote(key, purpose, **_):
         raise AssertionError("검증 실패 시 promote(영구 copy + pending 삭제)가 실행되면 안 된다")
 
     monkeypatch.setattr(media_service_mod, "head_pending_object", fake_head)
@@ -54,7 +54,7 @@ async def test_confirm_rejects_disallowed_type_before_promote(monkeypatch):
     async def fake_head(key):
         return _meta(content_type="image/webp")
 
-    async def fail_promote(key, purpose):
+    async def fail_promote(key, purpose, **_):
         raise AssertionError("정책 거부 대상이 promote되면 안 된다")
 
     monkeypatch.setattr(media_service_mod, "head_pending_object", fake_head)
@@ -92,7 +92,7 @@ async def test_confirm_deletes_promoted_object_when_recheck_fails(monkeypatch):
     async def fake_head(key):
         return _meta(size=100, content_type="image/png")
 
-    async def fake_promote(key, purpose):
+    async def fake_promote(key, purpose, **_):
         return f"{purpose}/swapped.webp", 100, "image/webp"  # 승격 시점엔 webp로 바뀜
 
     def fake_delete(key):
@@ -113,7 +113,7 @@ async def test_confirm_happy_path(monkeypatch):
     async def fake_head(key):
         return _meta(size=100, content_type="image/png")
 
-    async def fake_promote(key, purpose):
+    async def fake_promote(key, purpose, **_):
         return f"{purpose}/ok.png", 100, "image/png"
 
     monkeypatch.setattr(media_service_mod, "head_pending_object", fake_head)

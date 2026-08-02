@@ -62,8 +62,7 @@ def test_storage_delete_and_public_url_invariant():
 def test_presigned_post_upload_then_promote():
     # 경로 ①(presigned 직접 업로드): presign 발급 → 실제 업로드 → head → promote(copy+delete).
     pending_key = f"pending/{new_uuid7()}/test.png"
-    url, fields, key = asyncio.run(storage.issue_presigned_post(pending_key, "image/png"))
-    assert key == pending_key
+    url, fields = asyncio.run(storage.issue_presigned_post(pending_key, "image/png"))
 
     resp = httpx.post(url, data=fields, files={"file": ("test.png", _PNG, "image/png")})
     assert resp.status_code in (200, 201, 204), resp.text
@@ -71,7 +70,11 @@ def test_presigned_post_upload_then_promote():
     meta = asyncio.run(storage.head_pending_object(pending_key))
     assert int(meta["ContentLength"]) == len(_PNG)
 
-    dest_key, size, content_type = asyncio.run(storage.promote_pending_object(pending_key, "post"))
+    dest_key, size, content_type = asyncio.run(
+        storage.promote_pending_object(
+            pending_key, "post", ext_by_content_type={"image/png": "png"}
+        )
+    )
     assert size == len(_PNG)
     assert content_type == "image/png"
     assert dest_key.startswith("post/") and dest_key.endswith(".png")

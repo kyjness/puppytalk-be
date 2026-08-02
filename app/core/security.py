@@ -1,5 +1,5 @@
 # 비밀번호 해시·검증(bcrypt), JWT Access/Refresh 토큰 생성·검증.
-import asyncio
+
 import hashlib
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -7,6 +7,7 @@ from uuid import UUID
 
 import bcrypt
 import jwt
+from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.core.ids import new_ulid_str, uuid_to_base62
@@ -41,11 +42,11 @@ def _verify_password_sync(password: str, hashed_password: str) -> bool:
 
 
 async def hash_password(password: str) -> str:
-    return await asyncio.to_thread(_hash_password_sync, password)
+    return await run_in_threadpool(_hash_password_sync, password)
 
 
 async def verify_password(password: str, hashed_password: str) -> bool:
-    return await asyncio.to_thread(_verify_password_sync, password, hashed_password)
+    return await run_in_threadpool(_verify_password_sync, password, hashed_password)
 
 
 async def verify_password_with_legacy_fallback(plain: str, hashed_password: str) -> bool:

@@ -54,3 +54,11 @@ class ApiCode(StrEnum):
     HTTP_ERROR = "HTTP_ERROR"
     # --- Reports ---
     ALREADY_REPORTED = "ALREADY_REPORTED"
+
+
+# 유니크 제약(23505) 위반 시 제약명 부분 문자열 → 409 응답 코드. 매칭 없으면 CONFLICT.
+# 도메인이 사용자 노출용 유니크 제약을 늘리면 전역 핸들러 대신 이 테이블에 추가한다.
+UNIQUE_CONSTRAINT_CODES: tuple[tuple[str, ApiCode], ...] = (
+    ("email", ApiCode.EMAIL_ALREADY_EXISTS),
+    ("nickname", ApiCode.NICKNAME_ALREADY_EXISTS),
+)

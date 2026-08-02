@@ -14,22 +14,71 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.v1 import v1_router
 from app.common import ApiCode, ApiResponse, RootData, api_response, setup_logging
-from app.core.cleanup import run_loop_async
-from app.core.cleanup import run_once as cleanup_once
+from app.core.cleanup import PeriodicJob, run_jobs_once, run_periodic
 from app.core.config import settings, validate_settings_for_environment
 from app.core.exception_handlers import register_exception_handlers
 from app.core.middleware import (
     RequestIdMiddleware,
-    access_log_middleware,
-    metrics_middleware,
+    observability_middleware,
     render_metrics,
-    security_headers_middleware,
 )
 from app.core.middleware.proxy_headers import ProxyHeadersMiddleware
 from app.core.middleware.rate_limit import RateLimitMiddleware
 from app.core.openapi_camel import openapi_schema_to_camel
 from app.db import check_database
 from app.infra.redis import get_app_redis
+
+
+def _cleanup_jobs(redis_client: Any) -> tuple[PeriodicJob, ...]:
+    """주기 정리 잡 정의(보존 정책 포함). 러너(core.cleanup)는 무엇을 도는지 모른다."""
+    from app.db import get_connection
+    from app.domain.media.service import MediaService
+    from app.domain.notifications.service import NotificationService
+    from app.domain.users.service import UserService
+
+    job_log = logging.getLogger("app.cleanup")
+
+    async def signup_image_cleanup(task_id: str) -> int:
+        async with get_connection() as db:
+            deleted_count, failed_file_keys = await MediaService.cleanup_expired_signup_images(
+                db, task_id=task_id, redis=redis_client
+            )
+        if failed_file_keys:
+            job_log.warning(
+                "signup_image_cleanup_partial task_id=%s deleted_count=%s storage_delete_failed=%s keys=%s",
+                task_id,
+                deleted_count,
+                len(failed_file_keys),
+                failed_file_keys,
+            )
+            job_log.warning(
+                "[S3_DELETE_RETRY_NEEDED] task_id=%s keys=%s", task_id, failed_file_keys
+            )
+        return deleted_count
+
+    async def orphan_post_image_cleanup(_task_id: str) -> int:
+        # 게시글 작성 중 이탈 등으로 남은 고아 이미지(24h+) 정리
+        async with get_connection() as db:
+            return await MediaService.sweep_unused_images(db, redis=redis_client)
+
+    async def withdrawn_user_purge(_task_id: str) -> int:
+        # 탈퇴 유저 파기(30일 경과 하드 삭제, 청크 단위)
+        async with get_connection() as db:
+            return await UserService.purge_withdrawn_users(older_than_days=30, db=db)
+
+    async def notification_purge(_task_id: str) -> int:
+        # 알림 자동 삭제(30일 경과)
+        async with get_connection() as db:
+            return await NotificationService.purge_old_notifications(
+                older_than_days=30, chunk_size=2_000, db=db
+            )
+
+    return (
+        PeriodicJob("signup_image_cleanup", signup_image_cleanup),
+        PeriodicJob("orphan_post_image_cleanup", orphan_post_image_cleanup),
+        PeriodicJob("withdrawn_user_purge", withdrawn_user_purge),
+        PeriodicJob("notification_purge", notification_purge),
+    )
 
 
 async def _view_buffer_flush_loop(stop_event: asyncio.Event, redis_client: Any) -> None:
@@ -71,13 +120,20 @@ async def lifespan(app: FastAPI):
     await init_redis(app)
 
     redis_client = get_app_redis(app)
-    await cleanup_once(redis=redis_client)
+    cleanup_jobs = _cleanup_jobs(redis_client)
+    await run_jobs_once(cleanup_jobs)
     stop_event = asyncio.Event()
     cleanup_task = None
     view_flush_task: asyncio.Task[None] | None = None
     fanout_listener_task: asyncio.Task[None] | None = None
     if settings.SIGNUP_IMAGE_CLEANUP_INTERVAL > 0:
-        cleanup_task = asyncio.create_task(run_loop_async(stop_event, redis=redis_client))
+        cleanup_task = asyncio.create_task(
+            run_periodic(
+                cleanup_jobs,
+                stop_event,
+                interval_seconds=max(60, settings.SIGNUP_IMAGE_CLEANUP_INTERVAL),
+            )
+        )
     if redis_client is not None and settings.VIEW_BUFFER_FLUSH_INTERVAL_SECONDS > 0:
         view_flush_task = asyncio.create_task(_view_buffer_flush_loop(stop_event, redis_client))
     if settings.REDIS_URL:
@@ -171,9 +227,8 @@ if settings.TRUSTED_HOSTS != ["*"]:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.TRUSTED_HOSTS)
 # RequestIdMiddleware가 가장 바깥 → 요청 진입 즉시 request_id 발급(에러 응답 포함 전 구간 전파).
 # GZip은 관측 미들웨어보다 바깥에 두어 압축 시간이 duration 측정을 오염시키지 않게 한다.
-app.middleware("http")(security_headers_middleware)
-app.middleware("http")(access_log_middleware)
-app.middleware("http")(metrics_middleware)
+# 보안 헤더·접근 로그·RED 메트릭은 한 겹(observability)으로 — 층당 task·스트림 할당 절감.
+app.middleware("http")(observability_middleware)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(ProxyHeadersMiddleware)
 app.add_middleware(RequestIdMiddleware)

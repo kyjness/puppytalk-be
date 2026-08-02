@@ -1,57 +1,38 @@
 # 4xx/5xx·슬로우 요청 접근 로그. request_id는 RequestIdFilter가 주입, 나머지는 extra로 구조화.
+# 호출은 observability_middleware(단일 @app.middleware)가 담당한다.
 import logging
-import time
-from collections.abc import Awaitable, Callable
 
 from starlette.requests import Request
-from starlette.responses import Response
 
 from app.core.config import settings
-from app.core.middleware.rate_limit import get_client_ip
+from app.core.middleware.proxy_headers import client_ip_from_scope
 
 _access_logger = logging.getLogger("app.access")
 
 
-async def access_log_middleware(
-    request: Request,
-    call_next: Callable[[Request], Awaitable[Response]],
-) -> Response:
-    """요청 시간 측정. 예외/4xx/5xx/슬로우를 구조화 필드(extra)로 기록. DEBUG 시 X-Process-Time 헤더."""
-    start = time.perf_counter()
-    try:
-        response = await call_next(request)
-    except Exception:
-        duration_ms = (time.perf_counter() - start) * 1000
-        _access_logger.exception(
-            "unhandled exception",
-            extra={
-                "method": request.method,
-                "path": request.url.path,
-                "duration_ms": round(duration_ms, 2),
-                "client_ip": get_client_ip(request),
-            },
-        )
-        raise
-
-    duration_ms = (time.perf_counter() - start) * 1000
-    client_ip = get_client_ip(request)
-
-    if settings.DEBUG:
-        response.headers["X-Process-Time"] = f"{duration_ms:.2f}"
-
-    fields: dict[str, object] = {
+def _fields(request: Request, status: int, duration_ms: float) -> dict[str, object]:
+    return {
         "method": request.method,
         "path": request.url.path,
-        "status": response.status_code,
+        "status": status,
         "duration_ms": round(duration_ms, 2),
-        "client_ip": client_ip,
+        "client_ip": client_ip_from_scope(request.scope),
     }
-    if response.status_code >= 500:
-        _access_logger.error("access", extra=fields)
-    elif response.status_code >= 400:
-        _access_logger.warning("access", extra=fields)
 
-    if duration_ms >= settings.SLOW_REQUEST_MS:
+
+def log_access(request: Request, status: int, duration_ms: float) -> None:
+    """4xx/5xx·슬로우만 기록 — 대부분의 요청(빠른 2xx)은 필드 조립조차 하지 않는다."""
+    is_slow = duration_ms >= settings.SLOW_REQUEST_MS
+    if status < 400 and not is_slow:
+        return
+    fields = _fields(request, status, duration_ms)
+    if status >= 500:
+        _access_logger.error("access", extra=fields)
+    elif status >= 400:
+        _access_logger.warning("access", extra=fields)
+    if is_slow:
         _access_logger.warning("slow request", extra=fields)
 
-    return response
+
+def log_unhandled_exception(request: Request, duration_ms: float) -> None:
+    _access_logger.exception("unhandled exception", extra=_fields(request, 500, duration_ms))

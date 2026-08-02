@@ -1,89 +1,44 @@
-# 만료된 회원가입용 임시 이미지 정리. Full-Async: run_once 비동기, run_loop_async(lifespan).
-# HTTP request가 없으므로 실행마다 task_id(ULID)를 발급해 로그 상관관계에 사용.
+# 주기 백그라운드 잡 러너. 어떤 잡을 어떤 보존 정책으로 돌릴지는 main lifespan이 소유하고,
+# core는 실행 루프(간격·잡 간 오류 격리·task_id 로그 상관관계)만 제공한다 — core가 도메인
+# 서비스를 직접 import하지 않는다. HTTP request가 없으므로 실행마다 task_id(ULID)를 발급.
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable, Sequence
+from typing import NamedTuple
 
-from app.core.config import settings
 from app.core.ids import new_ulid_str
-from app.db import get_connection
-from app.infra.redis import RedisLike
 
 log = logging.getLogger(__name__)
 
 
-async def run_once(redis: RedisLike | None = None) -> None:
+class PeriodicJob(NamedTuple):
+    """name은 로그 이벤트 접두사({name}_done/{name}_failed). run은 task_id를 받아 처리 건수를 반환."""
+
+    name: str
+    run: Callable[[str], Awaitable[int]]
+
+
+async def run_jobs_once(jobs: Sequence[PeriodicJob]) -> None:
+    """잡을 순차 실행. 한 잡의 실패가 다음 잡을 막지 않는다(경고 로그 후 계속)."""
     task_id = new_ulid_str()
     log.info("cleanup_start task_id=%s", task_id)
-
-    # 1) 회원가입 임시 이미지 정리
-    try:
-        from app.domain.media.service import MediaService
-
-        async with get_connection() as db:
-            deleted_count, failed_file_keys = await MediaService.cleanup_expired_signup_images(
-                db, task_id=task_id, redis=redis
-            )
-        if failed_file_keys:
-            log.warning(
-                "signup_image_cleanup_partial task_id=%s deleted_count=%s storage_delete_failed=%s keys=%s",
-                task_id,
-                deleted_count,
-                len(failed_file_keys),
-                failed_file_keys,
-            )
-            log.warning("[S3_DELETE_RETRY_NEEDED] task_id=%s keys=%s", task_id, failed_file_keys)
-        elif deleted_count:
-            log.info(
-                "signup_image_cleanup_done task_id=%s deleted_count=%s", task_id, deleted_count
-            )
-    except Exception as e:
-        log.warning("signup_image_cleanup_failed task_id=%s error=%s", task_id, e)
-
-    # 2) 게시글 작성 중 이탈 등으로 남은 고아 이미지(24h+) 정리
-    try:
-        from app.domain.media.service import MediaService
-
-        async with get_connection() as db:
-            deleted = await MediaService.sweep_unused_images(db, redis=redis)
-        if deleted:
-            log.info("orphan_post_image_cleanup_done task_id=%s deleted_count=%s", task_id, deleted)
-    except Exception as e:
-        log.warning("orphan_post_image_cleanup_failed task_id=%s error=%s", task_id, e)
-
-    # 3) 탈퇴 유저 파기(30일 경과 하드 삭제, 청크 단위)
-    try:
-        from app.domain.users.service import UserService
-
-        async with get_connection() as db:
-            deleted_users = await UserService.purge_withdrawn_users(older_than_days=30, db=db)
-        if deleted_users:
-            log.info(
-                "withdrawn_user_purge_done task_id=%s deleted_count=%s", task_id, deleted_users
-            )
-    except Exception as e:
-        log.warning("withdrawn_user_purge_failed task_id=%s error=%s", task_id, e)
-
-    # 4) 알림 자동 삭제(30일 경과)
-    try:
-        from app.domain.notifications.service import NotificationService
-
-        async with get_connection() as db:
-            deleted = await NotificationService.purge_old_notifications(
-                older_than_days=30,
-                chunk_size=2_000,
-                db=db,
-            )
-        if deleted:
-            log.info("notification_purge_done task_id=%s deleted_count=%s", task_id, deleted)
-    except Exception as e:
-        log.warning("notification_purge_failed task_id=%s error=%s", task_id, e)
-
-
-async def run_loop_async(stop_event: asyncio.Event, redis: RedisLike | None = None) -> None:
-    interval = max(60, settings.SIGNUP_IMAGE_CLEANUP_INTERVAL)
-    while not stop_event.is_set():
-        await run_once(redis=redis)
+    for job in jobs:
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=float(interval))
+            count = await job.run(task_id)
+            if count:
+                log.info("%s_done task_id=%s deleted_count=%s", job.name, task_id, count)
+        except Exception as e:
+            log.warning("%s_failed task_id=%s error=%s", job.name, task_id, e)
+
+
+async def run_periodic(
+    jobs: Sequence[PeriodicJob],
+    stop_event: asyncio.Event,
+    interval_seconds: float,
+) -> None:
+    while not stop_event.is_set():
+        await run_jobs_once(jobs)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
         except TimeoutError:
             pass  # Intended: interval elapsed, run cleanup again

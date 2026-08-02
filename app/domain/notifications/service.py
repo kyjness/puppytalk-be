@@ -8,6 +8,7 @@ from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from app.common.enums import NotificationKind
 from app.core.config import settings
@@ -126,7 +127,7 @@ class NotificationService:
                 from app.worker.tasks.notifications import deliver_notification_sns
 
                 # 결정적 멱등키: 같은 알림의 중복 enqueue가 워커에서 1회 배송으로 수렴.
-                await asyncio.to_thread(
+                await run_in_threadpool(
                     cast(Any, deliver_notification_sns).delay,
                     notification_id=uuid_to_base62(notification_id),
                     user_id=uuid_to_base62(recipient_user_id),

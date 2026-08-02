@@ -1,7 +1,5 @@
 import logging
 import re
-import secrets
-from typing import Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +17,8 @@ from app.core.metrics import VIEW_BUFFER_FLUSHED_VIEWS
 from app.domain.likes.model import PostLikesModel
 from app.domain.media.model import MediaModel
 from app.domain.posts.schemas import PostCreateRequest, PostResponse, PostUpdateRequest
+from app.infra.lock import release_lock, try_acquire_lock
+from app.infra.redis import RedisLike, bulk_to_str
 
 from ..repository import PostsModel, validate_search_query
 
@@ -65,7 +65,7 @@ def _view_redis_key(post_id: UUID, viewer_key: str) -> str:
 
 
 async def _consume_view_if_new_redis(
-    post_id: UUID, viewer_key: str, redis_client: Any | None
+    post_id: UUID, viewer_key: str, redis_client: RedisLike | None
 ) -> bool:
     # settings를 직접 읽는다 — 모듈 상수로 스냅샷하면 설정의 진실이 두 곳이 돼
     # 테스트·런타임 재설정이 조용히 무시된다.
@@ -83,7 +83,7 @@ async def _consume_view_if_new_redis(
         return True
 
 
-async def _get_buffer_pending(redis_client: Any | None, post_id: UUID) -> int:
+async def _get_buffer_pending(redis_client: RedisLike | None, post_id: UUID) -> int:
     if redis_client is None:
         return 0
     try:
@@ -94,7 +94,7 @@ async def _get_buffer_pending(redis_client: Any | None, post_id: UUID) -> int:
         return 0
 
 
-async def _try_view_increment_in_buffer(post_id: UUID, redis_client: Any | None) -> bool:
+async def _try_view_increment_in_buffer(post_id: UUID, redis_client: RedisLike | None) -> bool:
     try:
         if redis_client is None:
             raise ConnectionError("redis unavailable")
@@ -108,7 +108,7 @@ async def _try_view_increment_in_buffer(post_id: UUID, redis_client: Any | None)
 async def _apply_view_increment(
     post_id: UUID,
     viewer_key: str,
-    redis_client: Any | None,
+    redis_client: RedisLike | None,
     writer_db: AsyncSession,
 ) -> bool:
     """조회수 증가 안무: dedup → 버퍼 누적 → (버퍼 불가 시) writer 직접 증가 폴백.
@@ -201,7 +201,7 @@ class PostService:
         current_user_id: UUID | None = None,
         *,
         viewer_key: str,
-        redis_client: Any | None = None,
+        redis_client: RedisLike | None = None,
         writer_db: AsyncSession | None = None,
     ) -> PostResponse:
         async with db.begin():
@@ -229,22 +229,16 @@ class PostService:
         return data.model_copy(update={"view_count": data.view_count + pending + extra_db})
 
     @classmethod
-    async def flush_view_counts_to_db(cls, redis_client: Any | None) -> None:
+    async def flush_view_counts_to_db(cls, redis_client: RedisLike | None) -> None:
         if redis_client is None:
             return
-        lock_acquired = False
-        lock_value = secrets.token_urlsafe(24)
+        lock_value: str | None = None
         drain_key = f"views:{{v}}:drain:{new_ulid_str()}"
         try:
-            lock_acquired = bool(
-                await redis_client.set(
-                    VIEW_FLUSH_LOCK_KEY,
-                    lock_value,
-                    nx=True,
-                    ex=settings.VIEW_FLUSH_LOCK_SECONDS,
-                )
+            lock_value = await try_acquire_lock(
+                redis_client, VIEW_FLUSH_LOCK_KEY, settings.VIEW_FLUSH_LOCK_SECONDS
             )
-            if not lock_acquired:
+            if lock_value is None:
                 return
             renamed = await redis_client.eval(
                 _RENAME_BUFFER_TO_DRAIN_LUA, 2, VIEW_BUFFER_KEY, drain_key
@@ -264,11 +258,7 @@ class PostService:
                         for pid, cnt_raw in fields.items():
                             delta = int(cnt_raw)
                             if delta > 0:
-                                pk = (
-                                    pid.decode("utf-8")
-                                    if isinstance(pid, (bytes, bytearray))
-                                    else str(pid)
-                                )
+                                pk = bulk_to_str(pid) or ""
                                 await PostsModel.increment_view_count_delta(
                                     parse_public_id_value(pk), delta, db=db
                                 )
@@ -286,20 +276,13 @@ class PostService:
             except Exception as e:
                 log.warning("조회수 flush drain 삭제 실패(집계는 반영됨, stale 키만 잔존): %s", e)
         finally:
-            if lock_acquired:
-                try:
-                    await redis_client.eval(
-                        "if redis.call('GET', KEYS[1]) == ARGV[1] then "
-                        "return redis.call('DEL', KEYS[1]) else return 0 end",
-                        1,
-                        VIEW_FLUSH_LOCK_KEY,
-                        lock_value,
-                    )
-                except Exception as e:
-                    log.warning("조회수 flush 락 해제 실패: %s", e)
+            if lock_value is not None:
+                await release_lock(redis_client, VIEW_FLUSH_LOCK_KEY, lock_value)
 
     @staticmethod
-    async def _merge_drain_into_buffer(redis_client: Any, drain_key: str, buffer_key: str) -> None:
+    async def _merge_drain_into_buffer(
+        redis_client: RedisLike, drain_key: str, buffer_key: str
+    ) -> None:
         fields = await redis_client.hgetall(drain_key)
         if not fields:
             await redis_client.delete(drain_key)

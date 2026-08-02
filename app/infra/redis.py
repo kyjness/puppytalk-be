@@ -4,6 +4,7 @@ from collections.abc import Awaitable
 from typing import Any, Protocol, runtime_checkable
 
 from redis.asyncio import ConnectionPool, Redis
+from redis.exceptions import NoScriptError
 
 from app.core.config import settings
 
@@ -31,21 +32,35 @@ class RedisLike(Protocol):
     def setex(self, key: str, seconds: int, value: Any, /) -> Any: ...
     def delete(self, *keys: str) -> Any: ...
     def eval(self, script: str, numkeys: int, /, *args: Any) -> Any: ...
+    def evalsha(self, sha: str, numkeys: int, /, *args: Any) -> Any: ...
     def hget(self, key: str, field: str, /) -> Any: ...
     def hgetall(self, key: str, /) -> Any: ...
     def hincrby(self, key: str, field: str, amount: int, /) -> Any: ...
     def publish(self, channel: str, message: str, /) -> Any: ...
-    def pubsub(self) -> Any: ...
 
 
 def get_app_redis(app: Any) -> RedisLike | None:
-    """앱 lifespan에 붙은 클라이언트 조회의 단일 창구. 미초기화·비Redis 값은 None(fail-open).
+    """앱 lifespan에 붙은 클라이언트 조회의 단일 창구(핫패스 — rate limit이 매 요청 호출).
 
-    bare getattr는 isinstance 가드가 없어 잘못된 state 주입이 하류에서 AttributeError로
-    터진다 — 접근자를 한 곳으로 모아 가드·계약을 통일한다.
+    RedisLike isinstance 검사는 부팅·종료(init_redis/close_redis)에서만 수행한다 —
+    runtime_checkable Protocol isinstance는 멤버 수에 비례하는 속성 검사라 매 요청
+    태우기엔 비싸고, state에 실리는 값은 init_redis가 이미 계약을 강제한 클라이언트뿐이다.
     """
-    raw = getattr(app.state, "redis", None) if app is not None else None
-    return raw if isinstance(raw, RedisLike) else None
+    return getattr(app.state, "redis", None) if app is not None else None
+
+
+async def eval_script_cached(
+    redis: RedisLike, script: str, sha: str, numkeys: int, /, *args: Any
+) -> Any:
+    """EVALSHA 우선 실행 — 매 호출 스크립트 전문 전송을 피한다(핫패스 왕복 절감).
+
+    서버 스크립트 캐시가 빈 경우(NOSCRIPT — 재시작·FLUSH 직후)만 EVAL로 폴백해
+    자동 재로드한다(EVAL이 같은 sha1로 캐시를 채운다). sha는 호출부가
+    hashlib.sha1(script)로 사전 계산해 상수로 둔다."""
+    try:
+        return await redis.evalsha(sha, numkeys, *args)
+    except NoScriptError:
+        return await redis.eval(script, numkeys, *args)
 
 
 def bulk_to_str(value: Any) -> str | None:

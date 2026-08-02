@@ -1,7 +1,6 @@
 # 인증 의존성. Authorization Bearer 검증 → CurrentUser. Full-Async.
 
 import logging
-from typing import Any, cast
 
 import jwt
 from fastapi import Depends, Request
@@ -49,8 +48,7 @@ async def _ensure_jti_not_blacklisted(jti: str, request: Request) -> None:
         return
     key = access_jti_blacklist_redis_key(jti)
     try:
-        redis = cast(Any, redis_client)
-        if await redis.get(key) is not None:
+        if await redis_client.get(key) is not None:
             raise UnauthorizedException(message="인증 토큰이 유효하지 않습니다.")
     except UnauthorizedException:
         raise
@@ -123,7 +121,7 @@ async def get_current_user(
     cached_status: str | None = None
     if redis_client is not None:
         try:
-            cached_raw = await cast(Any, redis_client).get(user_status_cache_key(user_id))
+            cached_raw = await redis_client.get(user_status_cache_key(user_id))
             cached_status = bulk_to_str(cached_raw)
         except Exception as e:
             logger.warning("user status cache GET fail-open user_id=%s err=%s", user_id, e)

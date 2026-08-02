@@ -15,7 +15,7 @@ from app.common.exceptions import (
     UserNotFoundException,
 )
 from app.core.config import settings
-from app.core.middleware.rate_limit import check_fixed_window, count_rejection
+from app.core.rate_limit import check_fixed_window, count_rejection
 from app.db import AsyncSessionLocal
 from app.domain.chat.manager import chat_connection_manager
 from app.domain.chat.payload import parse_incoming_message, validation_error_to_ws_error
