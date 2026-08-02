@@ -1,4 +1,4 @@
-name: puppytalk-be
+name: puppytalk
 
 # 로컬 개발 전체 스택 — 클론 후 `docker compose up --build`면 API가 localhost:8000에 뜬다.
 # 컨테이너 네트워킹·개발 자격은 아래 environment로 주입(zero-config). 나머지는 app/core/config.py 기본값.
@@ -7,7 +7,7 @@ name: puppytalk-be
 services:
   db:
     image: postgres:15-alpine
-    container_name: puppytalk-be-db
+    container_name: puppytalk-db
     restart: unless-stopped
     ports:
       - "5432:5432"
@@ -26,7 +26,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: puppytalk-be-redis
+    container_name: puppytalk-redis
     restart: unless-stopped
     ports:
       - "6379:6379"
@@ -41,7 +41,7 @@ services:
 
   minio:
     image: minio/minio:latest
-    container_name: puppytalk-be-minio
+    container_name: puppytalk-minio
     restart: unless-stopped
     ports:
       - "9000:9000" # S3 API
@@ -58,7 +58,7 @@ services:
   #   prod S3 lifecycle rule의 dev 등가(ADR 0010).
   minio-init:
     image: minio/mc:latest
-    container_name: puppytalk-be-minio-init
+    container_name: puppytalk-minio-init
     depends_on:
       - minio
     entrypoint: >
@@ -74,7 +74,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: puppytalk-be-backend
+    container_name: puppytalk-backend
     restart: unless-stopped
     ports:
       - "8000:8000"
