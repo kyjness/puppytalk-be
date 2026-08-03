@@ -7,11 +7,11 @@ import logging
 from typing import Any
 from uuid import UUID
 
-from fastapi import HTTPException, Request
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from pydantic import TypeAdapter, ValidationError
 
-from app.common.codes import ApiCode
+from app.common.exceptions import ConcurrentUpdateException, InvalidRequestException
 from app.common.responses import get_request_id
 from app.common.schemas import ApiResponse
 from app.core.config import settings
@@ -43,13 +43,8 @@ def _normalize_idempotency_key(raw: str | None) -> str | None:
     if not s:
         return None
     if len(s) < _IDEMP_KEY_MIN or len(s) > _IDEMP_KEY_MAX:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": ApiCode.INVALID_REQUEST.value,
-                "message": f"X-Idempotency-Key는 {_IDEMP_KEY_MIN}~{_IDEMP_KEY_MAX}자여야 합니다.",
-                "data": None,
-            },
+        raise InvalidRequestException(
+            f"X-Idempotency-Key는 {_IDEMP_KEY_MIN}~{_IDEMP_KEY_MAX}자여야 합니다."
         )
     return s
 
@@ -92,6 +87,7 @@ async def post_create_idempotency_before(
     if rcli is None:
         return None, fp
 
+    # fail-open try는 Redis I/O만 감싼다 — 의도된 409는 try 밖에서 던져 삼켜질 표면 자체를 없앤다.
     try:
         payload = bulk_to_str(await rcli.get(_result_redis_key(fp)))
         if payload:
@@ -116,21 +112,12 @@ async def post_create_idempotency_before(
             nx=True,
             ex=settings.IDEMPOTENCY_POST_CREATE_LOCK_TTL_SECONDS,
         )
-        if not got_lock:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": ApiCode.CONFLICT.value,
-                    "message": _IDEMP_CONFLICT_MESSAGE,
-                    "data": None,
-                },
-            )
-    except HTTPException:
-        raise
     except Exception as e:
         log.warning("멱등성 Redis 오류(Fail-open): %s", e)
         return None, fp
 
+    if not got_lock:
+        raise ConcurrentUpdateException(_IDEMP_CONFLICT_MESSAGE)
     return None, fp
 
 

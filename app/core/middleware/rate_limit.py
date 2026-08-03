@@ -14,7 +14,7 @@ from app.common.paths import (
     SIGNUP_CONFIRM_PATH,
     SIGNUP_PRESIGN_PATH,
 )
-from app.common.responses import error_body
+from app.common.responses import error_body, retry_after_fields
 from app.core.config import settings
 from app.core.middleware.proxy_headers import client_ip_from_scope
 from app.core.rate_limit import check_fixed_window
@@ -88,18 +88,14 @@ async def _send_429(send: Send, scope: Scope, code: ApiCode, retry_after_seconds
     """순수 ASGI: 429 응답만 전송. 바디 규격은 error_body가 단일 소스."""
     state = scope.get("state") or {}
     rid = state.get("request_id", "") or ""
+    data, retry_after_value = retry_after_fields(retry_after_seconds)
     body = json.dumps(
-        error_body(
-            code.value,
-            "",
-            {"retry_after_seconds": retry_after_seconds},
-            request_id=rid,
-        ),
+        error_body(code.value, "", data, request_id=rid),
         ensure_ascii=False,
     ).encode("utf-8")
     headers = [
         (b"content-type", b"application/json"),
-        (b"retry-after", str(retry_after_seconds).encode()),
+        (b"retry-after", retry_after_value.encode()),
     ]
     await send(
         {

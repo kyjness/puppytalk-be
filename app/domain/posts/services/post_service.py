@@ -9,7 +9,6 @@ from sqlalchemy.orm.exc import StaleDataError
 from app.common import split_page
 from app.common.exceptions import (
     ConcurrentUpdateException,
-    InvalidImageException,
     InvalidRequestException,
     PostNotFoundException,
 )
@@ -82,7 +81,7 @@ async def _validate_refs(
     if image_ids:
         images = await MediaModel.get_images_by_ids(image_ids, db=db)
         if {i.id for i in images} != set(image_ids):
-            raise InvalidImageException()
+            raise InvalidRequestException("업로드되지 않은 이미지 ID를 참조할 수 없습니다.")
 
 
 def _view_redis_key(post_id: UUID, viewer_key: str) -> str:

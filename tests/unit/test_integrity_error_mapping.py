@@ -6,15 +6,12 @@ psycopg v3 예외의 실제 속성은 sqlstate다(pgcode는 v2 잔재 — 가짜
 포맷에 취약해 쓰지 않는다.
 """
 
-import json
 from types import SimpleNamespace
-from typing import Any, cast
 
 import pytest
-from app.core.exception_handlers import register_exception_handlers
-from fastapi import FastAPI
 from sqlalchemy.exc import IntegrityError
-from starlette.requests import Request
+
+from tests.unit.handler_harness import body_of, invoke_handler
 
 pytestmark = pytest.mark.asyncio
 
@@ -24,16 +21,9 @@ def _integrity_error(sqlstate: str | None, constraint: str | None = None) -> Int
     return IntegrityError("stmt", {}, orig)  # type: ignore[arg-type]
 
 
-def _request() -> Request:
-    return Request({"type": "http", "method": "POST", "path": "/t", "headers": []})
-
-
 async def _handle(exc: IntegrityError):
-    app = FastAPI()
-    register_exception_handlers(app)
-    handler = cast(Any, app.exception_handlers[IntegrityError])  # 등록된 async 핸들러
-    resp = await handler(_request(), exc)
-    return resp.status_code, json.loads(bytes(resp.body))["code"]
+    resp = await invoke_handler(IntegrityError, exc)
+    return resp.status_code, body_of(resp)["code"]
 
 
 async def test_unique_violation_maps_by_constraint_name():

@@ -5,10 +5,11 @@ import logging
 from collections.abc import Sequence
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.common import ApiCode
 from app.common.codes import UNIQUE_CONSTRAINT_CODES
@@ -55,6 +56,19 @@ def _log_error_structured(
         logger.log(level, "%s", line)
 
 
+def _masked_500_response(
+    request: Request, exc: Exception, *, event: str, code: ApiCode, status_code: int = 500
+) -> JSONResponse:
+    """5xx 응답의 단일 조립처: 구조화 로그 + 메시지 마스킹 + data 미노출.
+
+    모든 5xx 경로가 이 헬퍼를 지나야 마스킹 정책(메시지·data 모두)이 반쪽 적용될 수 없다."""
+    _log_error_structured(request, event, exc)
+    return JSONResponse(
+        status_code=status_code,
+        content=_error_payload(code.value, MASKED_500_MESSAGE, None, request=request),
+    )
+
+
 HTTP_STATUS_TO_CODE = {
     400: ApiCode.INVALID_REQUEST,
     401: ApiCode.UNAUTHORIZED,
@@ -69,61 +83,42 @@ HTTP_STATUS_TO_CODE = {
 
 
 def register_exception_handlers(app: FastAPI) -> None:
-    _VALIDATION_CODE_NAMES = frozenset(
-        {
-            ApiCode.INVALID_REQUEST_BODY.name,
-            ApiCode.INVALID_REQUEST.name,
-            ApiCode.INVALID_PASSWORD_FORMAT.name,
-            ApiCode.INVALID_FILE_FORMAT.name,
-            ApiCode.MISSING_REQUIRED_FIELD.name,
-            ApiCode.POST_FILE_LIMIT_EXCEEDED.name,
-        }
-    )
+    def _pick_validation_error(errors: Sequence[Any]) -> tuple[str, str]:
+        """(code, message)를 **같은 에러**에서 뽑는다 — 코드는 에러 N, 메시지는 에러 0을
+        쓰면 짝이 어긋난 응답이 된다.
 
-    def _pick_validation_code(errors: Sequence[Any]) -> str:
+        검증기는 ValueError(ApiCode.X.name)로 실패를 알린다 → pydantic msg는
+        "Value error, X". 접두 제거 후 ApiCode 이름과 **정확 일치**로 해석하므로
+        부분 문자열 충돌(INVALID_REQUEST ⊂ INVALID_REQUEST_BODY)도, 코드별 매핑
+        테이블을 따로 관리할 필요도 없다. 매칭 없으면 (INVALID_REQUEST_BODY, 첫 msg)."""
+        first_msg = ""
         for err in errors:
-            msg = err.get("msg", "") if isinstance(err.get("msg"), str) else ""
-            for name in _VALIDATION_CODE_NAMES:
-                if name in msg or msg == name:
-                    return getattr(ApiCode, name).value
-        return ApiCode.INVALID_REQUEST_BODY.value
-
-    def _first_validation_message(errors: Sequence[Any]) -> str | None:
-        if not errors:
-            return None
-        first = errors[0]
-        if isinstance(first, dict):
-            msg = first.get("msg")
-            if isinstance(msg, str) and msg:
-                return msg
-        return None
+            msg = err.get("msg") if isinstance(err, dict) else None
+            if not isinstance(msg, str):
+                continue
+            first_msg = first_msg or msg
+            code = ApiCode.__members__.get(msg.removeprefix("Value error, "))
+            if code is not None:
+                return code.value, msg
+        return ApiCode.INVALID_REQUEST_BODY.value, first_msg
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
-        errors = exc.errors()
-        code = _pick_validation_code(errors)
-        message = _first_validation_message(errors) or ""
+        code, message = _pick_validation_error(exc.errors())
         return JSONResponse(
             status_code=400,
             content=_error_payload(code, message, None, request=request),
         )
 
-    @app.exception_handler(HTTPException)
-    async def http_exception_handler(request: Request, exc: HTTPException):
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+        # 앱 코드는 BaseProjectException만 raise한다 — 여기는 프레임워크발 전용.
+        # 핸들러 조회는 예외의 MRO를 따르므로 Starlette 기반 클래스로 등록해야
+        # 라우팅 404/405(Starlette가 직접 raise)와 FastAPI HTTPException을 모두 받는다.
         headers = dict(exc.headers) if exc.headers else {}
-        if isinstance(exc.detail, dict) and "code" in exc.detail:
-            detail = exc.detail
-            code_str = detail.get("code", "")
-            message = detail.get("message", "") if isinstance(detail.get("message"), str) else ""
-            content = _error_payload(code_str, message, detail.get("data"), request=request)
-        else:
-            code_str = (HTTP_STATUS_TO_CODE.get(exc.status_code) or ApiCode.HTTP_ERROR).value
-            message = ""
-            if isinstance(exc.detail, str):
-                message = exc.detail
-            elif isinstance(exc.detail, dict) and "message" in exc.detail:
-                message = exc.detail.get("message") or ""
-            content = _error_payload(code_str, message, None, request=request)
+        code_str = (HTTP_STATUS_TO_CODE.get(exc.status_code) or ApiCode.HTTP_ERROR).value
+        message = exc.detail if isinstance(exc.detail, str) else ""
+        content = _error_payload(code_str, message, None, request=request)
         return JSONResponse(status_code=exc.status_code, content=content, headers=headers)
 
     @app.exception_handler(IntegrityError)
@@ -165,28 +160,25 @@ def register_exception_handlers(app: FastAPI) -> None:
         # OperationalError는 DatabaseError의 하위 클래스 — 핸들러 조회가 MRO를 따르므로
         # 여기 하나로 잡고 로그 event 라벨만 구분한다(응답은 동일).
         event = "db_operational_error" if isinstance(exc, OperationalError) else "db_database_error"
-        _log_error_structured(request, event, exc)
-        return JSONResponse(
-            status_code=500,
-            content=_error_payload(
-                ApiCode.DB_ERROR.value, MASKED_500_MESSAGE, None, request=request
-            ),
-        )
+        return _masked_500_response(request, exc, event=event, code=ApiCode.DB_ERROR)
 
     @app.exception_handler(BaseProjectException)
     async def project_exception_handler(request: Request, exc: BaseProjectException):
-        code_val = exc.code.value if isinstance(exc.code, ApiCode) else str(exc.code)
-        message = getattr(exc, "message", None)
-        message_str = message if isinstance(message, str) else ""
-        content = _error_payload(code_val, message_str, getattr(exc, "data", None), request=request)
-        return JSONResponse(status_code=exc.status_code, content=content)
+        # 5xx는 다른 500 경로(DatabaseError·unhandled)와 동일 정책(로그+마스킹, data 미노출).
+        # 4xx는 기대된 흐름이라 로그 없음.
+        if exc.status_code >= 500:
+            return _masked_500_response(
+                request,
+                exc,
+                event="project_exception_5xx",
+                code=exc.code,
+                status_code=exc.status_code,
+            )
+        content = _error_payload(exc.code.value, exc.message or "", exc.data, request=request)
+        return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers)
 
     @app.exception_handler(Exception)
     async def general_exception_handler(request: Request, exc: Exception):
-        _log_error_structured(request, "unhandled_exception", exc)
-        return JSONResponse(
-            status_code=500,
-            content=_error_payload(
-                ApiCode.INTERNAL_SERVER_ERROR.value, MASKED_500_MESSAGE, None, request=request
-            ),
+        return _masked_500_response(
+            request, exc, event="unhandled_exception", code=ApiCode.INTERNAL_SERVER_ERROR
         )
