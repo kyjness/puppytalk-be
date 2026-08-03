@@ -1,16 +1,18 @@
 from typing import Annotated
 
-from pydantic import AfterValidator, Field, computed_field, field_validator, model_validator
+from pydantic import AfterValidator, AliasChoices, Field, computed_field, field_validator
 
-from app.common import BaseSchema, OptionalPublicId, PublicId, UserStatus, UtcDatetime
+from app.common import BaseSchema, OptionalPublicId, PublicId, UtcDatetime
 from app.common.codes import ApiCode
-from app.domain.users.schema import RepresentativeDogInfo
+from app.domain.users.schema import AuthorInfo
 
 _POST_HASHTAGS_MAX = 6
+# 게시글 이미지 상한의 단일 정의처 — 초과는 여기서 거부하고, 리포지토리는 검증된 입력을 신뢰한다.
+POST_IMAGES_MAX = 5
 
 
 def _image_ids_max_five(v: list[str] | None) -> list[str] | None:
-    if v is not None and len(v) > 5:
+    if v is not None and len(v) > POST_IMAGES_MAX:
         raise ValueError(ApiCode.POST_FILE_LIMIT_EXCEEDED.name)
     return v
 
@@ -49,31 +51,6 @@ class PostUpdateRequest(BaseSchema):
     )
 
 
-class AuthorInfo(BaseSchema):
-    id: PublicId
-    nickname: str
-    profile_image_id: OptionalPublicId = None
-    profile_image_url: str | None = None
-    representative_dog: RepresentativeDogInfo | None = None
-
-    @model_validator(mode="wrap")
-    @classmethod
-    def anonymize_inactive(cls, data, handler):
-        status = getattr(data, "status", None)
-        if status is not None and not UserStatus.is_active_value(status):
-            if hasattr(data, "id"):
-                return handler(
-                    {
-                        "id": data.id,
-                        "nickname": "알수없음",
-                        "profile_image_id": None,
-                        "profile_image_url": None,
-                        "representative_dog": None,
-                    }
-                )
-        return handler(data)
-
-
 class FileInfo(BaseSchema):
     id: PublicId
     file_url: str | None = None
@@ -88,8 +65,12 @@ class PostResponse(BaseSchema):
     like_count: int = 0
     comment_count: int = 0
     is_liked: bool = False
-    author: AuthorInfo | None = None
-    files: list[FileInfo] = Field(default_factory=list)
+    # ORM 속성명(user·post_images)과 응답 필드명이 달라 validation_alias로 매핑한다
+    # (모델에 직렬화용 @property를 두지 않기 위함). 직렬화명은 alias_generator가 유지.
+    author: AuthorInfo | None = Field(default=None, validation_alias=AliasChoices("user", "author"))
+    files: list[FileInfo] = Field(
+        default_factory=list, validation_alias=AliasChoices("post_images", "files")
+    )
     category_id: int | None = None
     hashtags: list[str] = Field(default_factory=list)
     version: int = 1

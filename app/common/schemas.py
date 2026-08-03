@@ -68,6 +68,11 @@ class CursorPage(BaseSchema, Generic[T]):
     has_more: bool = False
 
 
+def split_page(rows: list[T], size: int) -> tuple[list[T], bool]:
+    """size+1 오버페치 결과를 (페이지, has_more)로 가른다 — keyset 페이지네이션 공용."""
+    return rows[:size], len(rows) > size
+
+
 class RootData(BaseSchema):
     message: str = ""
     version: str = ""
