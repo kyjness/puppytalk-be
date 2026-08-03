@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     and_,
     delete,
+    exists,
     or_,
     select,
     update,
@@ -95,6 +96,33 @@ class UserBlock(Base):
 
     blocker: Mapped["User"] = relationship("User", foreign_keys=[blocker_id], lazy="raise_on_sql")
     blocked: Mapped["User"] = relationship("User", foreign_keys=[blocked_id], lazy="raise_on_sql")
+
+
+def author_not_blocked_clause(author_col: Any, blocker_id: UUID | None) -> Any | None:
+    """blocker가 차단한 작성자를 제외하는 조건(대상 없으면 None).
+
+    "차단한 저자의 콘텐츠를 숨긴다"는 users 도메인 정책의 단일 정의처 —
+    posts·comments가 동일 술어를 공유한다(정책 변경 시 여기 한 곳만).
+    """
+    if blocker_id is None:
+        return None
+    return ~exists(1).where(
+        UserBlock.blocker_id == blocker_id,
+        UserBlock.blocked_id == author_col,
+    )
+
+
+def author_display_loads(author_rel: Any) -> Any:
+    """작성자 표시용 공통 eager load(프로필 이미지 + 대표견 1마리).
+
+    응답은 author.representative_dog 하나만 쓰므로 대표견 전용 뷰 관계로 로드한다.
+    dogs를 .and_() 필터로 로드하면 컬렉션 자체가 잘려 세션에 캐시되는 트랩이 있어
+    dogs는 건드리지 않는다. posts(Post.user)·comments(Comment.author)가 공유한다.
+    """
+    return joinedload(author_rel).options(
+        joinedload(User.profile_image),
+        selectinload(User.representative_dog).joinedload(DogProfile.profile_image),
+    )
 
 
 class UsersModel:

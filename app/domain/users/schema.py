@@ -86,6 +86,33 @@ OptionalNicknameStr = Annotated[str | None, AfterValidator(_optional_nickname)]
 # --- 4. 스키마 모델 ---
 
 
+class AuthorInfo(BaseSchema):
+    """게시글·댓글 공용 작성자 표시 스키마. 탈퇴자 익명화 정책의 단일 정의처."""
+
+    id: PublicId
+    nickname: str
+    profile_image_id: OptionalPublicId = None
+    profile_image_url: str | None = None
+    representative_dog: RepresentativeDogInfo | None = None
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def anonymize_inactive(cls, data, handler):
+        status = getattr(data, "status", None)
+        if status is not None and not UserStatus.is_active_value(status):
+            if hasattr(data, "id"):
+                return handler(
+                    {
+                        "id": data.id,
+                        "nickname": "알수없음",
+                        "profile_image_id": None,
+                        "profile_image_url": None,
+                        "representative_dog": None,
+                    }
+                )
+        return handler(data)
+
+
 class AvailabilityData(BaseSchema):
     email_available: bool | None = None
     nickname_available: bool | None = None

@@ -1,49 +1,29 @@
-# 댓글 요청/응답 DTO. CommentCreateRequest, CommentResponse, 목록 스키마.
+# 댓글 요청/응답 DTO. 작성자 표시(익명화 포함)는 users의 AuthorInfo 공용.
 
-from pydantic import Field, model_validator
+from pydantic import Field
 
-from app.common import BaseSchema, OptionalPublicId, PublicId, UserStatus, UtcDatetime
-from app.domain.users.schema import RepresentativeDogInfo
+from app.common import BaseSchema, OptionalPublicId, PublicId, UtcDatetime
+from app.domain.users.schema import AuthorInfo
 
 
 class CommentIdData(BaseSchema):
     id: PublicId
 
 
-class CommentUpsertRequest(BaseSchema):
+class CommentCreateRequest(BaseSchema):
     content: str = Field(..., min_length=1, max_length=500, description="댓글 내용 (1~500자)")
     parent_id: OptionalPublicId = None
 
 
-class CommentAuthorInfo(BaseSchema):
-    id: PublicId
-    nickname: str
-    profile_image_id: OptionalPublicId = None
-    profile_image_url: str | None = None
-    representative_dog: RepresentativeDogInfo | None = None
-
-    @model_validator(mode="wrap")
-    @classmethod
-    def anonymize_inactive(cls, data, handler):
-        status = getattr(data, "status", None)
-        if status is not None and not UserStatus.is_active_value(status):
-            if hasattr(data, "id"):
-                return handler(
-                    {
-                        "id": data.id,
-                        "nickname": "알수없음",
-                        "profile_image_id": None,
-                        "profile_image_url": None,
-                        "representative_dog": None,
-                    }
-                )
-        return handler(data)
+class CommentUpdateRequest(BaseSchema):
+    # 수정은 내용만 — parent_id를 받으면 조용히 무시되는 계약이 생기므로 필드 자체를 두지 않는다.
+    content: str = Field(..., min_length=1, max_length=500, description="댓글 내용 (1~500자)")
 
 
 class CommentResponse(BaseSchema):
     id: PublicId
     content: str
-    author: CommentAuthorInfo | None = None
+    author: AuthorInfo | None = None
     created_at: UtcDatetime
     updated_at: UtcDatetime
     post_id: OptionalPublicId = None

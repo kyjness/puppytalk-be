@@ -12,7 +12,7 @@ from app.common.exceptions import (
     ConcurrentUpdateException,
     PostNotFoundException,
 )
-from app.domain.comments.model import CommentLikesModel, CommentsModel
+from app.domain.comments.repository import CommentLikesModel, CommentsModel
 from app.domain.likes.model import PostLikesModel
 from app.domain.notifications.model import NotificationsModel
 from app.domain.notifications.service import NotificationService
@@ -111,8 +111,8 @@ class LikeService:
         inserted_out = False
         like_count_out = 0
         async with db.begin():
-            comment_row = await CommentsModel.get_comment_by_id(comment_id, db=db)
-            if comment_row is None:
+            comment_row = await CommentsModel.get_comment_meta(comment_id, db=db)
+            if comment_row is None or comment_row.deleted_at is not None:
                 raise CommentNotFoundException()
             try:
                 inserted = await CommentLikesModel.create(comment_id, user_id, db=db)
@@ -160,7 +160,8 @@ class LikeService:
         cls, comment_id: UUID, user_id: UUID, db: AsyncSession
     ) -> tuple[bool, int]:
         async with db.begin():
-            if await CommentsModel.get_comment_by_id(comment_id, db=db) is None:
+            meta = await CommentsModel.get_comment_meta(comment_id, db=db)
+            if meta is None or meta.deleted_at is not None:
                 raise CommentNotFoundException()
             try:
                 deleted = await CommentLikesModel.delete(comment_id, user_id, db=db)

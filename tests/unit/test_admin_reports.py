@@ -8,7 +8,8 @@ import inspect
 
 from app.common.enums import TargetType
 from app.domain.admin.service import AdminService
-from app.domain.comments.model import Comment, CommentsModel
+from app.domain.comments.model import Comment
+from app.domain.comments.repository import CommentsModel
 from app.domain.posts.model import Post
 from app.domain.posts.repository import PostsModel
 from app.domain.reports.model import Report

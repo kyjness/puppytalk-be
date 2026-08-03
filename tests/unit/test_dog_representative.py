@@ -6,10 +6,10 @@
 
 import inspect
 
-from app.domain.comments.model import _comment_author_loads
+from app.domain.comments.repository import _comment_author_loads
 from app.domain.dogs.model import DogProfile
 from app.domain.posts.repository import _post_author_and_content_loads
-from app.domain.users.model import User
+from app.domain.users.model import User, author_display_loads
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import RelationshipProperty
@@ -46,9 +46,14 @@ def test_owner_representative_partial_unique_index_ddl():
 
 
 def test_author_loaders_avoid_dogs_collection_trap():
-    # posts·comments 핫패스가 대표견 전용 관계로 로드하고, User.dogs를 .and_()로
-    # 필터-로드(컬렉션 truncate 트랩)하지 않는지 소스로 고정한다.
+    # 작성자 로드 정책의 단일 정의처(users.author_display_loads)가 대표견 전용 관계로
+    # 로드하고, User.dogs를 .and_()로 필터-로드(컬렉션 truncate 트랩)하지 않는지 소스로
+    # 고정한다. posts·comments 핫패스는 이 공용 로더를 경유해야 한다.
+    src = inspect.getsource(author_display_loads)
+    assert "User.representative_dog" in src
+    assert "User.dogs" not in src
     for loader in (_post_author_and_content_loads, _comment_author_loads):
-        src = inspect.getsource(loader)
-        assert "User.representative_dog" in src
-        assert "User.dogs" not in src
+        loader_src = inspect.getsource(loader)
+        assert "author_display_loads" in loader_src
+        # 핫패스 로더가 공용 로더를 우회해 트랩을 다시 들이는 것도 막는다.
+        assert "User.dogs" not in loader_src

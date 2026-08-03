@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.common.enums import TargetType
 from app.common.exceptions import CommentNotFoundException, PostNotFoundException
 from app.core.config import settings
-from app.domain.comments.model import CommentsModel
+from app.domain.comments.repository import CommentsModel
 from app.domain.posts.repository import PostsModel
 from app.domain.reports.model import ReportsModel
 from app.domain.reports.schema import ReportCreateRequest, ReportSubmitData
@@ -48,7 +48,8 @@ class ReportService:
                 if await PostsModel.get_post_author_id(data.target_id, db=db) is None:
                     raise PostNotFoundException()
             else:
-                if await CommentsModel.get_comment_by_id(data.target_id, db=db) is None:
+                meta = await CommentsModel.get_comment_meta(data.target_id, db=db)
+                if meta is None or meta.deleted_at is not None:
                     raise CommentNotFoundException()
 
             # Pydantic/Config(use_enum_values 등) 조합에 따라 reason이 Enum이 아니라 str로 들어올 수 있음.

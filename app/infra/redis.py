@@ -1,4 +1,5 @@
 # Redis 연결. Rate Limit·Refresh Token 저장. 앱 lifespan에서 init/close.
+import hashlib
 import logging
 from collections.abc import Awaitable
 from typing import Any, Protocol, runtime_checkable
@@ -61,6 +62,32 @@ async def eval_script_cached(
         return await redis.evalsha(sha, numkeys, *args)
     except NoScriptError:
         return await redis.eval(script, numkeys, *args)
+
+
+_RENAME_IF_EXISTS_LUA = """
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 0
+end
+redis.call('RENAME', KEYS[1], KEYS[2])
+return 1
+"""
+_RENAME_IF_EXISTS_SHA = hashlib.sha1(_RENAME_IF_EXISTS_LUA.encode()).hexdigest()
+
+
+async def rename_if_exists(redis: RedisLike, src: str, dst: str, /) -> bool:
+    """src 키가 있으면 dst로 원자적 RENAME. 없으면 no-op(False)."""
+    renamed = await eval_script_cached(
+        redis, _RENAME_IF_EXISTS_LUA, _RENAME_IF_EXISTS_SHA, 2, src, dst
+    )
+    return bool(int(renamed))
+
+
+async def merge_hash_into(redis: RedisLike, src: str, dst: str, /) -> None:
+    """src 해시의 정수 필드를 dst 해시에 합산한 뒤 src를 삭제한다(재병합용)."""
+    fields = await redis.hgetall(src)
+    for field, raw in fields.items():
+        await redis.hincrby(dst, field, int(raw))
+    await redis.delete(src)
 
 
 def bulk_to_str(value: Any) -> str | None:

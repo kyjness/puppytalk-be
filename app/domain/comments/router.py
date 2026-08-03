@@ -24,7 +24,12 @@ from app.common import (
     PublicId,
     api_response,
 )
-from app.domain.comments.schema import CommentIdData, CommentResponse, CommentUpsertRequest
+from app.domain.comments.schema import (
+    CommentCreateRequest,
+    CommentIdData,
+    CommentResponse,
+    CommentUpdateRequest,
+)
 from app.domain.comments.service import CommentService
 from app.infra.redis import RedisLike
 
@@ -34,7 +39,7 @@ router = APIRouter(prefix="/posts/{post_id}/comments", tags=["comments"])
 @router.post("", status_code=201, response_model=ApiResponse[CommentIdData])
 async def create_comment(
     request: Request,
-    comment_data: CommentUpsertRequest,
+    comment_data: CommentCreateRequest,
     post_id: Annotated[PublicId, Path(..., description="게시글 공개 ID (Base62)")],
     user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_master_db),
@@ -73,7 +78,7 @@ async def get_comments(
 @router.patch("/{comment_id}", status_code=200, response_model=ApiResponse[None])
 async def update_comment(
     request: Request,
-    comment_data: CommentUpsertRequest,
+    comment_data: CommentUpdateRequest,
     author_ctx: CommentAuthorContext = Depends(require_comment_author),
     db: AsyncSession = Depends(get_master_db),
 ):

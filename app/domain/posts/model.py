@@ -42,10 +42,6 @@ class Category(Base):
     name: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    posts: Mapped[list["Post"]] = relationship(
-        "Post", back_populates="category", lazy="raise_on_sql"
-    )
-
 
 class Hashtag(Base):
     __tablename__ = "hashtags"
@@ -61,13 +57,6 @@ class Hashtag(Base):
             postgresql_ops={"name": "gin_trgm_ops"},
             postgresql_with={"fastupdate": True},
         ),
-    )
-
-    posts: Mapped[list["Post"]] = relationship(
-        "Post",
-        secondary=post_hashtags,
-        back_populates="hashtags",
-        lazy="raise_on_sql",
     )
 
 
@@ -120,7 +109,7 @@ class Post(Base):
 
     user: Mapped[User | None] = relationship(User, foreign_keys=[user_id], lazy="raise_on_sql")
     category: Mapped[Category | None] = relationship(
-        "Category", back_populates="posts", foreign_keys=[category_id], lazy="raise_on_sql"
+        "Category", foreign_keys=[category_id], lazy="raise_on_sql"
     )
     post_images: Mapped[list["PostImage"]] = relationship(
         "PostImage",
@@ -131,17 +120,8 @@ class Post(Base):
     hashtags: Mapped[list[Hashtag]] = relationship(
         "Hashtag",
         secondary=post_hashtags,
-        back_populates="posts",
         lazy="raise_on_sql",
     )
-
-    @property
-    def author(self):
-        return self.user
-
-    @property
-    def files(self):
-        return self.post_images or []
 
 
 class PostImage(Base):

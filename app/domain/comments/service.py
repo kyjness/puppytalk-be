@@ -1,34 +1,31 @@
 # 댓글 비즈니스 로직. Full-Async. 생성/삭제 시 게시글 comment_count 조정은 서비스에서 조율.
 
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.exc import StaleDataError
 
+from app.common import split_page
 from app.common.enums import NotificationKind
 from app.common.exceptions import (
     CommentNotFoundException,
     ConcurrentUpdateException,
     PostNotFoundException,
 )
-from app.domain.comments.model import CommentLikesModel, CommentsModel
+from app.domain.comments.repository import CommentLikesModel, CommentsModel
 from app.domain.comments.schema import (
+    CommentCreateRequest,
     CommentIdData,
     CommentResponse,
-    CommentUpsertRequest,
+    CommentUpdateRequest,
 )
 from app.domain.notifications.model import NotificationsModel
 from app.domain.notifications.service import NotificationService
 from app.domain.posts.repository import PostsModel
 from app.infra.redis import RedisLike
 
-
-async def _increment_post_comment_count(post_id: UUID, db: AsyncSession) -> None:
-    await PostsModel.increment_comment_count(post_id, db=db)
-
-
-async def _decrement_post_comment_count(post_id: UUID, db: AsyncSession) -> None:
-    await PostsModel.decrement_comment_count(post_id, db=db)
+_DELETED_CONTENT_PLACEHOLDER = "삭제된 댓글입니다."
 
 
 async def _ensure_post_visible(
@@ -40,16 +37,13 @@ async def _ensure_post_visible(
         raise PostNotFoundException()
 
 
-def _comment_to_response(
-    c, liked_ids: set, deleted_content_placeholder: str = "삭제된 댓글입니다."
-):
+def _comment_to_response(c, liked_ids: set):
     """AsyncSession에서는 lazy load 금지이므로, c.replies에 접근하지 않고 필드만 넣어 응답 생성."""
     is_edited = c.updated_at > c.created_at if (c.updated_at and c.created_at) else False
     is_deleted = c.deleted_at is not None
-    content = (c.content if not is_deleted else deleted_content_placeholder) or ""
     return CommentResponse(
         id=c.id,
-        content=content,
+        content=c.content if not is_deleted else _DELETED_CONTENT_PLACEHOLDER,
         author=c.author,
         created_at=c.created_at,
         updated_at=c.updated_at,
@@ -88,31 +82,36 @@ class CommentService:
         cls,
         post_id: UUID,
         user_id: UUID,
-        data: CommentUpsertRequest,
+        data: CommentCreateRequest,
         db: AsyncSession,
         redis: RedisLike | None = None,
     ) -> CommentIdData:
-        notify: (
-            tuple[UUID, UUID, NotificationKind, UUID | None, UUID | None, UUID | None] | None
-        ) = None
+        notify: dict[str, Any] | None = None
         async with db.begin():
-            await _ensure_post_visible(post_id, db=db, current_user_id=user_id)
-            parent_id = getattr(data, "parent_id", None)
-            if parent_id is not None:
-                parent = await CommentsModel.get_comment_by_id(parent_id, db=db)
-                if not parent or parent.post_id != post_id or parent.deleted_at is not None:
-                    raise CommentNotFoundException()
-                if parent.parent_id is not None:
+            # 가시성 확인 + 작성자 조회를 1쿼리로(알림 수신자 판정에 작성자가 필요).
+            visible = await PostsModel.get_visible_post_author(
+                post_id, db=db, current_user_id=user_id
+            )
+            if visible is None:
+                raise PostNotFoundException()
+            post_author_id = visible.author_id
+            if data.parent_id is not None:
+                parent = await CommentsModel.get_comment_meta(data.parent_id, db=db)
+                if (
+                    parent is None
+                    or parent.deleted_at is not None
+                    or parent.post_id != post_id
+                    or parent.parent_id is not None
+                ):
                     raise CommentNotFoundException()
             comment = await CommentsModel.create_comment(
-                post_id, user_id, data.content, db=db, parent_id=parent_id
+                post_id, user_id, data.content, db=db, parent_id=data.parent_id
             )
             try:
-                await _increment_post_comment_count(post_id, db=db)
+                await PostsModel.increment_comment_count(post_id, db=db)
             except StaleDataError as e:
                 raise ConcurrentUpdateException() from e
             comment_id = comment.id
-            post_author_id = await PostsModel.get_post_author_id(post_id, db=db)
             if post_author_id and post_author_id != user_id:
                 nid = await NotificationsModel.insert(
                     user_id=post_author_id,
@@ -122,25 +121,16 @@ class CommentService:
                     comment_id=comment_id,
                     db=db,
                 )
-                notify = (
-                    post_author_id,
-                    nid,
-                    NotificationKind.COMMENT_ON_POST,
-                    user_id,
-                    post_id,
-                    comment_id,
-                )
+                notify = {
+                    "recipient_user_id": post_author_id,
+                    "notification_id": nid,
+                    "kind": NotificationKind.COMMENT_ON_POST,
+                    "actor_id": user_id,
+                    "post_id": post_id,
+                    "comment_id": comment_id,
+                }
         if notify is not None:
-            rec, nid, kind, act, pid, cid = notify
-            await NotificationService.publish_after_commit(
-                redis,
-                recipient_user_id=rec,
-                notification_id=nid,
-                kind=kind,
-                actor_id=act,
-                post_id=pid,
-                comment_id=cid,
-            )
+            await NotificationService.publish_after_commit(redis, **notify)
         return CommentIdData(id=comment_id)
 
     @classmethod
@@ -155,10 +145,7 @@ class CommentService:
     ) -> tuple[list[CommentResponse], bool]:
         sort_mode = sort if sort in ("latest", "oldest") else "latest"
         async with db.begin():
-            if not await PostsModel.post_is_visible(
-                post_id, db=db, current_user_id=current_user_id
-            ):
-                raise PostNotFoundException()
+            await _ensure_post_visible(post_id, db=db, current_user_id=current_user_id)
             fetched = await CommentsModel.get_root_comments(
                 post_id,
                 size,
@@ -167,8 +154,7 @@ class CommentService:
                 sort=sort_mode,
                 current_user_id=current_user_id,
             )
-            has_more = len(fetched) > size
-            roots = fetched[:size]
+            roots, has_more = split_page(fetched, size)
             replies = await CommentsModel.get_replies_for_roots(
                 [r.id for r in roots], db=db, current_user_id=current_user_id
             )
@@ -188,26 +174,24 @@ class CommentService:
         cls,
         post_id: UUID,
         comment_id: UUID,
-        data: CommentUpsertRequest,
+        data: CommentUpdateRequest,
         db: AsyncSession,
     ) -> None:
         async with db.begin():
-            affected = await CommentsModel.update_comment(post_id, comment_id, data.content, db=db)
-            if affected == 0:
+            if not await CommentsModel.update_comment(post_id, comment_id, data.content, db=db):
                 raise CommentNotFoundException()
 
     @classmethod
     async def delete_comment(cls, post_id: UUID, comment_id: UUID, db: AsyncSession) -> None:
         async with db.begin():
-            comment = await CommentsModel.get_comment_by_id(comment_id, db=db, include_deleted=True)
-            if comment is None or comment.post_id != post_id:
+            # UPDATE 우선(행복 경로 1쿼리) — 0건이면 메타로 미존재/이미 삭제(멱등 204)를 가른다.
+            if await CommentsModel.delete_comment(post_id, comment_id, db=db):
+                try:
+                    await PostsModel.decrement_comment_count(post_id, db=db)
+                except StaleDataError as e:
+                    raise ConcurrentUpdateException() from e
+                return
+            meta = await CommentsModel.get_comment_meta(comment_id, db=db)
+            if meta is None or meta.post_id != post_id or meta.deleted_at is None:
                 raise CommentNotFoundException()
-            if comment.deleted_at is not None:
-                return  # 이미 삭제됨 → 204 (멱등)
-            deleted = await CommentsModel.delete_comment(post_id, comment_id, db=db)
-            if not deleted:
-                raise CommentNotFoundException()
-            try:
-                await _decrement_post_comment_count(post_id, db=db)
-            except StaleDataError as e:
-                raise ConcurrentUpdateException() from e
+            return  # 이미 삭제됨 → 204 (멱등)
