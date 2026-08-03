@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.exceptions import (
     InternalServerErrorException,
-    InvalidUserInfoException,
+    InvalidRequestException,
     NicknameAlreadyExistsException,
     UnauthorizedException,
 )
@@ -87,7 +87,7 @@ class UserService:
                 else:
                     new_pid = data.profile_image_id
                     if new_pid is None or await MediaModel.get_image_by_id(new_pid, db=db) is None:
-                        raise InvalidUserInfoException()
+                        raise InvalidRequestException()
                     updates["profile_image_id"] = new_pid
 
             # 2) 유저 행 갱신
@@ -117,7 +117,7 @@ class UserService:
             ):
                 raise UnauthorizedException()
             if await verify_password_with_legacy_fallback(data.new_password, hashed):
-                raise InvalidUserInfoException(
+                raise InvalidRequestException(
                     "기존 비밀번호와 동일한 비밀번호는 사용할 수 없습니다."
                 )
             new_hashed = await hash_password(password_with_pepper(data.new_password))
@@ -144,7 +144,7 @@ class UserService:
     ) -> bool:
         """이미 차단되어 있으면 해제(delete), 아니면 차단(insert). 반환: 차단 여부(True=차단됨, False=해제됨)."""
         if blocker_id == target_user_id:
-            raise InvalidUserInfoException("자기 자신은 차단할 수 없습니다.")
+            raise InvalidRequestException("자기 자신은 차단할 수 없습니다.")
         async with db.begin():
             exists = await UsersModel.block_exists(blocker_id, target_user_id, db=db)
             if exists:

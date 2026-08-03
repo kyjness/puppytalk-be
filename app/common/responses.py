@@ -24,6 +24,12 @@ def error_body(
     return {"code": code, "message": message, "data": data, "requestId": request_id}
 
 
+def retry_after_fields(retry_after_seconds: int) -> tuple[dict[str, int], str]:
+    """429 응답의 (data, Retry-After 헤더 값) 단일 정의 — rate limit 미들웨어와
+    TooManyRequestsException이 공유해 두 429 경로가 같은 와이어 계약을 유지한다."""
+    return {"retry_after_seconds": retry_after_seconds}, str(retry_after_seconds)
+
+
 def api_response(
     request: Request,
     *,

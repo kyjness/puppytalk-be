@@ -157,11 +157,12 @@ async def chat_dm_websocket(websocket: WebSocket) -> None:
                     websocket, "peer_not_found", e.message or "상대방을 찾을 수 없습니다."
                 )
             except BaseProjectException as e:
-                await _send_ws_error(
-                    websocket,
-                    str(e.code) if e.code is not None else "error",
-                    e.message or "",
-                )
+                # HTTP 표면과 동일한 5xx 정책: 서버 로그 + 내부 상세 비노출.
+                if e.status_code >= 500:
+                    log.exception("chat ws domain 5xx user=%s", user_id)
+                    await _send_ws_error(websocket, "internal_error", "일시적 오류입니다.")
+                else:
+                    await _send_ws_error(websocket, str(e.code), e.message or "")
             except Exception:
                 log.exception("chat ws send 실패 user=%s", user_id)
                 await _send_ws_error(websocket, "internal_error", "일시적 오류입니다.")
