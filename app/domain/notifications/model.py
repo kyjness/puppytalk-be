@@ -4,14 +4,16 @@ from datetime import datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, delete, select, text, update
+from sqlalchemy import DateTime, ForeignKey, Index, String, select, text, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.common import split_page
 from app.common.enums import NotificationKind
 from app.core.ids import new_uuid7
 from app.db.base_class import PG_UUID, Base, utc_now
+from app.db.statements import delete_rows
 
 
 class Notification(Base):
@@ -90,15 +92,14 @@ class NotificationsModel:
             stmt = stmt.where(Notification.id < cursor_id)
         stmt = stmt.order_by(Notification.id.desc()).limit(size + 1)
         rows = list((await db.execute(stmt)).scalars().all())
-        has_more = len(rows) > size
-        return rows[:size], has_more
+        return split_page(rows, size)
 
     @classmethod
     async def mark_read(
         cls,
         user_id: UUID,
         *,
-        notification_ids: list[UUID] | None,
+        notification_ids: list[UUID],
         db: AsyncSession,
     ) -> int:
         now = utc_now()
@@ -116,41 +117,21 @@ class NotificationsModel:
         return int(cr.rowcount or 0)
 
     @classmethod
-    async def purge_older_than_days(
+    async def delete_older_than(
         cls,
         *,
         older_than_days: int,
-        chunk_size: int = 2_000,
+        limit: int,
         db: AsyncSession,
     ) -> int:
-        """
-        created_at 기준 보관기간 초과 알림 삭제.
-        대량 삭제 시 락/트랜잭션 부하를 줄이기 위해 id를 청크로 잘라 반복 삭제한다.
-        """
-
-        days = max(1, int(older_than_days))
-        limit = max(100, int(chunk_size))
-        cutoff = utc_now() - timedelta(days=days)
-        deleted_total = 0
-
-        while True:
-            id_rows = (
-                (
-                    await db.execute(
-                        select(Notification.id)
-                        .where(Notification.created_at < cutoff)
-                        .order_by(Notification.created_at.asc())
-                        .limit(limit)
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            if not id_rows:
-                break
-            stmt = delete(Notification).where(Notification.id.in_(list(id_rows)))
-            cr = cast(CursorResult[Any], await db.execute(stmt))
-            deleted_total += int(cr.rowcount or 0)
-            await db.flush()
-
-        return deleted_total
+        """created_at 기준 보관기간 초과 알림 1청크 삭제 — 루프·트랜잭션 경계는 서비스가
+        소유한다(청크별 커밋으로 락을 청크 단위로만 잡기 위함). 삭제 순서는 무관하므로
+        정렬 없이 LIMIT 서브쿼리로 잘라 1문으로 지운다."""
+        cutoff = utc_now() - timedelta(days=max(1, int(older_than_days)))
+        expired_ids = (
+            select(Notification.id)
+            .where(Notification.created_at < cutoff)
+            .limit(max(100, int(limit)))
+            .scalar_subquery()
+        )
+        return await delete_rows(db, Notification, [Notification.id.in_(expired_ids)])

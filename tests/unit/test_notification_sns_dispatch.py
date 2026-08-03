@@ -13,6 +13,7 @@ from app.common.enums import NotificationKind
 from app.core.config import settings
 from app.core.ids import uuid_to_base62
 from app.domain.notifications import service as notif_service
+from app.domain.notifications.schema import NotificationEvent
 from app.domain.notifications.service import NotificationService
 from app.infra import sns as sns_mod
 from app.worker.jobs import notification_delivery as job
@@ -39,9 +40,8 @@ class _RecordingTask:
         self.calls.append(kwargs)
 
 
-async def _dispatch(recipient, nid):
-    await NotificationService._dispatch_sns_publish(
-        None,
+def _event(recipient, nid) -> NotificationEvent:
+    return NotificationEvent(
         recipient_user_id=recipient,
         notification_id=nid,
         kind=_KIND,
@@ -51,12 +51,16 @@ async def _dispatch(recipient, nid):
     )
 
 
-def _capture_inline(monkeypatch) -> list[dict]:
-    inline_calls: list[dict] = []
+async def _dispatch(recipient, nid):
+    await NotificationService._dispatch_sns_publish(None, _event(recipient, nid))
+
+
+def _capture_inline(monkeypatch) -> list[NotificationEvent]:
+    inline_calls: list[NotificationEvent] = []
     monkeypatch.setattr(
         NotificationService,
         "_schedule_sns_publish",
-        classmethod(lambda cls, redis, **kw: inline_calls.append(kw)),
+        classmethod(lambda cls, redis, event: inline_calls.append(event)),
     )
     return inline_calls
 
@@ -222,15 +226,7 @@ async def test_job_skips_when_already_delivered(monkeypatch):
 
 
 async def _inline_publish(redis, nid, recipient):
-    await NotificationService._publish_sns_task(
-        redis,
-        recipient_user_id=recipient,
-        notification_id=nid,
-        kind=_KIND,
-        actor_id=None,
-        post_id=None,
-        comment_id=None,
-    )
+    await NotificationService._publish_sns_task(redis, _event(recipient, nid))
 
 
 async def test_inline_fallback_skips_when_worker_already_delivered(monkeypatch):

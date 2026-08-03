@@ -1,6 +1,5 @@
 # 댓글 비즈니스 로직. Full-Async. 생성/삭제 시 게시글 comment_count 조정은 서비스에서 조율.
 
-from typing import Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,7 +19,7 @@ from app.domain.comments.schema import (
     CommentResponse,
     CommentUpdateRequest,
 )
-from app.domain.notifications.model import NotificationsModel
+from app.domain.notifications.schema import NotificationEvent
 from app.domain.notifications.service import NotificationService
 from app.domain.posts.repository import PostsModel
 from app.infra.redis import RedisLike
@@ -86,7 +85,7 @@ class CommentService:
         db: AsyncSession,
         redis: RedisLike | None = None,
     ) -> CommentIdData:
-        notify: dict[str, Any] | None = None
+        event: NotificationEvent | None = None
         async with db.begin():
             # 가시성 확인 + 작성자 조회를 1쿼리로(알림 수신자 판정에 작성자가 필요).
             visible = await PostsModel.get_visible_post_author(
@@ -113,24 +112,16 @@ class CommentService:
                 raise ConcurrentUpdateException() from e
             comment_id = comment.id
             if post_author_id and post_author_id != user_id:
-                nid = await NotificationsModel.insert(
-                    user_id=post_author_id,
+                event = await NotificationService.record(
+                    recipient_user_id=post_author_id,
                     kind=NotificationKind.COMMENT_ON_POST,
                     actor_id=user_id,
                     post_id=post_id,
                     comment_id=comment_id,
                     db=db,
                 )
-                notify = {
-                    "recipient_user_id": post_author_id,
-                    "notification_id": nid,
-                    "kind": NotificationKind.COMMENT_ON_POST,
-                    "actor_id": user_id,
-                    "post_id": post_id,
-                    "comment_id": comment_id,
-                }
-        if notify is not None:
-            await NotificationService.publish_after_commit(redis, **notify)
+        if event is not None:
+            await NotificationService.publish_after_commit(redis, event)
         return CommentIdData(id=comment_id)
 
     @classmethod

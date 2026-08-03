@@ -13,7 +13,7 @@ from app.core.config import settings
 from app.core.ids import parse_public_id_value
 from app.db import get_connection
 from app.domain.notifications.model import Notification
-from app.domain.notifications.service import NotificationService
+from app.domain.notifications.schema import NotificationEvent, build_sns_payload
 from app.infra.redis import RedisLike
 from app.infra.sns import deliver_once
 
@@ -80,13 +80,15 @@ async def deliver_notification_sns_async(
         async with db.begin():
             row = await _load_notification(db, notification_id=nid, user_id=uid)
 
-    payload = NotificationService.build_sns_payload(
-        recipient_user_id=uid,
-        notification_id=row.id,
-        kind=NotificationKind(row.kind),
-        actor_id=row.actor_id,
-        post_id=row.post_id,
-        comment_id=row.comment_id,
+    payload = build_sns_payload(
+        NotificationEvent(
+            recipient_user_id=uid,
+            notification_id=row.id,
+            kind=NotificationKind(row.kind),
+            actor_id=row.actor_id,
+            post_id=row.post_id,
+            comment_id=row.comment_id,
+        )
     )
     delivered = await deliver_once(
         redis,

@@ -3,13 +3,12 @@
 from typing import Any, NamedTuple
 from uuid import UUID
 
-from sqlalchemy import and_, delete, exists, func, or_, select, update
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, joinedload
 
 from app.db.base_class import utc_now
-from app.db.statements import update_one_returning
+from app.db.statements import delete_rows, insert_ignore, update_one_returning
 from app.domain.posts.model import Post
 from app.domain.users.model import User, author_display_loads, author_not_blocked_clause
 
@@ -130,18 +129,37 @@ class CommentsModel:
         return c
 
     @classmethod
-    async def get_comment_meta(cls, comment_id: UUID, *, db: AsyncSession) -> CommentMeta | None:
-        """부모 검증·멱등 삭제 판별용 — 삭제된 댓글도 매칭한다(deleted_at으로 구분)."""
+    async def _select_comment_meta(
+        cls, comment_id: UUID, db: AsyncSession, *extra_conds: Any
+    ) -> CommentMeta | None:
         row = (
             await db.execute(
                 select(
                     Comment.post_id, Comment.parent_id, Comment.author_id, Comment.deleted_at
-                ).where(Comment.id == comment_id)
+                ).where(Comment.id == comment_id, *extra_conds)
             )
         ).one_or_none()
         if row is None:
             return None
         return CommentMeta(post_id=row[0], parent_id=row[1], author_id=row[2], deleted_at=row[3])
+
+    @classmethod
+    async def get_comment_meta(cls, comment_id: UUID, *, db: AsyncSession) -> CommentMeta | None:
+        """부모 검증·멱등 삭제 판별용 — 삭제된 댓글도 매칭한다(deleted_at으로 구분)."""
+        return await cls._select_comment_meta(comment_id, db)
+
+    @classmethod
+    async def get_visible_comment_meta(
+        cls, comment_id: UUID, *, db: AsyncSession, current_user_id: UUID | None = None
+    ) -> CommentMeta | None:
+        """표시 가능한(미삭제·미블라인드·차단 작성자 제외) 댓글의 메타 — 좋아요 등 쓰기 가드용.
+
+        가시성 규칙은 목록과 같은 _reply_visible_conditions 한 곳 — 보이지 않는 댓글에
+        카운트·알림이 붙는 드리프트를 막는다.
+        """
+        return await cls._select_comment_meta(
+            comment_id, db, *_reply_visible_conditions(Comment, current_user_id)
+        )
 
     @classmethod
     async def get_root_comments(
@@ -332,24 +350,19 @@ class CommentLikesModel:
         return set(result.scalars().all())
 
     @classmethod
-    async def create(cls, comment_id: UUID, user_id: UUID, db: AsyncSession) -> bool:
-        stmt = (
-            pg_insert(CommentLike)
-            .values(comment_id=comment_id, user_id=user_id, created_at=utc_now())
-            .on_conflict_do_nothing(index_elements=[CommentLike.comment_id, CommentLike.user_id])
-            .returning(CommentLike.comment_id)
+    async def create(cls, comment_id: UUID, user_id: UUID, *, db: AsyncSession) -> bool:
+        return await insert_ignore(
+            db,
+            CommentLike,
+            {"comment_id": comment_id, "user_id": user_id, "created_at": utc_now()},
+            [CommentLike.comment_id, CommentLike.user_id],
         )
-        result = await db.execute(stmt)
-        return result.scalar_one_or_none() is not None
 
     @classmethod
-    async def delete(cls, comment_id: UUID, user_id: UUID, db: AsyncSession) -> bool:
-        r = await db.execute(
-            delete(CommentLike)
-            .where(
-                CommentLike.comment_id == comment_id,
-                CommentLike.user_id == user_id,
-            )
-            .returning(CommentLike.comment_id)
+    async def delete(cls, comment_id: UUID, user_id: UUID, *, db: AsyncSession) -> bool:
+        deleted = await delete_rows(
+            db,
+            CommentLike,
+            [CommentLike.comment_id == comment_id, CommentLike.user_id == user_id],
         )
-        return r.scalar_one_or_none() is not None
+        return deleted > 0

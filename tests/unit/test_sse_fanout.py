@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 from app.domain.chat.service import ChatService
+from app.domain.notifications.schema import NotificationEvent
 from app.domain.notifications.service import NotificationService
 from app.domain.notifications.stream import (
     NOTIF_SSE_FANOUT_CHANNEL,
@@ -84,23 +85,23 @@ async def test_sse_subscribe_emits_ping_on_idle():
 # --- publish_after_commit 팬아웃 경로 ---
 
 
-def _publish_kwargs(uid) -> dict[str, Any]:
+def _event(uid) -> NotificationEvent:
     from app.common.enums import NotificationKind
 
-    return {
-        "recipient_user_id": uid,
-        "notification_id": uuid4(),
-        "kind": NotificationKind.LIKE_POST,
-        "actor_id": None,
-        "post_id": None,
-        "comment_id": None,
-    }
+    return NotificationEvent(
+        recipient_user_id=uid,
+        notification_id=uuid4(),
+        kind=NotificationKind.LIKE_POST,
+        actor_id=None,
+        post_id=None,
+        comment_id=None,
+    )
 
 
 async def test_publish_after_commit_sends_single_channel_envelope_with_origin():
     uid = uuid4()
     redis = FakeRedis()
-    await NotificationService.publish_after_commit(redis, **_publish_kwargs(uid))  # type: ignore[arg-type]
+    await NotificationService.publish_after_commit(redis, _event(uid))  # type: ignore[arg-type]
     [(channel, raw)] = redis.published
     assert channel == NOTIF_SSE_FANOUT_CHANNEL
     env = json.loads(raw)
@@ -118,7 +119,7 @@ async def test_publish_after_commit_delivers_locally_even_when_publish_succeeds(
     try:
         await NotificationService.publish_after_commit(
             FakeRedis(),  # type: ignore[arg-type]
-            **_publish_kwargs(uid),
+            _event(uid),
         )
         assert queue.qsize() == 1
     finally:
@@ -131,7 +132,7 @@ async def test_publish_after_commit_delivers_locally_when_publish_fails():
     try:
         await NotificationService.publish_after_commit(
             FakeRedis(fail_publish=True),  # type: ignore[arg-type]
-            **_publish_kwargs(uid),
+            _event(uid),
         )
         payload = queue.get_nowait()
         assert json.loads(payload)["kind"] == "LIKE_POST"
@@ -143,7 +144,7 @@ async def test_publish_after_commit_delivers_locally_without_redis():
     uid = uuid4()
     queue = await notification_sse_manager.register(uid)
     try:
-        await NotificationService.publish_after_commit(None, **_publish_kwargs(uid))
+        await NotificationService.publish_after_commit(None, _event(uid))
         assert queue.qsize() == 1
     finally:
         await notification_sse_manager.unregister(uid, queue)
