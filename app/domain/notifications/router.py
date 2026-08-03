@@ -37,7 +37,6 @@ router = APIRouter(prefix="/notifications", tags=["notifications"])
     response_class=StreamingResponse,
 )
 async def notifications_stream(
-    request: Request,
     user: CurrentUser = Depends(get_current_user),
 ):
     """로컬 팬아웃 큐 기반 SSE. Redis 장애 시에도 스트림은 유지되고 같은 인스턴스
@@ -78,8 +77,7 @@ async def mark_notifications_read(
     user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_master_db),
 ):
-    ids = body.ids if body.ids else None
-    n = await NotificationService.mark_read(user.id, ids=ids, db=db)
+    n = await NotificationService.mark_read(user.id, ids=body.ids, db=db)
     return api_response(
         request,
         code=ApiCode.OK,

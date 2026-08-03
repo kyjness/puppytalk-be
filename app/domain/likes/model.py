@@ -4,12 +4,12 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import DateTime, ForeignKey, delete, select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import DateTime, ForeignKey, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base_class import PG_UUID, Base, utc_now
+from app.db.statements import delete_rows, insert_ignore
 
 
 class PostLike(Base):
@@ -26,13 +26,6 @@ class PostLike(Base):
 
 class PostLikesModel:
     @classmethod
-    async def has_like(cls, post_id: UUID, user_id: UUID, db: AsyncSession) -> bool:
-        result = await db.execute(
-            select(1).where(PostLike.post_id == post_id, PostLike.user_id == user_id).limit(1)
-        )
-        return result.scalar_one_or_none() is not None
-
-    @classmethod
     async def get_liked_post_ids_for_user(
         cls, user_id: UUID, post_ids: list[UUID], db: AsyncSession
     ) -> set[UUID]:
@@ -43,31 +36,24 @@ class PostLikesModel:
             PostLike.post_id.in_(post_ids),
         )
         result = await db.execute(stmt)
-        return {r[0] for r in result.all()}
+        return set(result.scalars().all())
 
     @classmethod
     async def create(cls, post_id: UUID, user_id: UUID, *, db: AsyncSession) -> bool:
-        stmt = (
-            pg_insert(PostLike)
-            .values(post_id=post_id, user_id=user_id, created_at=utc_now())
-            .on_conflict_do_nothing(index_elements=[PostLike.post_id, PostLike.user_id])
-            .returning(PostLike.post_id)
+        return await insert_ignore(
+            db,
+            PostLike,
+            {"post_id": post_id, "user_id": user_id, "created_at": utc_now()},
+            [PostLike.post_id, PostLike.user_id],
         )
-        result = await db.execute(stmt)
-        return result.scalar_one_or_none() is not None
 
     @classmethod
-    async def delete(cls, post_id: UUID, user_id: UUID, db: AsyncSession) -> bool:
-        r = await db.execute(
-            delete(PostLike)
-            .where(PostLike.post_id == post_id, PostLike.user_id == user_id)
-            .returning(PostLike.post_id)
+    async def delete(cls, post_id: UUID, user_id: UUID, *, db: AsyncSession) -> bool:
+        deleted = await delete_rows(
+            db, PostLike, [PostLike.post_id == post_id, PostLike.user_id == user_id]
         )
-        return r.scalar_one_or_none() is not None
+        return deleted > 0
 
     @classmethod
     async def delete_by_post_id(cls, post_id: UUID, db: AsyncSession) -> int:
-        r = await db.execute(
-            delete(PostLike).where(PostLike.post_id == post_id).returning(PostLike.post_id)
-        )
-        return len(list(r.scalars().all()))
+        return await delete_rows(db, PostLike, [PostLike.post_id == post_id])

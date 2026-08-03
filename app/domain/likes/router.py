@@ -21,12 +21,10 @@ async def like_post(
     db: AsyncSession = Depends(get_master_db),
     redis: RedisLike | None = Depends(get_optional_redis),
 ):
-    is_liked, like_count, inserted = await LikeService.like_post(
-        post_id, user.id, db=db, redis=redis
-    )
+    like_count, inserted = await LikeService.like_post(post_id, user.id, db=db, redis=redis)
     code = ApiCode.OK if inserted else ApiCode.ALREADY_LIKED
     return api_response(
-        request, code=code, data=LikeResponseData(is_liked=is_liked, like_count=like_count)
+        request, code=code, data=LikeResponseData(is_liked=True, like_count=like_count)
     )
 
 
@@ -37,11 +35,11 @@ async def unlike_post(
     user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_master_db),
 ):
-    is_liked, like_count = await LikeService.unlike_post(post_id, user.id, db=db)
+    like_count = await LikeService.unlike_post(post_id, user.id, db=db)
     return api_response(
         request,
         code=ApiCode.OK,
-        data=LikeResponseData(is_liked=is_liked, like_count=like_count),
+        data=LikeResponseData(is_liked=False, like_count=like_count),
     )
 
 
@@ -57,12 +55,10 @@ async def like_comment(
     db: AsyncSession = Depends(get_master_db),
     redis: RedisLike | None = Depends(get_optional_redis),
 ):
-    is_liked, like_count, inserted = await LikeService.like_comment(
-        comment_id, user.id, db=db, redis=redis
-    )
+    like_count, inserted = await LikeService.like_comment(comment_id, user.id, db=db, redis=redis)
     code = ApiCode.OK if inserted else ApiCode.ALREADY_LIKED
     return api_response(
-        request, code=code, data=LikeResponseData(is_liked=is_liked, like_count=like_count)
+        request, code=code, data=LikeResponseData(is_liked=True, like_count=like_count)
     )
 
 
@@ -77,9 +73,9 @@ async def unlike_comment(
     user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_master_db),
 ):
-    is_liked, like_count = await LikeService.unlike_comment(comment_id, user.id, db=db)
+    like_count = await LikeService.unlike_comment(comment_id, user.id, db=db)
     return api_response(
         request,
         code=ApiCode.OK,
-        data=LikeResponseData(is_liked=is_liked, like_count=like_count),
+        data=LikeResponseData(is_liked=False, like_count=like_count),
     )

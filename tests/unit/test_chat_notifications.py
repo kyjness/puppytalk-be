@@ -7,7 +7,7 @@ from app.common.enums import NotificationKind
 from app.common.schemas import CursorPage
 from app.domain.chat.service import ChatService
 from app.domain.notifications.model import Notification, NotificationsModel
-from app.domain.notifications.service import NotificationService
+from app.domain.notifications.schema import NotificationEvent, build_realtime_payload
 
 
 def test_list_recent_rooms_scopes_subqueries_to_my_rooms():
@@ -29,12 +29,15 @@ def test_get_room_peer_info_merges_membership_into_query():
 
 
 def test_notification_realtime_payload_is_camelcase():
-    p = NotificationService.build_realtime_payload(
-        uuid.uuid4(),
-        NotificationKind.LIKE_POST,
-        actor_id=uuid.uuid4(),
-        post_id=None,
-        comment_id=None,
+    p = build_realtime_payload(
+        NotificationEvent(
+            recipient_user_id=uuid.uuid4(),
+            notification_id=uuid.uuid4(),
+            kind=NotificationKind.LIKE_POST,
+            actor_id=uuid.uuid4(),
+            post_id=None,
+            comment_id=None,
+        )
     )
     assert set(p) == {"notificationId", "kind", "actorId", "postId", "commentId"}
     assert p["postId"] is None and p["commentId"] is None

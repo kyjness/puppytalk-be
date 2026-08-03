@@ -14,7 +14,12 @@ from app.common.enums import NotificationKind
 from app.core.config import settings
 from app.core.ids import uuid_to_base62
 from app.domain.notifications.model import Notification, NotificationsModel
-from app.domain.notifications.schema import NotificationItem
+from app.domain.notifications.schema import (
+    NotificationEvent,
+    NotificationItem,
+    build_realtime_payload,
+    build_sns_payload,
+)
 from app.domain.notifications.stream import NOTIF_SSE_FANOUT_CHANNEL, notification_sse_manager
 from app.infra.pubsub import publish_user_envelope
 from app.infra.redis import RedisLike
@@ -49,72 +54,38 @@ def _sns_idempotency_key(notification_id: UUID) -> str:
 class NotificationService:
     """수신자별 알림 레코드와 실시간 전달을 조율. Publish는 항상 트랜잭션 커밋 이후 호출."""
 
-    @staticmethod
-    def build_realtime_payload(
-        notification_id: UUID,
-        kind: NotificationKind,
-        *,
-        actor_id: UUID | None,
-        post_id: UUID | None,
-        comment_id: UUID | None,
-    ) -> dict[str, Any]:
-        """SSE `data:` JSON. 필드명은 프론트 camelCase 관례에 맞춤."""
-
-        return {
-            "notificationId": uuid_to_base62(notification_id),
-            "kind": kind.value,
-            "actorId": None if actor_id is None else uuid_to_base62(actor_id),
-            "postId": None if post_id is None else uuid_to_base62(post_id),
-            "commentId": None if comment_id is None else uuid_to_base62(comment_id),
-        }
-
-    @staticmethod
-    def _sns_summary_for_kind(kind: NotificationKind) -> str:
-        if kind == NotificationKind.COMMENT_ON_POST:
-            return "회원님의 게시글에 댓글이 달렸습니다."
-        if kind == NotificationKind.LIKE_POST:
-            return "회원님의 게시글에 좋아요가 눌렸습니다."
-        if kind == NotificationKind.LIKE_COMMENT:
-            return "회원님의 댓글에 좋아요가 눌렸습니다."
-        return kind.value
-
-    @staticmethod
-    def build_sns_payload(
+    @classmethod
+    async def record(
+        cls,
         *,
         recipient_user_id: UUID,
-        notification_id: UUID,
         kind: NotificationKind,
         actor_id: UUID | None,
         post_id: UUID | None,
         comment_id: UUID | None,
-    ) -> dict[str, Any]:
-        """SNS `Message`에 실을 JSON 직렬화용 페이로드(구독자·Lambda에서 파싱)."""
-
-        base = NotificationService.build_realtime_payload(
-            notification_id,
-            kind,
+        db: AsyncSession,
+    ) -> NotificationEvent:
+        """트랜잭션 안에서 알림 행을 영속화하고, 커밋 후 publish_after_commit에 넘길
+        이벤트를 돌려준다 — 생산자가 같은 필드를 두 번 조립할 일이 없다."""
+        nid = await NotificationsModel.insert(
+            user_id=recipient_user_id,
+            kind=kind,
+            actor_id=actor_id,
+            post_id=post_id,
+            comment_id=comment_id,
+            db=db,
+        )
+        return NotificationEvent(
+            recipient_user_id=recipient_user_id,
+            notification_id=nid,
+            kind=kind,
             actor_id=actor_id,
             post_id=post_id,
             comment_id=comment_id,
         )
-        return {
-            **base,
-            "recipientUserId": uuid_to_base62(recipient_user_id),
-            "message": NotificationService._sns_summary_for_kind(kind),
-        }
 
     @classmethod
-    async def _dispatch_sns_publish(
-        cls,
-        redis: RedisLike | None,
-        *,
-        recipient_user_id: UUID,
-        notification_id: UUID,
-        kind: NotificationKind,
-        actor_id: UUID | None,
-        post_id: UUID | None,
-        comment_id: UUID | None,
-    ) -> None:
+    async def _dispatch_sns_publish(cls, redis: RedisLike | None, event: NotificationEvent) -> None:
         """오프라인 배송(SNS)은 재시도·백오프가 필요한 외부 I/O라 Celery로 오프로드한다.
 
         워커 비활성(CELERY_ENABLED=false)·브로커 장애 시에는 인라인 fire-and-forget으로
@@ -129,85 +100,39 @@ class NotificationService:
                 # 결정적 멱등키: 같은 알림의 중복 enqueue가 워커에서 1회 배송으로 수렴.
                 await run_in_threadpool(
                     cast(Any, deliver_notification_sns).delay,
-                    notification_id=uuid_to_base62(notification_id),
-                    user_id=uuid_to_base62(recipient_user_id),
-                    idempotency_key=_sns_idempotency_key(notification_id),
+                    notification_id=uuid_to_base62(event.notification_id),
+                    user_id=uuid_to_base62(event.recipient_user_id),
+                    idempotency_key=_sns_idempotency_key(event.notification_id),
                 )
                 return
             except Exception:
                 log.exception(
                     "알림 SNS Celery enqueue 실패 — 인라인 폴백. notification_id=%s",
-                    notification_id,
+                    event.notification_id,
                 )
-        cls._schedule_sns_publish(
-            redis,
-            recipient_user_id=recipient_user_id,
-            notification_id=notification_id,
-            kind=kind,
-            actor_id=actor_id,
-            post_id=post_id,
-            comment_id=comment_id,
-        )
+        cls._schedule_sns_publish(redis, event)
 
     @classmethod
-    def _schedule_sns_publish(
-        cls,
-        redis: RedisLike | None,
-        *,
-        recipient_user_id: UUID,
-        notification_id: UUID,
-        kind: NotificationKind,
-        actor_id: UUID | None,
-        post_id: UUID | None,
-        comment_id: UUID | None,
-    ) -> None:
+    def _schedule_sns_publish(cls, redis: RedisLike | None, event: NotificationEvent) -> None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
 
-        task = loop.create_task(
-            cls._publish_sns_task(
-                redis,
-                recipient_user_id=recipient_user_id,
-                notification_id=notification_id,
-                kind=kind,
-                actor_id=actor_id,
-                post_id=post_id,
-                comment_id=comment_id,
-            )
-        )
+        task = loop.create_task(cls._publish_sns_task(redis, event))
         _sns_inline_tasks.add(task)
         task.add_done_callback(_sns_inline_tasks.discard)
 
     @classmethod
-    async def _publish_sns_task(
-        cls,
-        redis: RedisLike | None,
-        *,
-        recipient_user_id: UUID,
-        notification_id: UUID,
-        kind: NotificationKind,
-        actor_id: UUID | None,
-        post_id: UUID | None,
-        comment_id: UUID | None,
-    ) -> None:
+    async def _publish_sns_task(cls, redis: RedisLike | None, event: NotificationEvent) -> None:
         topic = settings.SNS_TOPIC_ARN
-        payload = cls.build_sns_payload(
-            recipient_user_id=recipient_user_id,
-            notification_id=notification_id,
-            kind=kind,
-            actor_id=actor_id,
-            post_id=post_id,
-            comment_id=comment_id,
-        )
-        message_json = json.dumps(payload, ensure_ascii=False)
+        message_json = json.dumps(build_sns_payload(event), ensure_ascii=False)
         try:
             # 워커 잡과 같은 멱등 스토어·키·안무(deliver_once) — 브로커 ack 유실로
             # enqueue와 인라인 폴백이 둘 다 실행돼도(교차 경로) 한쪽만 배송된다.
             await deliver_once(
                 redis,
-                _sns_idempotency_key(notification_id),
+                _sns_idempotency_key(event.notification_id),
                 topic,
                 message_json,
                 settings.CELERY_TASK_IDEMPOTENCY_TTL_SECONDS,
@@ -215,54 +140,30 @@ class NotificationService:
         except Exception:
             log.exception(
                 "알림 SNS publish 실패(인앱·DB는 유지). recipient=%s topic=%s",
-                recipient_user_id,
+                event.recipient_user_id,
                 topic,
             )
 
     @classmethod
-    async def publish_after_commit(
-        cls,
-        redis: RedisLike | None,
-        *,
-        recipient_user_id: UUID,
-        notification_id: UUID,
-        kind: NotificationKind,
-        actor_id: UUID | None,
-        post_id: UUID | None,
-        comment_id: UUID | None,
-    ) -> None:
+    async def publish_after_commit(cls, redis: RedisLike | None, event: NotificationEvent) -> None:
         """트랜잭션이 성공적으로 커밋된 뒤에만 호출. Redis 장애 시 DB 데이터는 유지(fail-open)."""
 
-        payload_json = json.dumps(
-            cls.build_realtime_payload(
-                notification_id,
-                kind,
-                actor_id=actor_id,
-                post_id=post_id,
-                comment_id=comment_id,
-            ),
-            ensure_ascii=False,
-        )
+        payload_json = json.dumps(build_realtime_payload(event), ensure_ascii=False)
         # 같은 인스턴스의 SSE 스트림은 먼저 직접 전달 — Redis·구독 리스너 상태에 의존하지
         # 않는다. 크로스 인스턴스는 단일 채널 envelope publish(chat DM과 동형) — 리스너가
         # origin 비교로 자기 발행분을 건너뛰어 중복 없음. publish 실패 시 다른 인스턴스
         # 수신자는 GET /notifications로 동기화 가능하다(at-most-once).
-        await notification_sse_manager.deliver(recipient_user_id, payload_json)
-        await publish_user_envelope(
-            redis,
-            NOTIF_SSE_FANOUT_CHANNEL,
-            target_user_ids=[recipient_user_id],
-            payload=payload_json,
-        )
-
-        await cls._dispatch_sns_publish(
-            redis,
-            recipient_user_id=recipient_user_id,
-            notification_id=notification_id,
-            kind=kind,
-            actor_id=actor_id,
-            post_id=post_id,
-            comment_id=comment_id,
+        await notification_sse_manager.deliver(event.recipient_user_id, payload_json)
+        # 크로스 인스턴스 publish(Redis)와 SNS 오프로드(브로커)는 데이터·순서 의존이 없고
+        # 각자 예외를 삼키므로 병렬로 — 요청 지연이 합이 아니라 max가 된다.
+        await asyncio.gather(
+            publish_user_envelope(
+                redis,
+                NOTIF_SSE_FANOUT_CHANNEL,
+                target_user_ids=[event.recipient_user_id],
+                payload=payload_json,
+            ),
+            cls._dispatch_sns_publish(redis, event),
         )
 
     @staticmethod
@@ -297,7 +198,7 @@ class NotificationService:
         cls,
         user_id: UUID,
         *,
-        ids: list[UUID] | None,
+        ids: list[UUID],
         db: AsyncSession,
     ) -> int:
         async with db.begin():
@@ -307,16 +208,23 @@ class NotificationService:
     async def purge_old_notifications(
         cls,
         *,
-        older_than_days: int = 30,
-        chunk_size: int = 2_000,
+        older_than_days: int,
+        chunk_size: int,
         db: AsyncSession,
     ) -> int:
-        async with db.begin():
-            return await NotificationsModel.purge_older_than_days(
-                older_than_days=older_than_days,
-                chunk_size=chunk_size,
-                db=db,
-            )
+        """created_at 기준 보관기간 초과 알림 삭제(청크 반복). 정책 숫자는 호출부(main)가 소유."""
+        total = 0
+        # 단일 트랜잭션에 너무 많이 태우면 락/부하가 커질 수 있어, 청크별 begin()으로 끊는다
+        # (users 퍼지와 동형).
+        while True:
+            async with db.begin():
+                deleted = await NotificationsModel.delete_older_than(
+                    older_than_days=older_than_days, limit=chunk_size, db=db
+                )
+            if not deleted:
+                break
+            total += deleted
+        return total
 
     @staticmethod
     async def sse_subscribe(
