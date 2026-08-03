@@ -7,7 +7,7 @@
 #   ./dev.sh --backend-only  # 인프라 + 백엔드만
 #   ./dev.sh --docker        # 백엔드까지 컨테이너로(배포 이미지 그대로) + 프론트. 데모·환경검증용
 #   ./dev.sh --down          # 컨테이너 종료
-#   FE_DIR=/path/to/fe ./dev.sh   # 프론트 경로 지정(기본: ../2-kyjness-community-fe)
+#   FE_DIR=/path/to/fe ./dev.sh   # 프론트 경로 지정(기본: ../puppytalk-fe)
 #
 # Ctrl+C는 호스트 프로세스(백엔드·프론트)만 멈춘다 — 컨테이너는 유지(재시작이 빠르다).
 set -euo pipefail
@@ -17,7 +17,7 @@ set -euo pipefail
 set -m
 
 BE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FE_DIR="${FE_DIR:-$BE_DIR/../2-kyjness-community-fe}"
+FE_DIR="${FE_DIR:-$BE_DIR/../puppytalk-fe}"
 HEALTH_URL="${HEALTH_URL:-http://localhost:8000/v1/health}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-90}"
 INFRA_SERVICES=(db redis minio minio-init)

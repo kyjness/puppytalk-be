@@ -10,8 +10,8 @@
 
 **관련 링크**
 
-- 프론트엔드: [PuppyTalk Frontend](https://github.com/kyjness/2-kyjness-community-fe)
-- 인프라·배포: [PuppyTalk Infra](https://github.com/kyjness/2-kyjness-community-infra) (Terraform·ECS)
+- 프론트엔드: [PuppyTalk Frontend](https://github.com/kyjness/puppytalk-fe)
+- 인프라·배포: [PuppyTalk Infra](https://github.com/kyjness/puppytalk-infra) (Terraform·ECS)
 
 ---
 
@@ -231,7 +231,7 @@ Dockerfile             # uv 멀티스테이지 · 비루트 · Gunicorn+Uvicorn
 재빌드 없이 즉시 반영됩니다.
 
 ```bash
-git clone https://github.com/kyjness/2-kyjness-community-be && cd 2-kyjness-community-be
+git clone https://github.com/kyjness/puppytalk-be && cd puppytalk-be
 ./dev.sh                  # 인프라 compose → alembic → uvicorn --reload → 형제 폴더 프론트 pnpm dev
 ```
 
