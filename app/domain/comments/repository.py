@@ -70,7 +70,7 @@ async def _update_comment(
     return await update_one_returning(db, Comment, conds, values, returning)
 
 
-class CommentsModel:
+class CommentsRepository:
     @classmethod
     async def load_comment_author_permission_row(
         cls,
@@ -346,7 +346,7 @@ class CommentsModel:
         return row if row is not None else 0
 
 
-class CommentLikesModel:
+class CommentLikesRepository:
     @classmethod
     async def get_liked_comment_ids_for_user(
         cls, user_id: UUID, comment_ids: list[UUID], db: AsyncSession

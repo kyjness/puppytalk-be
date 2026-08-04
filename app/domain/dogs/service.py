@@ -11,9 +11,9 @@ from app.common.exceptions import (
     NotFoundException,
 )
 from app.db import utc_now
-from app.domain.dogs.model import DogProfilesModel
+from app.domain.dogs.model import DogProfilesRepository
 from app.domain.dogs.schema import DogProfileUpsertItem
-from app.domain.users.model import UsersModel
+from app.domain.users.model import UsersRepository
 from app.domain.users.schema import UserProfileResponse
 
 
@@ -32,7 +32,7 @@ class DogService:
         한 트랜잭션 안에서도 소유자당 1개로 강제하므로, 인라인으로 True를 여러 행에 넣으면
         statement 시점에 일시적 중복으로 거부된다.
         """
-        existing_ids = await DogProfilesModel.get_ids_by_owner_id(owner_id, db=db)
+        existing_ids = await DogProfilesRepository.get_ids_by_owner_id(owner_id, db=db)
         update_ids: list[UUID] = []
         create_rows: list[dict[str, object]] = []
         update_rows: list[dict[str, object]] = []
@@ -76,21 +76,21 @@ class DogService:
                     representative_existing_id = item.id
                     representative_new_index = None
 
-        owned_update_ids = await DogProfilesModel.get_owned_ids_in(owner_id, update_ids, db=db)
+        owned_update_ids = await DogProfilesRepository.get_owned_ids_in(owner_id, update_ids, db=db)
         if len(owned_update_ids) != len(set(update_ids)):
             raise ForbiddenException()
 
         if update_rows:
-            await DogProfilesModel.bulk_update_by_owner(owner_id, update_rows, db=db)
+            await DogProfilesRepository.bulk_update_by_owner(owner_id, update_rows, db=db)
 
-        created = await DogProfilesModel.create_many(owner_id, create_rows, db=db)
+        created = await DogProfilesRepository.create_many(owner_id, create_rows, db=db)
 
         requested_ids: set[UUID] = set(update_ids)
         requested_ids.update(d.id for d in created)
 
         delete_ids = list(existing_ids - requested_ids)
         if delete_ids:
-            await DogProfilesModel.bulk_delete_by_owner_ids(owner_id, delete_ids, db=db)
+            await DogProfilesRepository.bulk_delete_by_owner_ids(owner_id, delete_ids, db=db)
 
         representative_id: UUID | None = representative_existing_id
         if representative_new_index is not None:
@@ -99,7 +99,7 @@ class DogService:
             else:
                 representative_id = None
         if representative_id and requested_ids:
-            await DogProfilesModel.set_representative(owner_id, representative_id, db=db)
+            await DogProfilesRepository.set_representative(owner_id, representative_id, db=db)
 
     @classmethod
     async def set_representative_dog(
@@ -107,12 +107,12 @@ class DogService:
     ) -> UserProfileResponse:
         """대표 강아지 설정. dog_id가 해당 owner_id 소유가 아니면 NotFoundException. 반환: 갱신된 사용자 프로필."""
         async with db.begin():
-            dog = await DogProfilesModel.get_by_id(dog_id, owner_id, db=db)
+            dog = await DogProfilesRepository.get_by_id(dog_id, owner_id, db=db)
             if dog is None:
                 raise NotFoundException()
-            if not await DogProfilesModel.set_representative(owner_id, dog_id, db=db):
+            if not await DogProfilesRepository.set_representative(owner_id, dog_id, db=db):
                 raise InternalServerErrorException()
-            user = await UsersModel.get_user_by_id_with_dogs(owner_id, db=db)
+            user = await UsersRepository.get_user_by_id_with_dogs(owner_id, db=db)
             if not user:
                 raise InternalServerErrorException()
             return UserProfileResponse.model_validate(user)

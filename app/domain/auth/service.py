@@ -41,9 +41,9 @@ from app.domain.auth.user_status_cache import (
     set_user_status_cache_best_effort,
     user_status_cache_key,
 )
-from app.domain.media.model import MediaModel
+from app.domain.media.model import MediaRepository
 from app.domain.media.service import MediaService
-from app.domain.users.model import UsersModel
+from app.domain.users.model import UsersRepository
 from app.infra.redis import RedisLike, bulk_to_str
 
 logger = logging.getLogger(__name__)
@@ -176,7 +176,7 @@ async def _ensure_user_may_refresh(
         raise UnauthorizedException(message=UserStatus.inactive_message_ko(cached))
 
     async with db.begin():
-        user = await UsersModel.get_user_by_id(user_id, db=db)
+        user = await UsersRepository.get_user_by_id(user_id, db=db)
         if not user:
             raise UnauthorizedException()
         status_val = str(user.status)
@@ -213,9 +213,9 @@ class AuthService:
             raise MissingRequiredFieldException()
         hashed = await hash_password(password_with_pepper(data.password))
         async with db.begin():
-            if await UsersModel.email_exists(data.email, db=db):
+            if await UsersRepository.email_exists(data.email, db=db):
                 raise EmailAlreadyExistsException()
-            if await UsersModel.nickname_exists(data.nickname, db=db):
+            if await UsersRepository.nickname_exists(data.nickname, db=db):
                 raise NicknameAlreadyExistsException()
             profile_image_id = None
             if has_token:
@@ -231,7 +231,7 @@ class AuthService:
                     raise SignupImageTokenInvalidException()
                 profile_image_id = image_id_from_token
             try:
-                created = await UsersModel.create_user(
+                created = await UsersRepository.create_user(
                     data.email,
                     hashed,
                     data.nickname,
@@ -249,7 +249,7 @@ class AuthService:
                         raise NicknameAlreadyExistsException() from e
                 raise
             if profile_image_id is not None:
-                attached = await MediaModel.claim_image_ownership(
+                attached = await MediaRepository.claim_image_ownership(
                     profile_image_id, created.id, db=db
                 )
                 if not attached:
@@ -265,7 +265,7 @@ class AuthService:
         refresh_ttl_seconds: int = 0,
     ) -> tuple[LoginSuccessData, str]:
         async with db.begin():
-            user = await UsersModel.get_user_by_email(data.email, db=db)
+            user = await UsersRepository.get_user_by_email(data.email, db=db)
             if not user:
                 raise InvalidCredentialsException()
             if not UserStatus.is_active_value(user.status):

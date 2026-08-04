@@ -14,7 +14,7 @@ from app.common.exceptions import ForbiddenException
 from app.core.rate_limit import check_fixed_window
 from app.domain.chat.schema import ChatMessageSend
 from app.domain.chat.service import ChatService
-from app.domain.users.model import UsersModel
+from app.domain.users.model import UsersRepository
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.unit.fakes import FakeRedis as SharedFakeRedis
@@ -124,7 +124,7 @@ def _patch_blocked_pair(monkeypatch, a_id, b_id):
         assert {user_id, other_id} == {a_id, b_id}
         return SimpleNamespace(status="ACTIVE", blocked=True)
 
-    monkeypatch.setattr(UsersModel, "get_status_and_block_between", fake_status_and_block)
+    monkeypatch.setattr(UsersRepository, "get_status_and_block_between", fake_status_and_block)
 
 
 async def test_send_dm_rejects_blocked_relation_before_room_creation(monkeypatch):
@@ -155,7 +155,7 @@ async def test_status_and_block_between_checks_both_directions():
     """방향 무관 술어인지 쿼리 구조로 고정(blocker/blocked 양방향 OR)."""
     import inspect
 
-    src = inspect.getsource(UsersModel.get_status_and_block_between.__func__)
+    src = inspect.getsource(UsersRepository.get_status_and_block_between.__func__)
     assert src.count("or_") >= 1
     assert src.count("blocker_id == user_id") == 1
     assert src.count("blocker_id == other_id") == 1

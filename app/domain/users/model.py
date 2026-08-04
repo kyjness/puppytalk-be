@@ -125,7 +125,7 @@ def author_display_loads(author_rel: Any) -> Any:
     )
 
 
-class UsersModel:
+class UsersRepository:
     @classmethod
     async def create_user(
         cls,

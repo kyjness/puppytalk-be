@@ -1,7 +1,7 @@
 # ADR 0012 — 관리자 신고 피드 페이지네이션: DB-side UNION ALL + offset 유지
 
 - **상태**: 채택됨 (Accepted)
-- **관련 코드**: `app/domain/admin/model.py`(`AdminReportsModel.page_reported_targets`),
+- **관련 코드**: `app/domain/admin/repository.py`(`AdminReportsRepository.page_reported_targets`),
   `app/domain/admin/service.py`(`get_reported_posts`), `app/domain/admin/router.py`(`GET /admin/reported-posts`),
   `app/domain/posts/repository.py`·`app/domain/comments/model.py`(`get_reported_by_ids` 하이드레이션),
   `app/domain/users/model.py`(`Report` — `ix_reports_target` 부분 인덱스)

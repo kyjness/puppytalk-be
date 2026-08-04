@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.domain.posts.schemas import TrendingHashtagResponse
 from app.infra.cache import get_or_compute_json
 
-from ..repository import PostsModel
+from ..repository import PostsRepository
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ class HashtagService:
     ) -> list[TrendingHashtagResponse]:
         async def loader() -> list[TrendingHashtagResponse]:
             async with db.begin():
-                rows = await PostsModel.get_trending_hashtags(db=db, limit=limit)
+                rows = await PostsRepository.get_trending_hashtags(db=db, limit=limit)
             return [TrendingHashtagResponse(name=name, count=count) for name, count in rows]
 
         return await get_or_compute_json(

@@ -31,7 +31,7 @@ from app.domain.chat.schema import (
 )
 from app.domain.dogs.model import DogProfile
 from app.domain.media.model import Image
-from app.domain.users.model import User, UsersModel
+from app.domain.users.model import User, UsersRepository
 from app.infra.pubsub import publish_user_envelope
 from app.infra.redis import RedisLike
 
@@ -121,7 +121,7 @@ class ChatService:
         """
         if peer_id == user_id:
             raise SelfDmException()
-        peer = await UsersModel.get_status_and_block_between(user_id, peer_id, db=db)
+        peer = await UsersRepository.get_status_and_block_between(user_id, peer_id, db=db)
         if peer is None or not UserStatus.is_active_value(peer.status):
             raise UserNotFoundException(message="상대방을 찾을 수 없습니다.")
         if peer.blocked:

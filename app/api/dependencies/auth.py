@@ -18,7 +18,7 @@ from app.domain.auth.user_status_cache import (
     set_auth_cache_best_effort,
     set_user_status_cache_best_effort,
 )
-from app.domain.users.model import UsersModel
+from app.domain.users.model import UsersRepository
 from app.infra.redis import RedisLike, get_app_redis
 
 from .db import get_slave_db
@@ -97,7 +97,7 @@ async def resolve_access_token_user(
                 pass  # 형식 불일치(배포 중 구버전 값 등)는 미스 취급 — 아래 DB 경로로
 
     async with db.begin():
-        user = await UsersModel.get_user_by_id(user_id, db=db)
+        user = await UsersRepository.get_user_by_id(user_id, db=db)
         if not user:
             raise UnauthorizedException(message=_INVALID_TOKEN_MESSAGE)
         status_val = str(user.status)

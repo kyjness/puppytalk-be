@@ -46,7 +46,7 @@ class Notification(Base):
     )
 
 
-class NotificationsModel:
+class NotificationsRepository:
     @classmethod
     async def insert(
         cls,

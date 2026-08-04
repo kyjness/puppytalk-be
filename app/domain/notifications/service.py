@@ -13,7 +13,7 @@ from starlette.concurrency import run_in_threadpool
 from app.common.enums import NotificationKind
 from app.core.config import settings
 from app.core.ids import uuid_to_base62
-from app.domain.notifications.model import Notification, NotificationsModel
+from app.domain.notifications.model import Notification, NotificationsRepository
 from app.domain.notifications.schema import (
     NotificationEvent,
     NotificationItem,
@@ -67,7 +67,7 @@ class NotificationService:
     ) -> NotificationEvent:
         """트랜잭션 안에서 알림 행을 영속화하고, 커밋 후 publish_after_commit에 넘길
         이벤트를 돌려준다 — 생산자가 같은 필드를 두 번 조립할 일이 없다."""
-        nid = await NotificationsModel.insert(
+        nid = await NotificationsRepository.insert(
             user_id=recipient_user_id,
             kind=kind,
             actor_id=actor_id,
@@ -188,7 +188,7 @@ class NotificationService:
         db: AsyncSession,
     ) -> tuple[list[NotificationItem], bool]:
         async with db.begin():
-            rows, has_more = await NotificationsModel.list_for_user(
+            rows, has_more = await NotificationsRepository.list_for_user(
                 user_id, cursor_id=cursor_id, size=size, db=db
             )
         return [cls.row_to_item(r) for r in rows], has_more
@@ -202,7 +202,7 @@ class NotificationService:
         db: AsyncSession,
     ) -> int:
         async with db.begin():
-            return await NotificationsModel.mark_read(user_id, notification_ids=ids, db=db)
+            return await NotificationsRepository.mark_read(user_id, notification_ids=ids, db=db)
 
     @classmethod
     async def purge_old_notifications(
@@ -218,7 +218,7 @@ class NotificationService:
         # (users 퍼지와 동형).
         while True:
             async with db.begin():
-                deleted = await NotificationsModel.delete_older_than(
+                deleted = await NotificationsRepository.delete_older_than(
                     older_than_days=older_than_days, limit=chunk_size, db=db
                 )
             if not deleted:

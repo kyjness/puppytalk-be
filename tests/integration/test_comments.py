@@ -146,7 +146,7 @@ async def test_list_reflects_is_liked(client: AsyncClient):
 
 
 async def test_double_like_comment_does_not_double_count(client: AsyncClient):
-    # #15: 카운터를 CommentsModel로 일원화한 뒤에도 연타 좋아요가 이중 집계되지 않아야 한다.
+    # #15: 카운터를 CommentsRepository로 일원화한 뒤에도 연타 좋아요가 이중 집계되지 않아야 한다.
     headers = await _signup_login(client, "c_dbl@example.com", "연타퍼피")
     post_id = await _create_post(client, headers)
     cid = await _add_comment(client, headers, post_id, "연타 대상")

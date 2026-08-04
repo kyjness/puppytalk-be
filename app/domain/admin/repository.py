@@ -10,7 +10,7 @@ from app.domain.comments.model import Comment
 from app.domain.posts.model import Post
 
 
-class AdminReportsModel:
+class AdminReportsRepository:
     @classmethod
     async def page_reported_targets(
         cls, *, offset: int, size: int, db: AsyncSession

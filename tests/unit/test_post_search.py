@@ -1,6 +1,6 @@
 import pytest
 from app.common.exceptions import InvalidRequestException
-from app.domain.posts.repository import ParsedSearch, PostsModel, validate_search_query
+from app.domain.posts.repository import ParsedSearch, PostsRepository, validate_search_query
 
 
 def test_validate_search_query_splits_whitespace_tokens():
@@ -34,5 +34,5 @@ def test_validate_search_query_empty_returns_none():
 
 
 def test_posts_model_exposes_post_is_visible():
-    assert hasattr(PostsModel, "post_is_visible")
-    assert callable(PostsModel.post_is_visible)
+    assert hasattr(PostsRepository, "post_is_visible")
+    assert callable(PostsRepository.post_is_visible)

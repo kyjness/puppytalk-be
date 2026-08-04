@@ -15,14 +15,14 @@ from app.common.exceptions import (
 from app.core.config import settings
 from app.core.ids import new_ulid_str, parse_public_id_value
 from app.core.metrics import VIEW_BUFFER_FLUSHED_VIEWS
-from app.domain.comments.repository import CommentsModel
-from app.domain.likes.model import PostLikesModel
-from app.domain.media.model import MediaModel
+from app.domain.comments.repository import CommentsRepository
+from app.domain.likes.model import PostLikesRepository
+from app.domain.media.model import MediaRepository
 from app.domain.posts.schemas import PostCreateRequest, PostResponse, PostUpdateRequest
 from app.infra.lock import release_lock, try_acquire_lock
 from app.infra.redis import RedisLike, bulk_to_str, merge_hash_into, rename_if_exists
 
-from ..repository import PostsModel, validate_search_query
+from ..repository import PostsRepository, validate_search_query
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ async def _category_exists(category_id: int, db: AsyncSession) -> bool:
     global _category_cache
     now = time.monotonic()
     if _category_cache is None or now >= _category_cache[0]:
-        ids = await PostsModel.get_category_ids(db=db)
+        ids = await PostsRepository.get_category_ids(db=db)
         if not ids:
             # 시드 전 빈 테이블은 캐시하지 않는다 — 마이그레이션 직후 TTL 동안 전부 400이 되는
             # 윈도우 방지. 시드가 끝나면 다음 요청부터 정상 캐시.
@@ -79,7 +79,7 @@ async def _validate_refs(
     if category_id is not None and not await _category_exists(category_id, db):
         raise InvalidRequestException("존재하지 않는 카테고리입니다.")
     if image_ids:
-        images = await MediaModel.get_images_by_ids(image_ids, db=db)
+        images = await MediaRepository.get_images_by_ids(image_ids, db=db)
         if {i.id for i in images} != set(image_ids):
             raise InvalidRequestException("업로드되지 않은 이미지 ID를 참조할 수 없습니다.")
 
@@ -142,7 +142,7 @@ class PostService:
         async with db.begin():
             await _validate_refs(data.category_id, data.image_ids, db)
             hashtags = _normalize_hashtags(data.hashtags) if data.hashtags is not None else None
-            return await PostsModel.create_post(
+            return await PostsRepository.create_post(
                 user_id,
                 data.title,
                 data.content,
@@ -165,7 +165,7 @@ class PostService:
         search = validate_search_query(q)
         async with db.begin():
             await _validate_refs(category_id, None, db)
-            fetched = await PostsModel.get_all_posts(
+            fetched = await PostsRepository.get_all_posts(
                 size,
                 db=db,
                 cursor=cursor,
@@ -176,7 +176,7 @@ class PostService:
             posts, has_more = split_page(fetched, size)
             liked_ids: set[UUID] = set()
             if current_user_id is not None and posts:
-                liked_ids = await PostLikesModel.get_liked_post_ids_for_user(
+                liked_ids = await PostLikesRepository.get_liked_post_ids_for_user(
                     current_user_id, [p.id for p in posts], db=db
                 )
             result = [
@@ -197,7 +197,7 @@ class PostService:
         writer_db: AsyncSession | None = None,
     ) -> PostResponse:
         async with db.begin():
-            found = await PostsModel.get_post_detail(
+            found = await PostsRepository.get_post_detail(
                 post_id, db=db, current_user_id=current_user_id
             )
             if found is None:
@@ -212,7 +212,7 @@ class PostService:
             if direct_db:
                 async with writer_db.begin():
                     try:
-                        await PostsModel.increment_view_count(post_id, db=writer_db)
+                        await PostsRepository.increment_view_count(post_id, db=writer_db)
                     except StaleDataError as e:
                         raise ConcurrentUpdateException() from e
                 extra_db = 1
@@ -248,7 +248,7 @@ class PostService:
                             delta = int(cnt_raw)
                             if delta > 0:
                                 pk = bulk_to_str(pid) or ""
-                                await PostsModel.increment_view_count(
+                                await PostsRepository.increment_view_count(
                                     parse_public_id_value(pk), db=db, delta=delta
                                 )
                                 flushed_views += delta
@@ -279,7 +279,7 @@ class PostService:
             await _validate_refs(data.category_id, data.image_ids, db)
             hashtags = _normalize_hashtags(data.hashtags) if data.hashtags is not None else None
             try:
-                found = await PostsModel.update_post(
+                found = await PostsRepository.update_post(
                     post_id,
                     title=data.title,
                     content=data.content,
@@ -298,7 +298,7 @@ class PostService:
     async def delete_post(cls, post_id: UUID, db: AsyncSession) -> None:
         """게시글 삭제 + 댓글 soft-delete·좋아요 삭제 캐스케이드를 단일 트랜잭션에서 조율."""
         async with db.begin():
-            if not await PostsModel.soft_delete(post_id, db=db):
+            if not await PostsRepository.soft_delete(post_id, db=db):
                 raise PostNotFoundException()
-            await CommentsModel.soft_delete_by_post(post_id, db=db)
-            await PostLikesModel.delete_by_post_id(post_id, db=db)
+            await CommentsRepository.soft_delete_by_post(post_id, db=db)
+            await PostLikesRepository.delete_by_post_id(post_id, db=db)

@@ -24,7 +24,7 @@ from app.domain.media.image_policy import (
     sanitize_presign_filename,
     validate_image_content_type,
 )
-from app.domain.media.model import Image, MediaModel
+from app.domain.media.model import Image, MediaRepository
 from app.domain.media.schema import (
     ConfirmSignupUploadRequest,
     ConfirmUploadRequest,
@@ -103,7 +103,7 @@ async def _keyset_cleanup(
 
         if deletable_ids:
             async with db.begin():
-                total_deleted += await MediaModel.delete_images_by_ids(deletable_ids, db=db)
+                total_deleted += await MediaRepository.delete_images_by_ids(deletable_ids, db=db)
 
         if len(rows) < batch_size:
             break
@@ -178,7 +178,7 @@ class MediaService:
         )
         try:
             async with db.begin():
-                image = await MediaModel.create_image(
+                image = await MediaRepository.create_image(
                     file_key=dest_key,
                     file_url=file_url,
                     content_type=content_type,
@@ -214,7 +214,7 @@ class MediaService:
         image = None
         try:
             async with db.begin():
-                image = await MediaModel.create_temp_image(
+                image = await MediaRepository.create_temp_image(
                     file_key=dest_key,
                     file_url=file_url,
                     content_type=content_type,
@@ -231,7 +231,7 @@ class MediaService:
             try:
                 if image is not None:
                     async with db.begin():
-                        await MediaModel.delete_images_by_ids([image.id], db=db)
+                        await MediaRepository.delete_images_by_ids([image.id], db=db)
                 await run_in_threadpool(storage_delete, dest_key)
             except Exception as rollback_e:
                 logger.warning(
@@ -279,11 +279,11 @@ class MediaService:
     async def delete_image(cls, image_id: UUID, user_id: UUID, db: AsyncSession) -> None:
         file_key = None
         async with db.begin():
-            image = await MediaModel.get_image_by_id(image_id, db=db)
+            image = await MediaRepository.get_image_by_id(image_id, db=db)
             if not image or image.uploader_id != user_id:
                 raise ImageNotFoundException()
             file_key = image.file_key
-            await MediaModel.delete_image_record(image, db=db)
+            await MediaRepository.delete_image_record(image, db=db)
         if file_key:
             await run_in_threadpool(storage_delete, file_key)
 
@@ -301,7 +301,7 @@ class MediaService:
         try:
 
             async def _fetch(after_id: UUID | None, limit: int) -> list[Image]:
-                return await MediaModel.get_orphan_images_older_than(
+                return await MediaRepository.get_orphan_images_older_than(
                     older_than_hours=24, db=db, limit=limit, after_id=after_id
                 )
 
@@ -348,7 +348,7 @@ class MediaService:
             failed_file_keys: list[str] = []
 
             async def _fetch(after_id: UUID | None, limit: int) -> list[Image]:
-                return await MediaModel.get_expired_signup_images(
+                return await MediaRepository.get_expired_signup_images(
                     db=db, limit=limit, after_id=after_id
                 )
 

@@ -5,7 +5,7 @@ from uuid import UUID
 from pydantic import BaseModel, TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain.posts.repository import PostsModel
+from app.domain.posts.repository import PostsRepository
 from app.domain.posts.schemas import TrendingPostResponse
 from app.infra.cache import get_or_compute_json
 
@@ -71,7 +71,7 @@ class TrendingPostService:
         # 세션은 autobegin=False이므로 조회도 명시적 트랜잭션 안에서 수행한다.
         if current_user_id is not None and pool:
             async with db.begin():
-                blocked = await PostsModel.get_blocked_author_ids(current_user_id, db=db)
+                blocked = await PostsRepository.get_blocked_author_ids(current_user_id, db=db)
             if blocked:
                 pool = [it for it in pool if it.author_id not in blocked]
 
@@ -93,7 +93,7 @@ class TrendingPostService:
     ) -> list[_TrendingCacheItem]:
         """차단 무관(current_user_id=None) 랭킹 풀을 3단 fallback으로 계산한다."""
         async with db.begin():
-            posts = await PostsModel.get_trending_posts(
+            posts = await PostsRepository.get_trending_posts(
                 db=db,
                 limit=_POOL_SIZE,
                 window_hours=_WINDOW_HOURS,
@@ -108,7 +108,7 @@ class TrendingPostService:
                     len(posts),
                     _FALLBACK_WINDOW_HOURS,
                 )
-                posts = await PostsModel.get_trending_posts(
+                posts = await PostsRepository.get_trending_posts(
                     db=db,
                     limit=_POOL_SIZE,
                     window_hours=_FALLBACK_WINDOW_HOURS,
@@ -118,7 +118,7 @@ class TrendingPostService:
                 )
             if len(posts) == 0:
                 log.debug("trending_posts still empty; fallback to all-time like-order")
-                posts = await PostsModel.get_trending_posts(
+                posts = await PostsRepository.get_trending_posts(
                     db=db,
                     limit=_POOL_SIZE,
                     window_hours=None,

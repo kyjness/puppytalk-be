@@ -35,7 +35,7 @@ class Image(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-class MediaModel:
+class MediaRepository:
     @classmethod
     async def create_temp_image(
         cls,
