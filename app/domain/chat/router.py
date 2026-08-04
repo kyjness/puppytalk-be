@@ -3,13 +3,20 @@
 import json
 import logging
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Path, Query, Request, WebSocket
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.websockets import WebSocketDisconnect
 
-from app.api.dependencies import CurrentUser, get_current_user, get_master_db, get_slave_db
+from app.api.dependencies import (
+    CurrentUser,
+    get_current_user,
+    get_master_db,
+    get_slave_db,
+    resolve_access_token_user,
+)
 from app.common import (
     ApiCode,
     ApiResponse,
@@ -18,7 +25,12 @@ from app.common import (
     PublicId,
     api_response,
 )
-from app.common.exceptions import BaseProjectException, UserNotFoundException, ws_close_code
+from app.common.exceptions import (
+    BaseProjectException,
+    UnauthorizedException,
+    UserNotFoundException,
+    ws_close_code,
+)
 from app.core.config import settings
 from app.core.rate_limit import LocalRejectionGate
 from app.db import AsyncSessionLocal, AsyncSessionLocalReader
@@ -32,7 +44,6 @@ from app.domain.chat.schema import (
     ChatWsErrorPayload,
 )
 from app.domain.chat.service import ChatService
-from app.domain.chat.ws_auth import authenticate_chat_websocket
 from app.infra.redis import get_websocket_redis
 
 log = logging.getLogger(__name__)
@@ -142,6 +153,17 @@ def _ws_close_reason(exc: BaseProjectException) -> str:
     return {401: "Unauthorized", 403: "Forbidden"}.get(exc.status_code, "Policy violation")
 
 
+async def _authenticate(websocket: WebSocket, db: AsyncSession) -> UUID:
+    """?token= Access JWT 인증 — HTTP Depends와 동일 파이프라인(resolve_access_token_user)."""
+    token = (websocket.query_params.get("token") or "").strip()
+    if not token:
+        raise UnauthorizedException(message="인증 토큰이 필요합니다.")
+    user = await resolve_access_token_user(
+        token, db=db, redis_client=get_websocket_redis(websocket)
+    )
+    return user.id
+
+
 async def _safe_send_text(websocket: WebSocket, text: str) -> None:
     """끊긴/끊기는 중인 소켓에 에러 프레임을 보내다 나는 예외(RuntimeError 등)는
     WebSocketDisconnect가 아니라서 루프 밖으로 새면 ASGI 예외 소음이 된다 — 삼킨다."""
@@ -161,7 +183,7 @@ async def chat_dm_websocket(websocket: WebSocket) -> None:
     # 인증은 순수 읽기 — writer 풀을 점유하면 재연결 폭풍이 쓰기 경로와 커넥션을 다툰다.
     async with AsyncSessionLocalReader() as db:
         try:
-            user_id = await authenticate_chat_websocket(websocket, db)
+            user_id = await _authenticate(websocket, db)
         except BaseProjectException as e:
             if e.status_code >= 500:
                 log.exception("chat ws auth 예외")
