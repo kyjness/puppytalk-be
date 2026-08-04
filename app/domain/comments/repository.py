@@ -408,6 +408,27 @@ class CommentsRepository:
         )
 
     @classmethod
+    async def decrement_like_counts_for_users(cls, user_ids: list[UUID], db: AsyncSession) -> None:
+        """주어진 유저들이 누른 좋아요만큼 댓글 like_count를 깎는다 — 유저 하드 삭제 **직전** 호출.
+
+        comment_likes.user_id는 CASCADE, comments.author_id는 SET NULL이라 유저를 지우면
+        좋아요 행만 사라지고 댓글은 남는다(posts와 동일한 드리프트).
+        """
+        if not user_ids:
+            return
+        agg = (
+            select(CommentLike.comment_id.label("cid"), func.count().label("n"))
+            .where(CommentLike.user_id.in_(user_ids))
+            .group_by(CommentLike.comment_id)
+            .subquery()
+        )
+        await db.execute(
+            update(Comment)
+            .where(Comment.id == agg.c.cid)
+            .values(like_count=func.greatest(Comment.like_count - agg.c.n, 0))
+        )
+
+    @classmethod
     async def increment_like_count(cls, comment_id: UUID, db: AsyncSession) -> int:
         row = await _update_comment(
             db,

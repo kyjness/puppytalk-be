@@ -4,7 +4,7 @@ from datetime import timedelta
 from typing import Any, NamedTuple
 from uuid import UUID
 
-from sqlalchemy import Row, Select, and_, delete, exists, false, func, literal, or_, select
+from sqlalchemy import Row, Select, and_, delete, exists, false, func, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
@@ -620,6 +620,31 @@ class PostsRepository:
     @classmethod
     async def increment_comment_count(cls, post_id: UUID, db: AsyncSession) -> bool:
         return await _update_post(db, post_id, comment_count=Post.comment_count + 1) is not None
+
+    @classmethod
+    async def decrement_like_counts_for_users(cls, user_ids: list[UUID], db: AsyncSession) -> None:
+        """주어진 유저들이 누른 좋아요만큼 게시글 like_count를 깎는다 — 유저 하드 삭제 **직전** 호출.
+
+        post_likes.user_id는 ON DELETE CASCADE, posts.user_id는 SET NULL이다. 즉 유저를 지우면
+        좋아요 행만 사라지고 게시글은 남아, 보정하지 않으면 like_count가 영구히 부풀어 있다
+        (자가 치유되지 않는다). 삭제 후에는 어떤 행이 사라졌는지 알 수 없어 순서가 중요하다.
+        """
+        if not user_ids:
+            return
+        # 로컬 import — likes→posts 방향만 두어 순환을 피한다(이 파일의 기존 관례).
+        from app.domain.likes.model import PostLike
+
+        agg = (
+            select(PostLike.post_id.label("pid"), func.count().label("n"))
+            .where(PostLike.user_id.in_(user_ids))
+            .group_by(PostLike.post_id)
+            .subquery()
+        )
+        await db.execute(
+            update(Post)
+            .where(Post.id == agg.c.pid)
+            .values(like_count=func.greatest(Post.like_count - agg.c.n, 0))
+        )
 
     @classmethod
     async def decrement_comment_count(cls, post_id: UUID, db: AsyncSession) -> bool:

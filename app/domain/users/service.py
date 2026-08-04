@@ -16,8 +16,10 @@ from app.core.security import (
     password_with_pepper,
     verify_password_with_legacy_fallback,
 )
+from app.domain.comments.repository import CommentsRepository
 from app.domain.dogs.service import DogService
 from app.domain.media.model import MediaRepository
+from app.domain.posts.repository import PostsRepository
 from app.domain.users.model import UsersRepository
 from app.domain.users.schema import (
     AvailabilityData,
@@ -177,16 +179,27 @@ class UserService:
 
     @classmethod
     async def purge_withdrawn_users(cls, *, older_than_days: int, db: AsyncSession) -> int:
-        """탈퇴 유저 하드 삭제(청크 반복)."""
+        """탈퇴 유저 하드 삭제(청크 반복).
+
+        좋아요 행은 FK CASCADE로 사라지지만 게시글·댓글은 SET NULL로 살아남는다 — 삭제 전에
+        like_count를 깎지 않으면 카운트가 영구히 부풀어 있게 된다(자가 치유 없음). 카운트는
+        각 도메인 저장소가 소유하므로 조율은 여기서 한다(댓글 블라인드 카운트와 같은 규약).
+        """
         total = 0
         # 단일 트랜잭션에 너무 많이 태우면 락/부하가 커질 수 있어, 청크별 begin()으로 끊는다.
         while True:
             async with db.begin():
-                deleted_ids = await UsersRepository.purge_withdrawn_users_older_than(
+                target_ids = await UsersRepository.select_purgeable_user_ids(
                     older_than_days=older_than_days,
                     limit=200,
                     db=db,
                 )
+                if target_ids:
+                    await PostsRepository.decrement_like_counts_for_users(target_ids, db=db)
+                    await CommentsRepository.decrement_like_counts_for_users(target_ids, db=db)
+                    deleted_ids = await UsersRepository.purge_users_by_ids(target_ids, db=db)
+                else:
+                    deleted_ids = []
             if not deleted_ids:
                 break
             total += len(deleted_ids)

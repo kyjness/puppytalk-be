@@ -377,20 +377,21 @@ class UsersRepository:
         return r.scalar_one_or_none() is not None
 
     @classmethod
-    async def purge_withdrawn_users_older_than(
+    async def select_purgeable_user_ids(
         cls,
         *,
         older_than_days: int,
         limit: int,
         db: AsyncSession,
     ) -> list[UUID]:
-        """탈퇴(WITHDRAWN) + deleted_at 기준 N일 경과 유저를 하드 삭제.
+        """하드 삭제 대상(탈퇴 + deleted_at 기준 N일 경과) id를 청크 단위로 고른다.
 
-        - 대량 삭제로 인한 락을 줄이기 위해 limit 단위로 청크 처리한다.
-        - FK ondelete(CASCADE/SET NULL)에 의존해 연관 데이터 정합성 유지.
+        삭제와 분리한 이유: 지우기 **전에** 다른 도메인의 비정규화 카운트를 보정해야 하는데,
+        같은 LIMIT 서브쿼리를 두 번 평가하면 ORDER BY가 없어 서로 다른 행이 잡힐 수 있다.
+        id를 한 번 확정해 보정·삭제가 같은 집합을 보게 한다.
         """
         cutoff = utc_now() - timedelta(days=older_than_days)
-        id_stmt = (
+        rows = await db.execute(
             select(User.id)
             .where(
                 User.status == UserStatus.WITHDRAWN.value,
@@ -399,6 +400,17 @@ class UsersRepository:
             )
             .limit(int(limit))
         )
-        result = await db.execute(delete(User).where(User.id.in_(id_stmt)).returning(User.id))
+        return list(rows.scalars().all())
+
+    @classmethod
+    async def purge_users_by_ids(cls, user_ids: list[UUID], *, db: AsyncSession) -> list[UUID]:
+        """유저 하드 삭제. 연관 데이터는 FK ondelete(CASCADE/SET NULL)가 처리한다.
+
+        단, FK는 **행**만 정리하고 다른 테이블의 비정규화 카운트는 모른다 —
+        like_count 보정은 호출부(UserService)가 이 호출 전에 끝내야 한다.
+        """
+        if not user_ids:
+            return []
+        result = await db.execute(delete(User).where(User.id.in_(user_ids)).returning(User.id))
         await db.flush()
         return list(result.scalars().all())
