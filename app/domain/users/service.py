@@ -194,13 +194,10 @@ class UserService:
                     limit=200,
                     db=db,
                 )
-                if target_ids:
-                    await PostsRepository.decrement_like_counts_for_users(target_ids, db=db)
-                    await CommentsRepository.decrement_like_counts_for_users(target_ids, db=db)
-                    deleted_ids = await UsersRepository.purge_users_by_ids(target_ids, db=db)
-                else:
-                    deleted_ids = []
-            if not deleted_ids:
-                break
+                if not target_ids:
+                    break
+                await PostsRepository.decrement_like_counts_for_users(target_ids, db=db)
+                await CommentsRepository.decrement_like_counts_for_users(target_ids, db=db)
+                deleted_ids = await UsersRepository.purge_users_by_ids(target_ids, db=db)
             total += len(deleted_ids)
         return total

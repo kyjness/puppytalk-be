@@ -80,6 +80,24 @@ def test_redis_absent_runs_without_lock():
     assert calls == ["purge"]
 
 
+def test_declared_lock_key_overrides_name_derived_key():
+    """요청 유발 경로와 같은 키를 선언한 잡은 그 키로 배타 실행돼야 한다.
+
+    미디어 sweep은 주기 잡 말고 sweep_unused_images_detached에서도 돈다 — 키가 갈리면
+    두 경로가 서로를 배제하지 못한다.
+    """
+    from app.domain.media.service import JOB_LOCK_SWEEP_UNUSED
+
+    calls: list[str] = []
+    redis = FakeRedis(preloaded={JOB_LOCK_SWEEP_UNUSED: "other-path-token"})
+    job = PeriodicJob("sweep", _job("sweep", calls).run, lock_key=JOB_LOCK_SWEEP_UNUSED)
+
+    _run([job], redis)
+
+    assert calls == []  # 요청 유발 경로가 쥔 락을 존중한다
+    assert job_lock_key("sweep") not in redis.kv  # 이름 파생 키는 쓰지 않는다
+
+
 def test_redis_failure_falls_open_to_running():
     """락 조회 실패로 정리 잡이 멈추면 안 된다 — 중복 실행이 미실행보다 낫다."""
     calls: list[str] = []

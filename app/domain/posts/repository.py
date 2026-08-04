@@ -4,14 +4,14 @@ from datetime import timedelta
 from typing import Any, NamedTuple
 from uuid import UUID
 
-from sqlalchemy import Row, Select, and_, delete, exists, false, func, literal, or_, select, update
+from sqlalchemy import Row, Select, and_, delete, exists, false, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
 
 from app.common.exceptions import ConcurrentUpdateException, InvalidRequestException
 from app.db.base_class import utc_now
-from app.db.statements import update_one_returning
+from app.db.statements import decrement_counter_by_link_owner, update_one_returning
 from app.domain.users.model import User, UserBlock, author_display_loads, author_not_blocked_clause
 
 from .model import Category, Hashtag, Post, PostImage, post_hashtags
@@ -370,7 +370,7 @@ class PostsRepository:
     def get_trending_hashtags_query(
         cls,
         *,
-        window_hours: int | None = 24,
+        window_hours: int | None,
         limit: int = 10,
     ) -> Select[Any]:
         # 집계 창은 트렌딩 게시글과 같은 24h(ADR 0004) — 창이 없으면 "지금 뜨는"이 아니라
@@ -397,7 +397,7 @@ class PostsRepository:
         cls,
         *,
         db: AsyncSession,
-        window_hours: int | None = 24,
+        window_hours: int | None,
         limit: int = 10,
     ) -> list[tuple[str, int]]:
         stmt = cls.get_trending_hashtags_query(window_hours=window_hours, limit=limit)
@@ -629,21 +629,17 @@ class PostsRepository:
         좋아요 행만 사라지고 게시글은 남아, 보정하지 않으면 like_count가 영구히 부풀어 있다
         (자가 치유되지 않는다). 삭제 후에는 어떤 행이 사라졌는지 알 수 없어 순서가 중요하다.
         """
-        if not user_ids:
-            return
         # 로컬 import — likes→posts 방향만 두어 순환을 피한다(이 파일의 기존 관례).
         from app.domain.likes.model import PostLike
 
-        agg = (
-            select(PostLike.post_id.label("pid"), func.count().label("n"))
-            .where(PostLike.user_id.in_(user_ids))
-            .group_by(PostLike.post_id)
-            .subquery()
-        )
-        await db.execute(
-            update(Post)
-            .where(Post.id == agg.c.pid)
-            .values(like_count=func.greatest(Post.like_count - agg.c.n, 0))
+        await decrement_counter_by_link_owner(
+            db,
+            target_model=Post,
+            counter_col=Post.like_count,
+            link_model=PostLike,
+            link_target_col=PostLike.post_id,
+            link_owner_col=PostLike.user_id,
+            owner_ids=user_ids,
         )
 
     @classmethod

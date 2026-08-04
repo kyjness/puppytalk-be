@@ -30,6 +30,9 @@ class PeriodicJob(NamedTuple):
     name: str
     run: Callable[[str], Awaitable[int]]
     lock_ttl_seconds: int = DEFAULT_JOB_LOCK_TTL_SECONDS
+    # 같은 작업을 러너 밖(요청 유발 등)에서도 도는 잡은 그 경로와 **같은 키**를 선언한다 —
+    # 키가 갈리면 두 경로가 서로를 배제하지 못한다. 미지정 시 이름에서 파생.
+    lock_key: str | None = None
 
 
 async def run_jobs_once(jobs: Sequence[PeriodicJob], *, redis: RedisLike | None = None) -> None:
@@ -42,8 +45,9 @@ async def run_jobs_once(jobs: Sequence[PeriodicJob], *, redis: RedisLike | None 
     task_id = new_ulid_str()
     log.info("cleanup_start task_id=%s", task_id)
     for job in jobs:
+        lock_key = job.lock_key or job_lock_key(job.name)
         acquired, token = await try_acquire_job_lock(
-            redis, key=job_lock_key(job.name), ttl_seconds=job.lock_ttl_seconds
+            redis, key=lock_key, ttl_seconds=job.lock_ttl_seconds
         )
         if not acquired:
             log.info("%s_skipped task_id=%s reason=lock_held", job.name, task_id)
@@ -57,7 +61,7 @@ async def run_jobs_once(jobs: Sequence[PeriodicJob], *, redis: RedisLike | None 
         finally:
             # 잡이 예외로 끝나도 반드시 해제 — 안 그러면 TTL 만료까지 전 인스턴스가 skip한다.
             if token is not None and redis is not None:
-                await release_lock(redis, job_lock_key(job.name), token)
+                await release_lock(redis, lock_key, token)
 
 
 async def run_periodic(

@@ -8,7 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, joinedload
 
 from app.db.base_class import utc_now
-from app.db.statements import delete_rows, insert_ignore, update_one_returning
+from app.db.statements import (
+    decrement_counter_by_link_owner,
+    delete_rows,
+    insert_ignore,
+    update_one_returning,
+)
 from app.domain.posts.model import Post
 from app.domain.users.model import User, author_display_loads, author_not_blocked_clause
 
@@ -39,13 +44,31 @@ def _reply_visible_conditions(reply, current_user_id: UUID | None) -> list:
     """표시 가능한 대댓글 조건: 미삭제·미블라인드·(차단 작성자 제외).
 
     루트의 'EXISTS 대댓글이 있으면 삭제 루트를 placeholder로 유지' 판정과
-    get_replies_for_roots가 이 술어를 공유해, 삭제 루트 placeholder 시맨틱이 어긋나지 않게 한다.
+    get_reply_previews_for_roots·get_replies_page가 이 술어를 공유해,
+    삭제 루트 placeholder 시맨틱과 목록·더보기의 가시성 규칙이 어긋나지 않게 한다.
     """
     conds = [reply.deleted_at.is_(None), reply.is_blinded.is_(False)]
     not_blocked = author_not_blocked_clause(reply.author_id, current_user_id)
     if not_blocked is not None:
         conds.append(not_blocked)
     return conds
+
+
+def _apply_id_keyset(stmt, *, sort: str, cursor: UUID | None, size: int):
+    """id 기준 keyset 페이지네이션 공통 — 루트 목록과 대댓글 "더보기"가 공유한다.
+
+    비교 방향과 정렬 방향이 어긋나면 페이지가 조용히 겹치거나 빠진다. 규칙을 한 곳에 둔다.
+    size+1로 오버페치해 호출부가 split_page로 has_more를 가른다.
+    """
+    if sort == "oldest":
+        if cursor is not None:
+            stmt = stmt.where(Comment.id > cursor)
+        stmt = stmt.order_by(Comment.id.asc())
+    else:
+        if cursor is not None:
+            stmt = stmt.where(Comment.id < cursor)
+        stmt = stmt.order_by(Comment.id.desc())
+    return stmt.limit(size + 1)
 
 
 async def _update_comment(
@@ -175,8 +198,8 @@ class CommentsRepository:
         """루트 댓글을 keyset로 조회한다(size+1건으로 has_more 판정).
 
         삭제된 루트는 표시 가능한 대댓글이 하나라도 있을 때만 placeholder로 살린다
-        (EXISTS를 SQL에서 걸어 페이지 크기를 정확히 유지). 대댓글은 get_replies_for_roots가
-        부모별로 배치 로드한다.
+        (EXISTS를 SQL에서 걸어 페이지 크기를 정확히 유지). 대댓글 preview는
+        get_reply_previews_for_roots가 루트별로 상한을 두고 로드한다.
         """
         reply = aliased(Comment)
         reply_exists = exists(1).where(
@@ -195,15 +218,7 @@ class CommentsRepository:
         root_not_blocked = author_not_blocked_clause(Comment.author_id, current_user_id)
         if root_not_blocked is not None:
             stmt = stmt.where(root_not_blocked)
-        if sort == "oldest":
-            if cursor is not None:
-                stmt = stmt.where(Comment.id > cursor)
-            stmt = stmt.order_by(Comment.id.asc())
-        else:
-            if cursor is not None:
-                stmt = stmt.where(Comment.id < cursor)
-            stmt = stmt.order_by(Comment.id.desc())
-        stmt = stmt.limit(size + 1)
+        stmt = _apply_id_keyset(stmt, sort=sort, cursor=cursor, size=size)
         result = await db.execute(stmt)
         return list(result.unique().scalars().all())
 
@@ -276,15 +291,7 @@ class CommentsRepository:
             )
             .options(*_comment_author_loads())
         )
-        if sort == "oldest":
-            if cursor is not None:
-                stmt = stmt.where(Comment.id > cursor)
-            stmt = stmt.order_by(Comment.id.asc())
-        else:
-            if cursor is not None:
-                stmt = stmt.where(Comment.id < cursor)
-            stmt = stmt.order_by(Comment.id.desc())
-        result = await db.execute(stmt.limit(size + 1))
+        result = await db.execute(_apply_id_keyset(stmt, sort=sort, cursor=cursor, size=size))
         return list(result.unique().scalars().all())
 
     @classmethod
@@ -400,10 +407,10 @@ class CommentsRepository:
 
     @classmethod
     async def reset_reports(cls, comment_id: UUID, db: AsyncSession) -> bool:
+        """신고 카운트만 0으로. 블라인드 해제는 CommentModeration이 전이로 처리한다 —
+        여기서 is_blinded까지 건드리면 같은 해제가 두 번 일어나고 카운트 조정과 어긋난다."""
         return (
-            await _update_comment(
-                db, comment_id, alive=True, touch=True, report_count=0, is_blinded=False
-            )
+            await _update_comment(db, comment_id, alive=True, touch=True, report_count=0)
             is not None
         )
 
@@ -414,18 +421,14 @@ class CommentsRepository:
         comment_likes.user_id는 CASCADE, comments.author_id는 SET NULL이라 유저를 지우면
         좋아요 행만 사라지고 댓글은 남는다(posts와 동일한 드리프트).
         """
-        if not user_ids:
-            return
-        agg = (
-            select(CommentLike.comment_id.label("cid"), func.count().label("n"))
-            .where(CommentLike.user_id.in_(user_ids))
-            .group_by(CommentLike.comment_id)
-            .subquery()
-        )
-        await db.execute(
-            update(Comment)
-            .where(Comment.id == agg.c.cid)
-            .values(like_count=func.greatest(Comment.like_count - agg.c.n, 0))
+        await decrement_counter_by_link_owner(
+            db,
+            target_model=Comment,
+            counter_col=Comment.like_count,
+            link_model=CommentLike,
+            link_target_col=CommentLike.comment_id,
+            link_owner_col=CommentLike.user_id,
+            owner_ids=user_ids,
         )
 
     @classmethod

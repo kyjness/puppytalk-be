@@ -4,7 +4,7 @@
 
 from typing import Any, cast
 
-from sqlalchemy import delete, literal, update
+from sqlalchemy import delete, func, literal, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -46,3 +46,36 @@ async def delete_rows(db: AsyncSession, model: type[Any], conds: list[Any]) -> i
     """조건 일치 행 삭제 후 삭제 행 수 반환 — RETURNING 없이 rowcount로 센다."""
     cr = cast(CursorResult[Any], await db.execute(delete(model).where(*conds)))
     return int(cr.rowcount or 0)
+
+
+async def decrement_counter_by_link_owner(
+    db: AsyncSession,
+    *,
+    target_model: type[Any],
+    counter_col: Any,
+    link_model: type[Any],
+    link_target_col: Any,
+    link_owner_col: Any,
+    owner_ids: list[Any],
+) -> None:
+    """링크 행의 소유자들을 지우기 **직전에**, 그 링크 수만큼 대상의 카운터를 깎는다.
+
+    좋아요처럼 링크 행이 유저에 CASCADE로 매달려 있고 대상(게시글·댓글)은 SET NULL로 살아남는
+    구조에서, FK는 행만 정리하고 비정규화 카운터는 모른다 — 보정하지 않으면 카운터가 영구히
+    부풀어 있다. 삭제 후에는 어떤 링크가 사라졌는지 알 수 없어 호출 순서가 강제된다.
+
+    음수 방지는 카운터 규약대로 GREATEST(x - n, 0).
+    """
+    if not owner_ids:
+        return
+    agg = (
+        select(link_target_col.label("target_id"), func.count().label("n"))
+        .where(link_owner_col.in_(owner_ids))
+        .group_by(link_target_col)
+        .subquery()
+    )
+    await db.execute(
+        update(target_model)
+        .where(target_model.id == agg.c.target_id)
+        .values({counter_col.key: func.greatest(counter_col - agg.c.n, 0)})
+    )
