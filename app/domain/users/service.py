@@ -4,6 +4,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.common import split_page
 from app.common.exceptions import (
     InternalServerErrorException,
     InvalidRequestException,
@@ -21,7 +22,6 @@ from app.domain.users.model import UsersRepository
 from app.domain.users.schema import (
     AvailabilityData,
     BlockedUserItem,
-    BlocksData,
     UpdatePasswordRequest,
     UpdateUserRequest,
     UserAvailabilityQuery,
@@ -128,9 +128,19 @@ class UserService:
                 raise InternalServerErrorException()
 
     @classmethod
-    async def get_blocked_list(cls, blocker_id: UUID, db: AsyncSession) -> BlocksData:
+    async def get_blocked_list(
+        cls,
+        blocker_id: UUID,
+        *,
+        db: AsyncSession,
+        size: int,
+        cursor: UUID | None = None,
+    ) -> tuple[list[BlockedUserItem], bool]:
         async with db.begin():
-            users = await UsersRepository.get_blocked_users(blocker_id, db=db)
+            fetched = await UsersRepository.get_blocked_users(
+                blocker_id, db=db, size=size, cursor=cursor
+            )
+        users, has_more = split_page(fetched, size)
         items = [
             BlockedUserItem(
                 id=u.id,
@@ -139,7 +149,7 @@ class UserService:
             )
             for u in users
         ]
-        return BlocksData(items=items)
+        return items, has_more
 
     @classmethod
     async def toggle_block_user(

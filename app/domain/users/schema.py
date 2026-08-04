@@ -124,10 +124,6 @@ class BlockedUserItem(BaseSchema):
     profile_image_url: str | None = None
 
 
-class BlocksData(BaseSchema):
-    items: list[BlockedUserItem] = Field(default_factory=list)
-
-
 class BlockToggleResponse(BaseSchema):
     blocked: bool
 

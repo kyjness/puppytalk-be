@@ -1,7 +1,7 @@
 # 사용자 라우터. Router → Service. 예외는 전역 handler 처리.
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path, Request
+from fastapi import APIRouter, Depends, Path, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import (
@@ -11,11 +11,18 @@ from app.api.dependencies import (
     get_slave_db,
     parse_availability_query,
 )
-from app.common import ApiCode, ApiResponse, PublicId, api_response
+from app.common import (
+    ApiCode,
+    ApiResponse,
+    CursorPage,
+    OptionalPublicId,
+    PublicId,
+    api_response,
+)
 from app.domain.auth.service import AuthService
 from app.domain.users.schema import (
     AvailabilityData,
-    BlocksData,
+    BlockedUserItem,
     BlockToggleResponse,
     UpdatePasswordRequest,
     UpdateUserRequest,
@@ -87,14 +94,21 @@ async def delete_me(
     return api_response(request, code=ApiCode.OK, data=None)
 
 
-@router.get("/me/blocks", status_code=200, response_model=ApiResponse[BlocksData])
+@router.get("/me/blocks", status_code=200, response_model=ApiResponse[CursorPage[BlockedUserItem]])
 async def get_my_blocks(
     request: Request,
+    cursor: Annotated[
+        OptionalPublicId,
+        Query(
+            description="무한 스크롤: 직전 응답의 마지막 차단 유저 id(공개 ID). 미지정 시 처음부터."
+        ),
+    ] = None,
+    size: int = Query(20, ge=1, le=100, description="페이지 크기"),
     user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_slave_db),
 ):
-    data = await UserService.get_blocked_list(user.id, db=db)
-    return api_response(request, code=ApiCode.OK, data=data)
+    items, has_more = await UserService.get_blocked_list(user.id, db=db, size=size, cursor=cursor)
+    return api_response(request, code=ApiCode.OK, data=CursorPage(items=items, has_more=has_more))
 
 
 @router.post(

@@ -245,8 +245,21 @@ class UsersRepository:
         return r.scalar_one_or_none() is not None
 
     @classmethod
-    async def get_blocked_users(cls, blocker_id: UUID, db: AsyncSession) -> list[User]:
-        """내가 차단한 유저 목록 (삭제되지 않은 유저만, 차단 시점 최신순)."""
+    async def get_blocked_users(
+        cls,
+        blocker_id: UUID,
+        *,
+        db: AsyncSession,
+        size: int,
+        cursor: UUID | None = None,
+    ) -> list[User]:
+        """내가 차단한 유저 목록을 keyset로 조회한다(size+1건으로 has_more 판정).
+
+        정렬·커서 축이 blocked_id인 이유: user_blocks의 PK가 (blocker_id, blocked_id)라
+        blocker_id 필터 + blocked_id 정렬이 **추가 인덱스 없이 PK로 완전히 커버**된다.
+        차단 시점(created_at) 정렬은 복합 커서 인코딩이 필요한데, 이 목록에 그 복잡도는
+        정당화되지 않는다(ADR 0002의 cursor 표준은 그대로 따른다).
+        """
         stmt = (
             select(User)
             .join(UserBlock, User.id == UserBlock.blocked_id)
@@ -255,8 +268,10 @@ class UsersRepository:
                 User.deleted_at.is_(None),
             )
             .options(joinedload(User.profile_image))
-            .order_by(UserBlock.created_at.desc())
         )
+        if cursor is not None:
+            stmt = stmt.where(UserBlock.blocked_id < cursor)
+        stmt = stmt.order_by(UserBlock.blocked_id.desc()).limit(size + 1)
         result = await db.execute(stmt)
         return list(result.unique().scalars().all())
 
