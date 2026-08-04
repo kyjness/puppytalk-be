@@ -522,12 +522,14 @@ class PostsModel:
 
     @classmethod
     async def increment_report_count(cls, post_id: UUID, db: AsyncSession) -> int | None:
-        return await _update_post(
+        # 저자 없는 글(SET NULL)은 관리자 목록에 노출되지 않으므로 신고 대상에서도 제외 —
+        # None 반환이 미존재·삭제·저자 없음의 404 판정을 겸한다(별도 존재 확인 쿼리 불필요).
+        return await update_one_returning(
             db,
-            post_id,
-            alive=True,
-            returning=Post.report_count,
-            report_count=Post.report_count + 1,
+            Post,
+            [Post.id == post_id, Post.deleted_at.is_(None), Post.user_id.isnot(None)],
+            {"report_count": Post.report_count + 1, "updated_at": utc_now()},
+            Post.report_count,
         )
 
     @classmethod
@@ -535,7 +537,7 @@ class PostsModel:
         return await _update_post(db, post_id, alive=True, is_blinded=True) is not None
 
     @classmethod
-    async def unblind_post(cls, post_id: UUID, db: AsyncSession) -> bool:
+    async def unblind(cls, post_id: UUID, db: AsyncSession) -> bool:
         return await _update_post(db, post_id, alive=True, is_blinded=False) is not None
 
     @classmethod

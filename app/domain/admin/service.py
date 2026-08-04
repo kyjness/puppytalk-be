@@ -1,51 +1,31 @@
-# 관리자 전용: 신고 게시글/댓글 목록·블라인드 해제·유저 정지·게시글 삭제. AsyncSession.
+# 관리자 전용: 신고 게시글/댓글 목록·블라인드/해제·신고 리셋·유저 정지·삭제. AsyncSession.
+# POST/COMMENT 분기는 reports/targets.py의 모더레이션 배선으로 흡수한다.
 
-from typing import Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.exc import StaleDataError
 
 from app.common import UserStatus
 from app.common.enums import TargetType
-from app.common.exceptions import (
-    CommentNotFoundException,
-    ConcurrentUpdateException,
-    PostNotFoundException,
-    UserNotFoundException,
-    UserWithdrawnException,
-)
+from app.common.exceptions import UserNotFoundException, UserWithdrawnException
 from app.domain.admin.model import AdminReportsModel
 from app.domain.admin.schema import ReportedPostAuthorInfo, ReportedPostItem
 from app.domain.auth.service import AuthService
 from app.domain.comments.repository import CommentsModel
+from app.domain.comments.service import CommentService
 from app.domain.posts.repository import PostsModel
 from app.domain.posts.services import PostService
 from app.domain.reports.model import ReportsModel
+from app.domain.reports.targets import moderation_target
 from app.domain.users.model import UsersModel
+from app.infra.redis import RedisLike
 
 CONTENT_PREVIEW_LEN = 80  # 게시글/댓글 내용 미리보기 글자 수
 
 
 def _content_preview(content: str | None) -> str:
     text = content or ""
-    if len(text) > CONTENT_PREVIEW_LEN:
-        return text[:CONTENT_PREVIEW_LEN] + "…"
-    return text[:CONTENT_PREVIEW_LEN]
-
-
-def _author_from_user(user) -> tuple[ReportedPostAuthorInfo | None, str | None]:
-    if not user:
-        return None, None
-    status = getattr(user, "status", None)
-    author = ReportedPostAuthorInfo(
-        id=user.id,
-        nickname=user.nickname,
-        profile_image_url=getattr(user, "profile_image_url", None)
-        or (user.profile_image.file_url if getattr(user, "profile_image", None) else None),
-        status=status,
-    )
-    return author, status
+    return text[:CONTENT_PREVIEW_LEN] + ("…" if len(text) > CONTENT_PREVIEW_LEN else "")
 
 
 class AdminService:
@@ -62,22 +42,13 @@ class AdminService:
             page_rows, total = await AdminReportsModel.page_reported_targets(
                 offset=(page - 1) * size, size=size, db=db
             )
-            post_ids = [tid for ttype, tid in page_rows if ttype == TargetType.POST.value]
-            comment_ids = [tid for ttype, tid in page_rows if ttype == TargetType.COMMENT.value]
+            post_ids = [tid for ttype, tid in page_rows if ttype is TargetType.POST]
+            comment_ids = [tid for ttype, tid in page_rows if ttype is TargetType.COMMENT]
 
             posts = await PostsModel.get_reported_by_ids(post_ids, db=db)
             comments = await CommentsModel.get_reported_by_ids(comment_ids, db=db)
-            last_at_by_post = await ReportsModel.bulk_max_created_at_by_target_ids(
-                TargetType.POST, post_ids, db=db
-            )
-            last_at_by_comment = await ReportsModel.bulk_max_created_at_by_target_ids(
-                TargetType.COMMENT, comment_ids, db=db
-            )
-            reasons_by_post = await ReportsModel.bulk_reasons_ordered_by_target_ids(
-                TargetType.POST, post_ids, db=db
-            )
-            reasons_by_comment = await ReportsModel.bulk_reasons_ordered_by_target_ids(
-                TargetType.COMMENT, comment_ids, db=db
+            reasons_map, last_at_map = await ReportsModel.bulk_report_meta(
+                post_ids=post_ids, comment_ids=comment_ids, db=db
             )
             titles_map = await PostsModel.get_titles_by_ids(
                 list({c.post_id for c in comments}), db=db
@@ -88,110 +59,115 @@ class AdminService:
 
             items: list[ReportedPostItem] = []
             for ttype, tid in page_rows:
-                if ttype == TargetType.POST.value:
+                if ttype is TargetType.POST:
                     p = posts_by_id.get(tid)
                     if p is None or p.user_id is None:
                         continue
-                    author, author_status = _author_from_user(p.user)
-                    items.append(
-                        ReportedPostItem(
-                            target_type="POST",
-                            id=p.id,
-                            post_id=p.id,
-                            title=p.title or "",
-                            content_preview=_content_preview(p.content),
-                            user_id=p.user_id,
-                            author=author,
-                            author_status=author_status,
-                            report_count=p.report_count,
-                            report_reasons=reasons_by_post.get(p.id, []),
-                            is_blinded=p.is_blinded,
-                            created_at=p.created_at,
-                            last_reported_at=last_at_by_post.get(p.id),
-                        )
-                    )
+                    row = p
+                    post_id = p.id
+                    title = p.title or ""
+                    user_id = p.user_id
+                    user = p.user
                 else:
                     c = comments_by_id.get(tid)
                     if c is None or c.author_id is None:
                         continue
-                    author, author_status = _author_from_user(c.author)
-                    items.append(
-                        ReportedPostItem(
-                            target_type="COMMENT",
-                            id=c.id,
-                            post_id=c.post_id,
-                            title=titles_map.get(c.post_id, ""),
-                            content_preview=_content_preview(c.content),
-                            user_id=c.author_id,
-                            author=author,
-                            author_status=author_status,
-                            report_count=c.report_count,
-                            report_reasons=reasons_by_comment.get(c.id, []),
-                            is_blinded=c.is_blinded,
-                            created_at=c.created_at,
-                            last_reported_at=last_at_by_comment.get(c.id),
-                        )
+                    row = c
+                    post_id = c.post_id
+                    title = titles_map.get(c.post_id, "")
+                    user_id = c.author_id
+                    user = c.author
+                author = ReportedPostAuthorInfo.model_validate(user) if user else None
+                items.append(
+                    ReportedPostItem(
+                        target_type=ttype.value,
+                        id=tid,
+                        post_id=post_id,
+                        title=title,
+                        content_preview=_content_preview(row.content),
+                        user_id=user_id,
+                        author=author,
+                        author_status=author.status if author else None,
+                        report_count=row.report_count,
+                        report_reasons=reasons_map.get((ttype, tid), []),
+                        is_blinded=row.is_blinded,
+                        created_at=row.created_at,
+                        last_reported_at=last_at_map.get((ttype, tid)),
                     )
+                )
             return items, total
 
-    @classmethod
-    async def unblind_post(cls, post_id: UUID, db: AsyncSession) -> None:
-        async with db.begin():
-            try:
-                ok = await PostsModel.unblind_post(post_id, db=db)
-            except StaleDataError as e:
-                raise ConcurrentUpdateException() from e
-        if not ok:
-            raise PostNotFoundException()
+    # --- 모더레이션(블라인드/해제/신고 리셋) — 타깃 분기는 배선이 흡수 ---
 
     @classmethod
-    async def reset_post_reports(cls, post_id: UUID, db: AsyncSession) -> None:
+    async def blind(cls, target_type: TargetType, target_id: UUID, db: AsyncSession) -> None:
+        t = moderation_target(target_type)
         async with db.begin():
-            await ReportsModel.delete_by_post_id(post_id, db=db)
-            await db.flush()  # delete 반영 후 reset_reports 실행해 재신고 시 목록 노출 보장
-            try:
-                ok = await PostsModel.reset_reports(post_id, db=db)
-            except StaleDataError as e:
-                raise ConcurrentUpdateException() from e
+            ok = await t.repo.set_blinded(target_id, db=db)
         if not ok:
-            raise PostNotFoundException()
+            raise t.not_found()
 
     @classmethod
-    async def suspend_user(cls, user_id: UUID, db: AsyncSession, redis: Any | None = None) -> None:
+    async def unblind(cls, target_type: TargetType, target_id: UUID, db: AsyncSession) -> None:
+        t = moderation_target(target_type)
+        async with db.begin():
+            ok = await t.repo.unblind(target_id, db=db)
+        if not ok:
+            raise t.not_found()
+
+    @classmethod
+    async def reset_reports(
+        cls, target_type: TargetType, target_id: UUID, db: AsyncSession
+    ) -> None:
+        t = moderation_target(target_type)
+        async with db.begin():
+            await ReportsModel.delete_by_target(t.target_type, target_id, db=db)
+            await db.flush()  # delete 반영 후 reset 실행해 재신고 시 목록 노출 보장
+            ok = await t.repo.reset_reports(target_id, db=db)
+        if not ok:
+            raise t.not_found()
+
+    # --- 유저 정지/복귀 ---
+
+    @classmethod
+    async def _set_user_status(
+        cls,
+        user_id: UUID,
+        status: UserStatus,
+        *,
+        db: AsyncSession,
+        redis: RedisLike | None,
+        revoke_refresh: bool,
+    ) -> None:
         async with db.begin():
             user = await UsersModel.get_user_by_id_including_deleted(user_id, db=db)
             if not user:
                 raise UserNotFoundException()
-            if getattr(user, "deleted_at", None) is not None or UserStatus.is_withdrawn_value(
-                getattr(user, "status", None)
-            ):
+            if user.deleted_at is not None or UserStatus.is_withdrawn_value(user.status):
                 raise UserWithdrawnException()
-            await UsersModel.update_user(user_id, db=db, status=UserStatus.SUSPENDED.value)
-        await AuthService.revoke_refresh_for_user(user_id, redis)
+            await UsersModel.update_user(user_id, db=db, status=status.value)
+        if revoke_refresh:
+            await AuthService.revoke_refresh_for_user(user_id, redis)
         await AuthService.invalidate_user_status_cache(redis, user_id)
 
     @classmethod
-    async def activate_user(cls, user_id: UUID, db: AsyncSession, redis: Any | None = None) -> None:
-        async with db.begin():
-            user = await UsersModel.get_user_by_id_including_deleted(user_id, db=db)
-            if not user:
-                raise UserNotFoundException()
-            if getattr(user, "deleted_at", None) is not None or UserStatus.is_withdrawn_value(
-                getattr(user, "status", None)
-            ):
-                raise UserWithdrawnException()
-            await UsersModel.update_user(user_id, db=db, status=UserStatus.ACTIVE.value)
-        await AuthService.invalidate_user_status_cache(redis, user_id)
+    async def suspend_user(
+        cls, user_id: UUID, db: AsyncSession, redis: RedisLike | None = None
+    ) -> None:
+        # 정지는 재로그인 차단을 위해 refresh 토큰까지 회수한다.
+        await cls._set_user_status(
+            user_id, UserStatus.SUSPENDED, db=db, redis=redis, revoke_refresh=True
+        )
 
     @classmethod
-    async def blind_post(cls, post_id: UUID, db: AsyncSession) -> None:
-        async with db.begin():
-            try:
-                ok = await PostsModel.set_blinded(post_id, db=db)
-            except StaleDataError as e:
-                raise ConcurrentUpdateException() from e
-        if not ok:
-            raise PostNotFoundException()
+    async def activate_user(
+        cls, user_id: UUID, db: AsyncSession, redis: RedisLike | None = None
+    ) -> None:
+        await cls._set_user_status(
+            user_id, UserStatus.ACTIVE, db=db, redis=redis, revoke_refresh=False
+        )
+
+    # --- 삭제 — 캐스케이드·멱등 시맨틱은 각 도메인 서비스가 소유 ---
 
     @classmethod
     async def delete_post(cls, post_id: UUID, db: AsyncSession) -> None:
@@ -199,39 +175,7 @@ class AdminService:
         await PostService.delete_post(post_id, db=db)
 
     @classmethod
-    async def unblind_comment(cls, comment_id: UUID, db: AsyncSession) -> None:
-        async with db.begin():
-            ok = await CommentsModel.unblind_comment(comment_id, db=db)
-        if not ok:
-            raise CommentNotFoundException()
-
-    @classmethod
-    async def blind_comment(cls, comment_id: UUID, db: AsyncSession) -> None:
-        async with db.begin():
-            ok = await CommentsModel.set_blinded(comment_id, db=db)
-        if not ok:
-            raise CommentNotFoundException()
-
-    @classmethod
-    async def reset_comment_reports(cls, comment_id: UUID, db: AsyncSession) -> None:
-        async with db.begin():
-            await ReportsModel.delete_by_comment_id(comment_id, db=db)
-            await db.flush()
-            ok = await CommentsModel.reset_reports(comment_id, db=db)
-        if not ok:
-            raise CommentNotFoundException()
-
-    @classmethod
     async def delete_comment(cls, post_id: UUID, comment_id: UUID, db: AsyncSession) -> None:
-        async with db.begin():
-            # 삭제는 멱등이 아니므로, 먼저 대상 존재 확인 후 삭제/카운트 감소를 같은 트랜잭션에서 처리.
-            meta = await CommentsModel.get_comment_meta(comment_id, db=db)
-            if meta is None or meta.deleted_at is not None:
-                raise CommentNotFoundException()
-            deleted = await CommentsModel.delete_comment(post_id, comment_id, db=db)
-            if not deleted:
-                raise CommentNotFoundException()
-            try:
-                await PostsModel.decrement_comment_count(post_id, db=db)
-            except StaleDataError as e:
-                raise ConcurrentUpdateException() from e
+        # 본가 흐름에 위임해 캐스케이드 소유를 comments에 남긴다. 본가는 delete-first
+        # 멱등이라 이미 삭제된 댓글도 200 — post 이중 삭제(404)와는 시맨틱이 다르다.
+        await CommentService.delete_comment(post_id, comment_id, db=db)
