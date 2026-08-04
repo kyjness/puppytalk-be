@@ -287,19 +287,30 @@ class CommentsModel:
 
     @classmethod
     async def increment_report_count(cls, comment_id: UUID, db: AsyncSession) -> int | None:
-        return await _update_comment(
+        # 저자 없는 댓글(SET NULL)은 관리자 목록에 노출되지 않으므로 신고 대상에서도 제외 —
+        # None 반환이 미존재·삭제·저자 없음의 404 판정을 겸한다(posts와 동일 시맨틱).
+        return await update_one_returning(
             db,
-            comment_id,
-            returning=Comment.report_count,
-            report_count=Comment.report_count + 1,
+            Comment,
+            [
+                Comment.id == comment_id,
+                Comment.deleted_at.is_(None),
+                Comment.author_id.isnot(None),
+            ],
+            {"report_count": Comment.report_count + 1},
+            Comment.report_count,
         )
 
     @classmethod
     async def set_blinded(cls, comment_id: UUID, db: AsyncSession) -> bool:
-        return await _update_comment(db, comment_id, touch=True, is_blinded=True) is not None
+        # alive 가드 — 삭제 댓글 blind는 404 판정(posts와 동일 시맨틱).
+        return (
+            await _update_comment(db, comment_id, alive=True, touch=True, is_blinded=True)
+            is not None
+        )
 
     @classmethod
-    async def unblind_comment(cls, comment_id: UUID, db: AsyncSession) -> bool:
+    async def unblind(cls, comment_id: UUID, db: AsyncSession) -> bool:
         return (
             await _update_comment(db, comment_id, alive=True, touch=True, is_blinded=False)
             is not None

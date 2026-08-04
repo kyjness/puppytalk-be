@@ -17,6 +17,7 @@ from app.common.exceptions import (
 )
 from app.core.config import settings
 from app.core.ids import new_uuid7
+from app.db import get_connection
 from app.domain.media.image_policy import (
     CONTENT_TYPE_EXT,
     build_pending_file_key,
@@ -316,6 +317,20 @@ class MediaService:
         finally:
             if lock_value and redis is not None:
                 await release_lock(redis, _JOB_LOCK_SWEEP_UNUSED, lock_value)
+
+    @classmethod
+    async def sweep_unused_images_detached(cls, redis: RedisLike | None) -> None:
+        """BackgroundTasks용 sweep — 응답 후 실행되므로 요청 스코프 세션 대신 자체 세션을 연다.
+
+        redis를 받아 스케줄 잡과 같은 락(_JOB_LOCK_SWEEP_UNUSED)을 공유하고, 실패는
+        클라이언트에 재전달하지 않는다(202는 '시작'만 보장) — 로그만 남긴다.
+        """
+        try:
+            async with get_connection() as db:
+                deleted_count = await cls.sweep_unused_images(db=db, redis=redis)
+            logger.info("media_sweep_done deleted_count=%s", deleted_count)
+        except Exception:
+            logger.warning("media_sweep_failed", exc_info=True)
 
     @classmethod
     async def cleanup_expired_signup_images(

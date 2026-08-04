@@ -14,7 +14,7 @@ class AdminReportsModel:
     @classmethod
     async def page_reported_targets(
         cls, *, offset: int, size: int, db: AsyncSession
-    ) -> tuple[list[tuple[str, UUID]], int]:
+    ) -> tuple[list[tuple[TargetType, UUID]], int]:
         """신고된 게시글·댓글을 하나의 피드로 합쳐 (target_type, id) 페이지 + 총계를 반환.
 
         두 테이블을 UNION ALL로 합쳐 DB에서 report_count DESC, created_at DESC, id DESC 단일
@@ -51,7 +51,7 @@ class AdminReportsModel:
         )
         count_stmt = select(func.count()).select_from(u)
 
-        total = (await db.execute(count_stmt)).scalar_one_or_none() or 0
+        total = (await db.execute(count_stmt)).scalar_one()  # count(*)는 항상 1행
         rows = (await db.execute(page_stmt)).all()
-        page = [(row[0], row[1]) for row in rows]
-        return page, int(total)
+        page = [(TargetType(row[0]), row[1]) for row in rows]  # str 태그 → enum 경계 복원
+        return page, total

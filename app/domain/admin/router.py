@@ -1,13 +1,12 @@
 # 관리자 전용 API. 관리자 검증은 APIRouter.dependencies 로 일괄 적용.
-import logging
-from typing import Annotated, Any
+from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Path, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import get_current_admin, get_master_db
 from app.common import ApiCode, ApiResponse, PaginatedResponse, PublicId, api_response
-from app.db import AsyncSessionLocal
+from app.common.enums import TargetType
 from app.domain.admin.schema import (
     ActivatedResponse,
     BlindedResponse,
@@ -26,7 +25,6 @@ router = APIRouter(
     tags=["admin"],
     dependencies=[Depends(get_current_admin)],
 )
-log = logging.getLogger(__name__)
 
 
 @router.post(
@@ -38,20 +36,9 @@ async def sweep_unused_media(
     request: Request,
     background_tasks: BackgroundTasks,
 ):
-    async def _sweep_task(session_maker: Any) -> None:
-        # BackgroundTasks는 응답 후 실행되므로, request-scoped db 세션이 아니라 독립 커넥션을 열어야 합니다.
-        try:
-            async with session_maker() as bg_db:
-                deleted_count = await MediaService.sweep_unused_images(db=bg_db)
-                if deleted_count:
-                    log.info("media_sweep_done deleted_count=%s", deleted_count)
-                else:
-                    log.info("media_sweep_done deleted_count=0")
-        except Exception:
-            # 백그라운드 실패는 클라이언트에 재전달하지 않음(202는 '시작'만 보장).
-            log.warning("media_sweep_failed", exc_info=True)
-
-    background_tasks.add_task(_sweep_task, AsyncSessionLocal)
+    # 세션·잡 락·로깅은 MediaService가 소유(202는 '시작'만 보장). redis를 넘겨
+    # 스케줄 sweep과 같은 락을 공유한다.
+    background_tasks.add_task(MediaService.sweep_unused_images_detached, get_app_redis(request.app))
     return api_response(
         request,
         code=ApiCode.OK,
@@ -90,7 +77,7 @@ async def unblind_post(
     post_id: Annotated[PublicId, Path(..., description="게시글 공개 ID (Base62)")],
     db: AsyncSession = Depends(get_master_db),
 ):
-    await AdminService.unblind_post(post_id, db=db)
+    await AdminService.unblind(TargetType.POST, post_id, db=db)
     return api_response(request, code=ApiCode.OK, data=UnblindedResponse())
 
 
@@ -104,7 +91,7 @@ async def reset_post_reports(
     post_id: Annotated[PublicId, Path(..., description="게시글 공개 ID (Base62)")],
     db: AsyncSession = Depends(get_master_db),
 ):
-    await AdminService.reset_post_reports(post_id, db=db)
+    await AdminService.reset_reports(TargetType.POST, post_id, db=db)
     return api_response(request, code=ApiCode.OK, data=ResetReportsResponse())
 
 
@@ -148,7 +135,7 @@ async def blind_post(
     post_id: Annotated[PublicId, Path(..., description="게시글 공개 ID (Base62)")],
     db: AsyncSession = Depends(get_master_db),
 ):
-    await AdminService.blind_post(post_id, db=db)
+    await AdminService.blind(TargetType.POST, post_id, db=db)
     return api_response(request, code=ApiCode.OK, data=BlindedResponse())
 
 
@@ -176,7 +163,7 @@ async def unblind_comment(
     comment_id: Annotated[PublicId, Path(..., description="댓글 공개 ID (Base62)")],
     db: AsyncSession = Depends(get_master_db),
 ):
-    await AdminService.unblind_comment(comment_id, db=db)
+    await AdminService.unblind(TargetType.COMMENT, comment_id, db=db)
     return api_response(request, code=ApiCode.OK, data=UnblindedResponse())
 
 
@@ -190,7 +177,7 @@ async def blind_comment(
     comment_id: Annotated[PublicId, Path(..., description="댓글 공개 ID (Base62)")],
     db: AsyncSession = Depends(get_master_db),
 ):
-    await AdminService.blind_comment(comment_id, db=db)
+    await AdminService.blind(TargetType.COMMENT, comment_id, db=db)
     return api_response(request, code=ApiCode.OK, data=BlindedResponse())
 
 
@@ -204,7 +191,7 @@ async def reset_comment_reports(
     comment_id: Annotated[PublicId, Path(..., description="댓글 공개 ID (Base62)")],
     db: AsyncSession = Depends(get_master_db),
 ):
-    await AdminService.reset_comment_reports(comment_id, db=db)
+    await AdminService.reset_reports(TargetType.COMMENT, comment_id, db=db)
     return api_response(request, code=ApiCode.OK, data=ResetReportsResponse())
 
 
