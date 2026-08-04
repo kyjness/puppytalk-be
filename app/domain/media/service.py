@@ -33,7 +33,7 @@ from app.domain.media.schema import (
     PresignUploadResponse,
     SignupImageUploadData,
 )
-from app.infra.lock import release_lock, try_acquire_lock
+from app.infra.lock import release_lock, try_acquire_job_lock
 from app.infra.redis import RedisLike, bulk_to_str
 from app.infra.storage import (
     build_url,
@@ -47,28 +47,12 @@ from app.infra.storage import (
 logger = logging.getLogger(__name__)
 
 _UPLOAD_TOKEN_KEY_PREFIX = "upload_token:"
+# 주기 잡 러너(core.cleanup)가 이미 잡별 락을 걸지만, 이 두 정리는 러너 밖에서도 불린다
+# (sweep_unused_images_detached — 업로드 응답 후 BackgroundTasks). 러너 락은 그 경로를
+# 못 덮으므로 자체 락을 유지한다 — 스케줄 실행과 요청 유발 실행이 겹치는 것을 막는 몫이다.
 _JOB_LOCK_SWEEP_UNUSED = "lock:media-sweep"
 _JOB_LOCK_SIGNUP_CLEANUP = "lock:media-signup-cleanup"
 _JOB_LOCK_TTL_SECONDS = 600
-
-
-async def _try_acquire_job_lock(
-    redis: RedisLike | None,
-    *,
-    lock_key: str,
-    ttl_seconds: int,
-) -> tuple[bool, str | None]:
-    """잡 락 획득 시도. 실패(이미 점유)면 조용히 skip하도록 (False, None) 반환."""
-    if redis is None:
-        # Redis 미사용 환경은 단일 노드 개발 모드로 간주하고 작업을 진행한다.
-        return True, None
-    try:
-        lock_value = await try_acquire_lock(redis, lock_key, ttl_seconds)
-        return (lock_value is not None), lock_value
-    except Exception as e:
-        # 스케줄러 작업의 보수적 가용성: RedisLike 장애 시 락 없이 진행.
-        logger.warning("job lock unavailable key=%s fallback_without_lock err=%s", lock_key, e)
-        return True, None
 
 
 async def _keyset_cleanup(
@@ -290,10 +274,8 @@ class MediaService:
     @classmethod
     async def sweep_unused_images(cls, db: AsyncSession, redis: RedisLike | None = None) -> int:
         """24시간 이상 경과 + users/dog_profiles/post_images 어디에도 연결되지 않은 이미지 정리."""
-        acquired, lock_value = await _try_acquire_job_lock(
-            redis,
-            lock_key=_JOB_LOCK_SWEEP_UNUSED,
-            ttl_seconds=_JOB_LOCK_TTL_SECONDS,
+        acquired, lock_value = await try_acquire_job_lock(
+            redis, key=_JOB_LOCK_SWEEP_UNUSED, ttl_seconds=_JOB_LOCK_TTL_SECONDS
         )
         if not acquired:
             logger.info("skip sweep_unused_images: lock already held")
@@ -336,10 +318,8 @@ class MediaService:
     async def cleanup_expired_signup_images(
         cls, db: AsyncSession, *, task_id: str, redis: RedisLike | None = None
     ) -> tuple[int, list[str]]:
-        acquired, lock_value = await _try_acquire_job_lock(
-            redis,
-            lock_key=_JOB_LOCK_SIGNUP_CLEANUP,
-            ttl_seconds=_JOB_LOCK_TTL_SECONDS,
+        acquired, lock_value = await try_acquire_job_lock(
+            redis, key=_JOB_LOCK_SIGNUP_CLEANUP, ttl_seconds=_JOB_LOCK_TTL_SECONDS
         )
         if not acquired:
             logger.info("skip cleanup_expired_signup_images task_id=%s: lock already held", task_id)

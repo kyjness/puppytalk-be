@@ -76,8 +76,10 @@ def _cleanup_jobs(redis_client: Any) -> tuple[PeriodicJob, ...]:
     return (
         PeriodicJob("signup_image_cleanup", signup_image_cleanup),
         PeriodicJob("orphan_post_image_cleanup", orphan_post_image_cleanup),
-        PeriodicJob("withdrawn_user_purge", withdrawn_user_purge),
-        PeriodicJob("notification_purge", notification_purge),
+        # 퍼지 2종은 테이블이 빌 때까지 청크 삭제를 반복해 백로그가 쌓였을 때 오래 돈다 —
+        # 락이 도중에 만료돼 다른 인스턴스가 끼어들지 않도록 TTL을 넉넉히 준다.
+        PeriodicJob("withdrawn_user_purge", withdrawn_user_purge, lock_ttl_seconds=1800),
+        PeriodicJob("notification_purge", notification_purge, lock_ttl_seconds=1800),
     )
 
 
@@ -121,7 +123,7 @@ async def lifespan(app: FastAPI):
 
     redis_client = get_app_redis(app)
     cleanup_jobs = _cleanup_jobs(redis_client)
-    await run_jobs_once(cleanup_jobs)
+    await run_jobs_once(cleanup_jobs, redis=redis_client)
     stop_event = asyncio.Event()
     cleanup_task = None
     view_flush_task: asyncio.Task[None] | None = None
@@ -132,6 +134,7 @@ async def lifespan(app: FastAPI):
                 cleanup_jobs,
                 stop_event,
                 interval_seconds=max(60, settings.SIGNUP_IMAGE_CLEANUP_INTERVAL),
+                redis=redis_client,
             )
         )
     if redis_client is not None and settings.VIEW_BUFFER_FLUSH_INTERVAL_SECONDS > 0:
