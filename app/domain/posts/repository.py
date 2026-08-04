@@ -636,7 +636,6 @@ class PostsRepository:
             db,
             target_model=Post,
             counter_col=Post.like_count,
-            link_model=PostLike,
             link_target_col=PostLike.post_id,
             link_owner_col=PostLike.user_id,
             owner_ids=user_ids,

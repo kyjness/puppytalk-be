@@ -466,7 +466,6 @@ class CommentsRepository:
             db,
             target_model=Comment,
             counter_col=Comment.like_count,
-            link_model=CommentLike,
             link_target_col=CommentLike.comment_id,
             link_owner_col=CommentLike.user_id,
             owner_ids=user_ids,

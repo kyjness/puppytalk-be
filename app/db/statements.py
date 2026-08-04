@@ -53,7 +53,6 @@ async def decrement_counter_by_link_owner(
     *,
     target_model: type[Any],
     counter_col: Any,
-    link_model: type[Any],
     link_target_col: Any,
     link_owner_col: Any,
     owner_ids: list[Any],

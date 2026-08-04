@@ -32,11 +32,18 @@ pytestmark = pytest.mark.asyncio
 # --- SseFanoutManager ---
 
 
+async def _register(manager: SseFanoutManager, uid) -> asyncio.Queue[str]:
+    """상한 미만에서의 등록 — 거절(None)은 그 자체를 검증하는 테스트에서만 다룬다."""
+    queue = await manager.register(uid)
+    assert queue is not None
+    return queue
+
+
 async def test_manager_delivers_to_all_user_queues():
     manager = SseFanoutManager()
     uid = uuid4()
-    q1 = await manager.register(uid)
-    q2 = await manager.register(uid)
+    q1 = await _register(manager, uid)
+    q2 = await _register(manager, uid)
     await manager.deliver(uid, "hello")
     assert q1.get_nowait() == "hello"
     assert q2.get_nowait() == "hello"
@@ -45,7 +52,7 @@ async def test_manager_delivers_to_all_user_queues():
 async def test_manager_unregister_removes_empty_bucket():
     manager = SseFanoutManager()
     uid = uuid4()
-    queue = await manager.register(uid)
+    queue = await _register(manager, uid)
     await manager.unregister(uid, queue)
     await manager.deliver(uid, "dropped")  # 등록 없음 → no-op
     assert manager._by_user == {}
@@ -54,7 +61,7 @@ async def test_manager_unregister_removes_empty_bucket():
 async def test_manager_drops_when_queue_full():
     manager = SseFanoutManager()
     uid = uuid4()
-    queue = await manager.register(uid)
+    queue = await _register(manager, uid)
     for i in range(queue.maxsize):
         await manager.deliver(uid, str(i))
     await manager.deliver(uid, "overflow")  # 예외 없이 드롭
@@ -88,14 +95,14 @@ async def test_sse_capacity_check_rejects_past_cap():
     """상한 판정은 스트림 시작 전에 일어나야 429로 내려갈 수 있다."""
     uid = uuid4()
     cap = settings.REALTIME_MAX_CONNECTIONS_PER_USER
-    queues = [await notification_sse_manager.register(uid) for _ in range(cap)]
+    queues = [await _register(notification_sse_manager, uid) for _ in range(cap)]
     try:
         with pytest.raises(TooManyRequestsException):
             await NotificationService.ensure_sse_capacity(uid)
 
         await notification_sse_manager.unregister(uid, queues.pop())
         await NotificationService.ensure_sse_capacity(uid)  # 자리가 나면 통과
-        queues.append(await notification_sse_manager.register(uid))
+        queues.append(await _register(notification_sse_manager, uid))
     finally:
         for q in queues:
             await notification_sse_manager.unregister(uid, q)
@@ -119,7 +126,7 @@ async def test_manager_register_returns_none_at_cap_without_leaking_bucket():
     manager = SseFanoutManager()
     uid = uuid4()
     queues = [
-        await manager.register(uid) for _ in range(settings.REALTIME_MAX_CONNECTIONS_PER_USER)
+        await _register(manager, uid) for _ in range(settings.REALTIME_MAX_CONNECTIONS_PER_USER)
     ]
     assert await manager.register(uid) is None
     for q in queues:
@@ -160,7 +167,7 @@ async def test_publish_after_commit_sends_single_channel_envelope_with_origin():
 async def test_publish_after_commit_delivers_locally_even_when_publish_succeeds():
     """로컬 전달은 publish·리스너 상태에 의존하지 않는다 — 항상 직접 전달."""
     uid = uuid4()
-    queue = await notification_sse_manager.register(uid)
+    queue = await _register(notification_sse_manager, uid)
     try:
         await NotificationService.publish_after_commit(
             FakeRedis(),  # type: ignore[arg-type]
@@ -173,7 +180,7 @@ async def test_publish_after_commit_delivers_locally_even_when_publish_succeeds(
 
 async def test_publish_after_commit_delivers_locally_when_publish_fails():
     uid = uuid4()
-    queue = await notification_sse_manager.register(uid)
+    queue = await _register(notification_sse_manager, uid)
     try:
         await NotificationService.publish_after_commit(
             FakeRedis(fail_publish=True),  # type: ignore[arg-type]
@@ -187,7 +194,7 @@ async def test_publish_after_commit_delivers_locally_when_publish_fails():
 
 async def test_publish_after_commit_delivers_locally_without_redis():
     uid = uuid4()
-    queue = await notification_sse_manager.register(uid)
+    queue = await _register(notification_sse_manager, uid)
     try:
         await NotificationService.publish_after_commit(None, _event(uid))
         assert queue.qsize() == 1
