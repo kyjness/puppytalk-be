@@ -27,6 +27,11 @@ from app.infra.redis import RedisLike
 
 _DELETED_CONTENT_PLACEHOLDER = "삭제된 댓글입니다."
 
+# 목록 응답에 루트당 함께 실어 보내는 대댓글 수. 서버 상수로 고정한다 — 클라이언트가
+# 제어하면 한 요청이 끌어오는 행 수의 상한이 다시 사라진다(트렌딩 window_hours와 같은 이유).
+# 나머지는 GET .../comments/{comment_id}/replies 로 이어 받는다.
+REPLY_PREVIEW_LIMIT = 3
+
 
 async def _ensure_post_visible(
     post_id: UUID,
@@ -59,20 +64,26 @@ def _comment_to_response(c, liked_ids: set):
 
 def _build_comment_tree(
     roots: list,
-    replies: list,
+    reply_previews: list[tuple],
     liked_ids: set,
     sort: str = "latest",
 ) -> list[CommentResponse]:
-    """루트 순서는 keyset로 이미 확정돼 있으므로 보존하고, 대댓글만 부모에 붙여 정렬한다."""
+    """루트 순서는 keyset로 이미 확정돼 있으므로 보존하고, 대댓글 preview만 부모에 붙여 정렬한다.
+
+    reply_previews는 (대댓글, 그 부모의 총 표시 가능 대댓글 수) 쌍이다 — 총 개수를 별도
+    COUNT 쿼리 없이 같은 조회에서 받아, 응답의 reply_count·has_more_replies를 채운다.
+    """
     root_resps = [_comment_to_response(r, liked_ids) for r in roots]
     by_id = {r.id: resp for r, resp in zip(roots, root_resps)}
-    for rp in replies:
+    for rp, total in reply_previews:
         parent = by_id.get(rp.parent_id)
         if parent is not None:
             parent.replies.append(_comment_to_response(rp, liked_ids))
+            parent.reply_count = total
     reverse = sort != "oldest"
     for resp in root_resps:
         resp.replies.sort(key=lambda x: x.id, reverse=reverse)
+        resp.has_more_replies = resp.reply_count > len(resp.replies)
     return root_resps
 
 
@@ -147,10 +158,14 @@ class CommentService:
                 current_user_id=current_user_id,
             )
             roots, has_more = split_page(fetched, size)
-            replies = await CommentsRepository.get_replies_for_roots(
-                [r.id for r in roots], db=db, current_user_id=current_user_id
+            reply_previews = await CommentsRepository.get_reply_previews_for_roots(
+                [r.id for r in roots],
+                db=db,
+                limit_per_root=REPLY_PREVIEW_LIMIT,
+                sort=sort_mode,
+                current_user_id=current_user_id,
             )
-            comment_ids = [c.id for c in roots] + [c.id for c in replies]
+            comment_ids = [c.id for c in roots] + [c.id for c, _ in reply_previews]
             liked_ids = (
                 await CommentLikesRepository.get_liked_comment_ids_for_user(
                     current_user_id, comment_ids, db=db
@@ -158,8 +173,47 @@ class CommentService:
                 if current_user_id is not None
                 else set()
             )
-            result = _build_comment_tree(roots, replies, liked_ids, sort=sort_mode)
+            result = _build_comment_tree(roots, reply_previews, liked_ids, sort=sort_mode)
         return result, has_more
+
+    @classmethod
+    async def get_replies(
+        cls,
+        post_id: UUID,
+        comment_id: UUID,
+        size: int,
+        db: AsyncSession,
+        sort: str | None = None,
+        cursor: UUID | None = None,
+        current_user_id: UUID | None = None,
+    ) -> tuple[list[CommentResponse], bool]:
+        """한 루트의 대댓글 keyset 페이지 — 목록 응답의 preview 뒤를 이어 받는다."""
+        sort_mode = sort if sort in ("latest", "oldest") else "latest"
+        async with db.begin():
+            await _ensure_post_visible(post_id, db=db, current_user_id=current_user_id)
+            # 루트가 이 게시글에 속한 실제 루트인지 확인 — 대댓글 id로 조회해 트리를
+            # 한 단계 더 파고드는 요청(2단 구조 위반)과 남의 글 id 조합을 함께 막는다.
+            meta = await CommentsRepository.get_comment_meta(comment_id, db=db)
+            if meta is None or meta.post_id != post_id or meta.parent_id is not None:
+                raise CommentNotFoundException()
+            fetched = await CommentsRepository.get_replies_page(
+                comment_id,
+                size,
+                db=db,
+                cursor=cursor,
+                sort=sort_mode,
+                current_user_id=current_user_id,
+            )
+            replies, has_more = split_page(fetched, size)
+            liked_ids = (
+                await CommentLikesRepository.get_liked_comment_ids_for_user(
+                    current_user_id, [c.id for c in replies], db=db
+                )
+                if current_user_id is not None
+                else set()
+            )
+            items = [_comment_to_response(r, liked_ids) for r in replies]
+        return items, has_more
 
     @classmethod
     async def update_comment(

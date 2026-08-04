@@ -208,28 +208,83 @@ class CommentsRepository:
         return list(result.unique().scalars().all())
 
     @classmethod
-    async def get_replies_for_roots(
+    async def get_reply_previews_for_roots(
         cls,
         root_ids: list[UUID],
         *,
         db: AsyncSession,
+        limit_per_root: int,
+        sort: str = "latest",
         current_user_id: UUID | None = None,
-    ) -> list[Comment]:
-        """주어진 루트들의 대댓글을 한 번에 배치 로드한다(부모별 하드리밋 없음).
+    ) -> list[tuple[Comment, int]]:
+        """루트별 대댓글 preview(최대 limit_per_root건)와 **부모별 총 표시 가능 개수**를 함께 준다.
 
-        정렬은 _build_comment_tree가 부모별로 다시 하므로 여기선 SQL ORDER BY를 두지 않는다.
+        이전 구현은 `parent_id IN (root_ids)`로 대댓글을 전부 로드해 상한이 없었다 —
+        인기 스레드의 루트 하나에 대댓글이 수천 건이면 한 응답이 그만큼의 행 + 작성자
+        eager load를 끌어왔다(운영 봉투의 핫스팟 전제와 정면 배치).
+
+        윈도우 함수로 루트당 상위 N건만 남기고 총 개수를 같은 쿼리에서 얻는다 —
+        쿼리 1회, 행 수는 `루트 수 × N`으로 상한이 잡힌다. 가시성 술어는 목록·더보기와
+        같은 _reply_visible_conditions를 공유해 규칙이 갈라지지 않는다.
+        정렬 방향은 루트 정렬과 같게 둔다(기존 트리 조립 시맨틱 보존).
         """
         if not root_ids:
             return []
+        order_col = Comment.id.asc() if sort == "oldest" else Comment.id.desc()
+        visible = _reply_visible_conditions(Comment, current_user_id)
+        ranked = (
+            select(
+                Comment.id.label("cid"),
+                func.row_number()
+                .over(partition_by=Comment.parent_id, order_by=order_col)
+                .label("rn"),
+                # 같은 파티션 스캔에서 총 개수까지 얻는다 — COUNT 쿼리를 따로 돌지 않는다.
+                func.count().over(partition_by=Comment.parent_id).label("reply_total"),
+            )
+            .where(Comment.parent_id.in_(root_ids), *visible)
+            .subquery()
+        )
+        stmt = (
+            select(Comment, ranked.c.reply_total)
+            .join(ranked, Comment.id == ranked.c.cid)
+            .where(ranked.c.rn <= limit_per_root)
+            .options(*_comment_author_loads())
+        )
+        rows = (await db.execute(stmt)).unique().all()
+        return [(row[0], int(row[1] or 0)) for row in rows]
+
+    @classmethod
+    async def get_replies_page(
+        cls,
+        parent_id: UUID,
+        size: int,
+        *,
+        db: AsyncSession,
+        cursor: UUID | None = None,
+        sort: str = "latest",
+        current_user_id: UUID | None = None,
+    ) -> list[Comment]:
+        """한 루트의 대댓글을 keyset로 조회한다(size+1건으로 has_more 판정) — "더보기" 전용.
+
+        루트 목록(get_root_comments)과 같은 keyset 패턴·같은 가시성 술어를 쓴다.
+        """
         stmt = (
             select(Comment)
             .where(
-                Comment.parent_id.in_(root_ids),
+                Comment.parent_id == parent_id,
                 *_reply_visible_conditions(Comment, current_user_id),
             )
             .options(*_comment_author_loads())
         )
-        result = await db.execute(stmt)
+        if sort == "oldest":
+            if cursor is not None:
+                stmt = stmt.where(Comment.id > cursor)
+            stmt = stmt.order_by(Comment.id.asc())
+        else:
+            if cursor is not None:
+                stmt = stmt.where(Comment.id < cursor)
+            stmt = stmt.order_by(Comment.id.desc())
+        result = await db.execute(stmt.limit(size + 1))
         return list(result.unique().scalars().all())
 
     @classmethod
