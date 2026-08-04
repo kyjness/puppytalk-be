@@ -16,14 +16,18 @@ from app.common.exceptions import (
     CommentNotFoundException,
     PostNotFoundException,
 )
-from app.domain.comments.repository import CommentsRepository
+from app.domain.comments.service import CommentModeration
 from app.domain.posts.repository import PostsRepository
 
 
 class _ModerationRepo(Protocol):
-    """posts·comments 저장소가 같은 이름으로 유지하는 모더레이션 계약.
+    """posts·comments가 같은 이름으로 유지하는 모더레이션 계약.
 
     첫 인자는 positional-only — 구현의 post_id/comment_id 이름 차이를 흡수한다.
+
+    게시글은 저장소가 곧 구현이지만, 댓글은 블라인드 전이마다 게시글 comment_count를
+    함께 맞춰야 해 서비스(CommentModeration)가 구현을 맡는다 — 계약이 구조적이라
+    호출부(AdminService·ReportService)는 이 차이를 알 필요가 없다.
     """
 
     async def increment_report_count(self, target_id: UUID, /, db: AsyncSession) -> int | None: ...
@@ -50,7 +54,7 @@ _BY_TYPE: dict[TargetType, ModerationTarget] = {
     ),
     TargetType.COMMENT: ModerationTarget(
         target_type=TargetType.COMMENT,
-        repo=CommentsRepository,
+        repo=CommentModeration,
         not_found=CommentNotFoundException,
     ),
 }

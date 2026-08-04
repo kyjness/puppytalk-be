@@ -33,7 +33,7 @@ from app.domain.media.schema import (
     PresignUploadResponse,
     SignupImageUploadData,
 )
-from app.infra.lock import release_lock, try_acquire_lock
+from app.infra.lock import release_lock, try_acquire_job_lock
 from app.infra.redis import RedisLike, bulk_to_str
 from app.infra.storage import (
     build_url,
@@ -47,28 +47,12 @@ from app.infra.storage import (
 logger = logging.getLogger(__name__)
 
 _UPLOAD_TOKEN_KEY_PREFIX = "upload_token:"
-_JOB_LOCK_SWEEP_UNUSED = "lock:media-sweep"
-_JOB_LOCK_SIGNUP_CLEANUP = "lock:media-signup-cleanup"
+# sweep은 주기 잡 말고 요청 유발 경로(sweep_unused_images_detached)에서도 돈다. 주기 잡이
+# **같은 키**를 선언하도록 main에서 PeriodicJob.lock_key로 넘겨(키가 갈리면 두 경로가 서로를
+# 배제하지 못한다), 락 획득은 여기 한 곳에서만 한다.
+# signup 정리는 호출자가 주기 잡뿐이라 러너 락이 전부 덮는다 — 사설 락을 두지 않는다.
+JOB_LOCK_SWEEP_UNUSED = "lock:media-sweep"
 _JOB_LOCK_TTL_SECONDS = 600
-
-
-async def _try_acquire_job_lock(
-    redis: RedisLike | None,
-    *,
-    lock_key: str,
-    ttl_seconds: int,
-) -> tuple[bool, str | None]:
-    """잡 락 획득 시도. 실패(이미 점유)면 조용히 skip하도록 (False, None) 반환."""
-    if redis is None:
-        # Redis 미사용 환경은 단일 노드 개발 모드로 간주하고 작업을 진행한다.
-        return True, None
-    try:
-        lock_value = await try_acquire_lock(redis, lock_key, ttl_seconds)
-        return (lock_value is not None), lock_value
-    except Exception as e:
-        # 스케줄러 작업의 보수적 가용성: RedisLike 장애 시 락 없이 진행.
-        logger.warning("job lock unavailable key=%s fallback_without_lock err=%s", lock_key, e)
-        return True, None
 
 
 async def _keyset_cleanup(
@@ -288,83 +272,75 @@ class MediaService:
             await run_in_threadpool(storage_delete, file_key)
 
     @classmethod
-    async def sweep_unused_images(cls, db: AsyncSession, redis: RedisLike | None = None) -> int:
-        """24시간 이상 경과 + users/dog_profiles/post_images 어디에도 연결되지 않은 이미지 정리."""
-        acquired, lock_value = await _try_acquire_job_lock(
-            redis,
-            lock_key=_JOB_LOCK_SWEEP_UNUSED,
-            ttl_seconds=_JOB_LOCK_TTL_SECONDS,
-        )
-        if not acquired:
-            logger.info("skip sweep_unused_images: lock already held")
-            return 0
-        try:
+    async def sweep_unused_images(cls, db: AsyncSession) -> int:
+        """24시간 이상 경과 + users/dog_profiles/post_images 어디에도 연결되지 않은 이미지 정리.
 
-            async def _fetch(after_id: UUID | None, limit: int) -> list[Image]:
-                return await MediaRepository.get_orphan_images_older_than(
-                    older_than_hours=24, db=db, limit=limit, after_id=after_id
-                )
+        **락은 잡지 않는다** — 배타 실행은 호출부가 JOB_LOCK_SWEEP_UNUSED로 보장한다.
+        여기서 또 잡으면 러너가 이미 그 키를 쥔 상태라 SET NX가 항상 실패해(재진입 불가)
+        정리가 영구 no-op이 된다.
+        """
 
-            def _on_fail(img: Image, e: Exception) -> None:
-                logger.warning(
-                    "Sweep storage delete failed image_id=%s file_key=%s: %s",
-                    img.id,
-                    img.file_key,
-                    e,
-                )
+        async def _fetch(after_id: UUID | None, limit: int) -> list[Image]:
+            return await MediaRepository.get_orphan_images_older_than(
+                older_than_hours=24, db=db, limit=limit, after_id=after_id
+            )
 
-            return await _keyset_cleanup(db, fetch=_fetch, on_delete_failed=_on_fail)
-        finally:
-            if lock_value and redis is not None:
-                await release_lock(redis, _JOB_LOCK_SWEEP_UNUSED, lock_value)
+        def _on_fail(img: Image, e: Exception) -> None:
+            logger.warning(
+                "Sweep storage delete failed image_id=%s file_key=%s: %s",
+                img.id,
+                img.file_key,
+                e,
+            )
+
+        return await _keyset_cleanup(db, fetch=_fetch, on_delete_failed=_on_fail)
 
     @classmethod
     async def sweep_unused_images_detached(cls, redis: RedisLike | None) -> None:
         """BackgroundTasks용 sweep — 응답 후 실행되므로 요청 스코프 세션 대신 자체 세션을 연다.
 
-        redis를 받아 스케줄 잡과 같은 락(_JOB_LOCK_SWEEP_UNUSED)을 공유하고, 실패는
-        클라이언트에 재전달하지 않는다(202는 '시작'만 보장) — 로그만 남긴다.
+        주기 잡과 **같은 키**로 배타 실행한다 — 주기 잡 쪽은 러너(PeriodicJob.lock_key)가,
+        이 요청 유발 경로는 여기서 직접 건다. 실패는 클라이언트에 재전달하지 않는다
+        (202는 '시작'만 보장) — 로그만 남긴다.
         """
+        acquired, lock_value = await try_acquire_job_lock(
+            redis, key=JOB_LOCK_SWEEP_UNUSED, ttl_seconds=_JOB_LOCK_TTL_SECONDS
+        )
+        if not acquired:
+            logger.info("skip media sweep: 다른 경로가 실행 중")
+            return
         try:
             async with get_connection() as db:
-                deleted_count = await cls.sweep_unused_images(db=db, redis=redis)
+                deleted_count = await cls.sweep_unused_images(db=db)
             logger.info("media_sweep_done deleted_count=%s", deleted_count)
         except Exception:
             logger.warning("media_sweep_failed", exc_info=True)
+        finally:
+            if lock_value and redis is not None:
+                await release_lock(redis, JOB_LOCK_SWEEP_UNUSED, lock_value)
 
     @classmethod
     async def cleanup_expired_signup_images(
-        cls, db: AsyncSession, *, task_id: str, redis: RedisLike | None = None
+        cls, db: AsyncSession, *, task_id: str
     ) -> tuple[int, list[str]]:
-        acquired, lock_value = await _try_acquire_job_lock(
-            redis,
-            lock_key=_JOB_LOCK_SIGNUP_CLEANUP,
-            ttl_seconds=_JOB_LOCK_TTL_SECONDS,
-        )
-        if not acquired:
-            logger.info("skip cleanup_expired_signup_images task_id=%s: lock already held", task_id)
-            return 0, []
-        try:
-            failed_file_keys: list[str] = []
+        """만료된 가입 임시 이미지 정리. 배타 실행은 주기 잡 러너의 락이 보장한다."""
+        failed_file_keys: list[str] = []
 
-            async def _fetch(after_id: UUID | None, limit: int) -> list[Image]:
-                return await MediaRepository.get_expired_signup_images(
-                    db=db, limit=limit, after_id=after_id
-                )
+        async def _fetch(after_id: UUID | None, limit: int) -> list[Image]:
+            return await MediaRepository.get_expired_signup_images(
+                db=db, limit=limit, after_id=after_id
+            )
 
-            def _on_fail(img: Image, e: Exception) -> None:
-                logger.warning(
-                    "Signup image storage delete failed task_id=%s image_id=%s file_key=%s: %s",
-                    task_id,
-                    img.id,
-                    img.file_key,
-                    e,
-                    exc_info=True,
-                )
-                failed_file_keys.append(img.file_key)
+        def _on_fail(img: Image, e: Exception) -> None:
+            logger.warning(
+                "Signup image storage delete failed task_id=%s image_id=%s file_key=%s: %s",
+                task_id,
+                img.id,
+                img.file_key,
+                e,
+                exc_info=True,
+            )
+            failed_file_keys.append(img.file_key)
 
-            total_deleted = await _keyset_cleanup(db, fetch=_fetch, on_delete_failed=_on_fail)
-            return total_deleted, failed_file_keys
-        finally:
-            if lock_value and redis is not None:
-                await release_lock(redis, _JOB_LOCK_SIGNUP_CLEANUP, lock_value)
+        total_deleted = await _keyset_cleanup(db, fetch=_fetch, on_delete_failed=_on_fail)
+        return total_deleted, failed_file_keys

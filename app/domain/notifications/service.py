@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from app.common.enums import NotificationKind
+from app.common.exceptions import TooManyRequestsException
 from app.core.config import settings
 from app.core.ids import uuid_to_base62
 from app.domain.notifications.model import Notification, NotificationsRepository
@@ -227,15 +228,29 @@ class NotificationService:
         return total
 
     @staticmethod
+    async def ensure_sse_capacity(user_id: UUID) -> None:
+        """상한 초과면 429 — **등록하지는 않는다.**
+
+        등록까지 여기서 하면, 스트림이 시작되지 않고 끝난 연결(중단된 요청)의 큐가
+        제너레이터의 finally를 못 만나 영구히 남는다. 그러면 상한이 그 유저를 잠근다.
+        등록·해제는 제너레이터가 짝으로 소유한다.
+        """
+        if not await notification_sse_manager.has_capacity(user_id):
+            raise TooManyRequestsException(
+                message="동시 실시간 연결 수를 초과했습니다. 사용하지 않는 탭을 닫고 다시 시도해주세요."
+            )
+
+    @staticmethod
     async def sse_subscribe(
         user_id: UUID,
         *,
         heartbeat_interval_sec: float = 25.0,
     ) -> AsyncGenerator[str]:
         """로컬 팬아웃 큐 대기 — 연결마다 Redis pubsub을 점유하지 않는다(공유 풀 고갈 방지).
-        클라이언트 연결 해제 시 제너레이터 취소 → 큐 등록 해제."""
-
+        등록·해제를 한 try/finally 안에 두어, 시작되지 않은 스트림이 슬롯을 남기지 않는다."""
         queue = await notification_sse_manager.register(user_id)
+        if queue is None:  # 확인~등록 사이에 상한이 찼다 — 조용히 끝낸다.
+            return
         try:
             while True:
                 try:

@@ -113,6 +113,9 @@ class Settings(BaseSettings):
     # WS는 HTTP 미들웨어를 타지 않는다 — DM 수신 루프에서 유저 단위로 적용.
     CHAT_WS_RATE_LIMIT_WINDOW: int = 60
     CHAT_WS_RATE_LIMIT_MAX_MESSAGES: int = 60
+    # 유저당 인스턴스 로컬 실시간 연결(WS·SSE) 상한. 큐는 bounded지만 연결 수가 무제한이면
+    # 유저 한 명이 인스턴스 로컬 상태를 무한히 늘릴 수 있다 — 탭·기기 다중 사용을 고려한 값.
+    REALTIME_MAX_CONNECTIONS_PER_USER: int = 5
     # 인증 presign 유저 단위 한도 — IP 글로벌만으로는 pending/ 대량 적재를 못 막는다.
     MEDIA_PRESIGN_RATE_LIMIT_WINDOW: int = 3600
     MEDIA_PRESIGN_RATE_LIMIT_MAX: int = 100

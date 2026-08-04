@@ -245,8 +245,21 @@ class UsersRepository:
         return r.scalar_one_or_none() is not None
 
     @classmethod
-    async def get_blocked_users(cls, blocker_id: UUID, db: AsyncSession) -> list[User]:
-        """내가 차단한 유저 목록 (삭제되지 않은 유저만, 차단 시점 최신순)."""
+    async def get_blocked_users(
+        cls,
+        blocker_id: UUID,
+        *,
+        db: AsyncSession,
+        size: int,
+        cursor: UUID | None = None,
+    ) -> list[User]:
+        """내가 차단한 유저 목록을 keyset로 조회한다(size+1건으로 has_more 판정).
+
+        정렬·커서 축이 blocked_id인 이유: user_blocks의 PK가 (blocker_id, blocked_id)라
+        blocker_id 필터 + blocked_id 정렬이 **추가 인덱스 없이 PK로 완전히 커버**된다.
+        차단 시점(created_at) 정렬은 복합 커서 인코딩이 필요한데, 이 목록에 그 복잡도는
+        정당화되지 않는다(ADR 0002의 cursor 표준은 그대로 따른다).
+        """
         stmt = (
             select(User)
             .join(UserBlock, User.id == UserBlock.blocked_id)
@@ -255,8 +268,10 @@ class UsersRepository:
                 User.deleted_at.is_(None),
             )
             .options(joinedload(User.profile_image))
-            .order_by(UserBlock.created_at.desc())
         )
+        if cursor is not None:
+            stmt = stmt.where(UserBlock.blocked_id < cursor)
+        stmt = stmt.order_by(UserBlock.blocked_id.desc()).limit(size + 1)
         result = await db.execute(stmt)
         return list(result.unique().scalars().all())
 
@@ -362,20 +377,21 @@ class UsersRepository:
         return r.scalar_one_or_none() is not None
 
     @classmethod
-    async def purge_withdrawn_users_older_than(
+    async def select_purgeable_user_ids(
         cls,
         *,
         older_than_days: int,
         limit: int,
         db: AsyncSession,
     ) -> list[UUID]:
-        """탈퇴(WITHDRAWN) + deleted_at 기준 N일 경과 유저를 하드 삭제.
+        """하드 삭제 대상(탈퇴 + deleted_at 기준 N일 경과) id를 청크 단위로 고른다.
 
-        - 대량 삭제로 인한 락을 줄이기 위해 limit 단위로 청크 처리한다.
-        - FK ondelete(CASCADE/SET NULL)에 의존해 연관 데이터 정합성 유지.
+        삭제와 분리한 이유: 지우기 **전에** 다른 도메인의 비정규화 카운트를 보정해야 하는데,
+        같은 LIMIT 서브쿼리를 두 번 평가하면 ORDER BY가 없어 서로 다른 행이 잡힐 수 있다.
+        id를 한 번 확정해 보정·삭제가 같은 집합을 보게 한다.
         """
         cutoff = utc_now() - timedelta(days=older_than_days)
-        id_stmt = (
+        rows = await db.execute(
             select(User.id)
             .where(
                 User.status == UserStatus.WITHDRAWN.value,
@@ -384,6 +400,17 @@ class UsersRepository:
             )
             .limit(int(limit))
         )
-        result = await db.execute(delete(User).where(User.id.in_(id_stmt)).returning(User.id))
+        return list(rows.scalars().all())
+
+    @classmethod
+    async def purge_users_by_ids(cls, user_ids: list[UUID], *, db: AsyncSession) -> list[UUID]:
+        """유저 하드 삭제. 연관 데이터는 FK ondelete(CASCADE/SET NULL)가 처리한다.
+
+        단, FK는 **행**만 정리하고 다른 테이블의 비정규화 카운트는 모른다 —
+        like_count 보정은 호출부(UserService)가 이 호출 전에 끝내야 한다.
+        """
+        if not user_ids:
+            return []
+        result = await db.execute(delete(User).where(User.id.in_(user_ids)).returning(User.id))
         await db.flush()
         return list(result.scalars().all())

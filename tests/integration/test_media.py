@@ -47,7 +47,7 @@ async def test_cleanup_keeps_records_when_storage_delete_fails(
 
     try:
         deleted, failed = await MediaService.cleanup_expired_signup_images(
-            db_session, task_id="test", redis=None
+            db_session, task_id="test"
         )
         assert deleted >= 1
         assert fail_key in failed
@@ -109,7 +109,7 @@ async def test_cleanup_advances_past_failing_head(
 
     try:
         deleted, failed = await MediaService.cleanup_expired_signup_images(
-            db_session, task_id="test", redis=None
+            db_session, task_id="test"
         )
         assert deleted >= 1
         assert head.file_key in failed

@@ -42,6 +42,9 @@ async def notifications_stream(
     """로컬 팬아웃 큐 기반 SSE. Redis 장애 시에도 스트림은 유지되고 같은 인스턴스
     이벤트는 계속 수신된다(fail-open) — 503으로 끊는 것보다 낫다."""
 
+    # 여유만 먼저 확인 — 429는 스트림이 시작되기 전에만 낼 수 있다. 등록은 제너레이터가
+    # 해제와 짝으로 하므로, 시작되지 않은 연결이 슬롯을 남기지 않는다.
+    await NotificationService.ensure_sse_capacity(user.id)
     return StreamingResponse(
         NotificationService.sse_subscribe(user.id),
         media_type="text/event-stream",

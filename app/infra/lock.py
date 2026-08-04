@@ -31,3 +31,22 @@ async def release_lock(redis: RedisLike, key: str, token: str) -> None:
         await eval_script_cached(redis, RELEASE_LOCK_LUA, _RELEASE_LOCK_SHA, 1, key, token)
     except Exception as e:
         log.warning("lock release failed key=%s err=%s", key, e)
+
+
+async def try_acquire_job_lock(
+    redis: RedisLike | None, *, key: str, ttl_seconds: int
+) -> tuple[bool, str | None]:
+    """배치 잡용 락 획득 — 반환은 (진행해도 되는가, 해제 토큰).
+
+    이 모듈 상단의 장애 정책 중 "배치 잡 = 락 없이 진행"의 구현이다. Redis 부재(단일 노드
+    개발)·장애는 진행으로 판정한다 — 정리 잡은 멈추는 것보다 중복 실행이 낫다.
+    이미 다른 인스턴스가 점유 중이면 (False, None)으로 조용히 skip하게 한다.
+    """
+    if redis is None:
+        return True, None
+    try:
+        token = await try_acquire_lock(redis, key, ttl_seconds)
+        return (token is not None), token
+    except Exception as e:
+        log.warning("job lock unavailable key=%s fallback_without_lock err=%s", key, e)
+        return True, None

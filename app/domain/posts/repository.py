@@ -11,7 +11,7 @@ from sqlalchemy.orm import joinedload, selectinload
 
 from app.common.exceptions import ConcurrentUpdateException, InvalidRequestException
 from app.db.base_class import utc_now
-from app.db.statements import update_one_returning
+from app.db.statements import decrement_counter_by_link_owner, update_one_returning
 from app.domain.users.model import User, UserBlock, author_display_loads, author_not_blocked_clause
 
 from .model import Category, Hashtag, Post, PostImage, post_hashtags
@@ -173,6 +173,21 @@ _TRENDING_POOL_COLS = (
     Post.view_count,
     Post.user_id,
 )
+
+# 트렌딩 점수 가중치 — 좋아요·조회수 중심. 비율의 근거는 신호의 희소성이다:
+# 좋아요 1개 ≈ 조회 20회 ≈ 댓글 2개. 조회수는 뷰어별 1시간 dedup(ADR 0007)을 거쳐
+# 사실상 "시간당 고유 조회자 수"라 좋아요와 같은 단위로 섞어도 된다.
+# 댓글은 보조 신호로만 둔다 — comment_count가 작성자 본인 답글·대댓글까지 포함해
+# "몇 명이 반응했나"를 뜻하지 않으므로, 가중치를 높이면 핑퐁 대화가 랭킹을 먹는다.
+_W_LIKE = 2
+_W_VIEW = 0.1
+_W_COMMENT = 1
+# 감쇠 지수. 집계 창(24h) 자체가 1차 감쇠라 지수까지 크면 이중 감쇠가 되어
+# "방금 올라온 글"만 노출된다(1.3이면 24h 된 글의 상대 페널티가 약 28배).
+# 1.0에서는 13배 — 최신 글 우대는 유지하면서 창 안의 좋아요·조회수 차이가 순위에 반영된다.
+_DECAY_EXPONENT = 1.0
+# 나이 0인 글의 분모가 0이 되지 않게 하는 하한(시간). 갓 올라온 글의 점수 폭주도 막는다.
+_DECAY_AGE_FLOOR_HOURS = 2
 
 
 class PostsRepository:
@@ -352,22 +367,40 @@ class PostsRepository:
         return list(result.unique().scalars().all())
 
     @classmethod
-    async def get_trending_hashtags(
+    def get_trending_hashtags_query(
         cls,
         *,
-        db: AsyncSession,
+        window_hours: int | None,
         limit: int = 10,
-    ) -> list[tuple[str, int]]:
+    ) -> Select[Any]:
+        # 집계 창은 트렌딩 게시글과 같은 24h(ADR 0004) — 창이 없으면 "지금 뜨는"이 아니라
+        # 전체 기간 누적이라 순위가 시간이 갈수록 고정된다. window_hours=None은 폴백 전용.
         count_expr = func.count(post_hashtags.c.post_id).label("count")
         stmt = (
             select(Hashtag.name, count_expr)
             .join(post_hashtags, Hashtag.id == post_hashtags.c.hashtag_id)
             .join(Post, Post.id == post_hashtags.c.post_id)
             .where(Post.deleted_at.is_(None), Post.is_blinded.is_(False))
-            .group_by(Hashtag.id, Hashtag.name)
-            .order_by(count_expr.desc())
+        )
+        if window_hours is not None:
+            stmt = stmt.where(Post.created_at >= utc_now() - timedelta(hours=window_hours))
+        return (
+            stmt.group_by(Hashtag.id, Hashtag.name)
+            # name ASC tie-breaker — 없으면 동점 태그의 순서가 비결정적이라
+            # 캐시 갱신 때마다 목록이 뒤집혀 보인다.
+            .order_by(count_expr.desc(), Hashtag.name.asc())
             .limit(limit)
         )
+
+    @classmethod
+    async def get_trending_hashtags(
+        cls,
+        *,
+        db: AsyncSession,
+        window_hours: int | None,
+        limit: int = 10,
+    ) -> list[tuple[str, int]]:
+        stmt = cls.get_trending_hashtags_query(window_hours=window_hours, limit=limit)
         rows = (await db.execute(stmt)).all()
         return [(str(r[0]), int(r[1] or 0)) for r in rows]
 
@@ -393,8 +426,10 @@ class PostsRepository:
         if use_time_decay:
             age_hours = func.extract("epoch", func.now() - Post.created_at) / 3600.0
             score = (
-                Post.comment_count * 3 + Post.like_count * 2 + Post.view_count * 0.1
-            ) / func.power(age_hours + 2, 1.3)
+                Post.like_count * _W_LIKE
+                + Post.view_count * _W_VIEW
+                + Post.comment_count * _W_COMMENT
+            ) / func.power(age_hours + _DECAY_AGE_FLOOR_HOURS, _DECAY_EXPONENT)
             stmt = stmt.order_by(score.desc(), Post.id.desc())
         else:
             stmt = stmt.order_by(
@@ -585,6 +620,31 @@ class PostsRepository:
     @classmethod
     async def increment_comment_count(cls, post_id: UUID, db: AsyncSession) -> bool:
         return await _update_post(db, post_id, comment_count=Post.comment_count + 1) is not None
+
+    @classmethod
+    async def decrement_like_counts_for_users(cls, user_ids: list[UUID], db: AsyncSession) -> None:
+        """주어진 유저들이 누른 좋아요만큼 게시글 like_count를 깎는다 — 유저 하드 삭제 **직전** 호출.
+
+        post_likes.user_id는 ON DELETE CASCADE, posts.user_id는 SET NULL이다. 즉 유저를 지우면
+        좋아요 행만 사라지고 게시글은 남아, 보정하지 않으면 like_count가 영구히 부풀어 있다
+        (자가 치유되지 않는다). 삭제 후에는 어떤 행이 사라졌는지 알 수 없어 순서가 중요하다.
+        """
+        # 로컬 import — likes→posts 방향만 두어 순환을 피한다(이 파일의 기존 관례).
+        from app.domain.likes.model import PostLike
+
+        await decrement_counter_by_link_owner(
+            db,
+            target_model=Post,
+            counter_col=Post.like_count,
+            link_target_col=PostLike.post_id,
+            link_owner_col=PostLike.user_id,
+            owner_ids=user_ids,
+        )
+
+    @classmethod
+    async def set_comment_count(cls, post_id: UUID, value: int, db: AsyncSession) -> bool:
+        """카운트를 절대값으로 확정 — 모더레이션처럼 변화량을 손으로 셀 수 없는 경로용."""
+        return await _update_post(db, post_id, comment_count=max(0, value)) is not None
 
     @classmethod
     async def decrement_comment_count(cls, post_id: UUID, db: AsyncSession) -> bool:

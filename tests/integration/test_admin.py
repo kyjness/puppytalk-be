@@ -1,5 +1,6 @@
 import pytest
 from app.core.config import settings
+from app.core.ids import new_ulid_str
 from app.db.base_class import utc_now
 from app.domain.comments.model import Comment
 from app.domain.posts.model import Post
@@ -10,17 +11,12 @@ from httpx import AsyncClient
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.integration.conftest import auth_header
+
 pytestmark = pytest.mark.asyncio
 
 # SignUpRequest: PasswordStr 8~20자
 _TEST_PW = "AdminTestPW123!"
-
-
-def _auth_header(login_json: dict) -> dict[str, str]:
-    token_data = login_json.get("data", login_json)
-    token = token_data.get("accessToken") or token_data.get("access_token")
-    assert token, "accessToken 없음"
-    return {"Authorization": f"Bearer {token}"}
 
 
 async def _admin_headers(client: AsyncClient, db: AsyncSession, email: str, nickname: str) -> dict:
@@ -31,7 +27,7 @@ async def _admin_headers(client: AsyncClient, db: AsyncSession, email: str, nick
     await db.commit()
     res = await client.post("/v1/auth/login", json={"email": email, "password": _TEST_PW})
     assert res.status_code == 200, res.text
-    return _auth_header(res.json())
+    return auth_header(res.json())
 
 
 async def test_admin_access_denied_for_normal_user(client: AsyncClient, db_session: AsyncSession):
@@ -42,7 +38,7 @@ async def test_admin_access_denied_for_normal_user(client: AsyncClient, db_sessi
         json={"email": payload["email"], "password": payload["password"]},
     )
     assert login_res.status_code == 200
-    headers = _auth_header(login_res.json())
+    headers = auth_header(login_res.json())
 
     res = await client.get("/v1/admin/reported-posts", headers=headers)
     assert res.status_code == 403
@@ -63,7 +59,7 @@ async def test_admin_access_success(client: AsyncClient, db_session: AsyncSessio
         json={"email": payload["email"], "password": payload["password"]},
     )
     assert login_res.status_code == 200
-    headers = _auth_header(login_res.json())
+    headers = auth_header(login_res.json())
 
     res = await client.get("/v1/admin/reported-posts", headers=headers)
     assert res.status_code == 200
@@ -107,7 +103,7 @@ async def test_suspend_revokes_refresh_token(client: AsyncClient, db_session: As
         "/v1/auth/login",
         json={"email": admin["email"], "password": admin["password"]},
     )
-    headers = _auth_header(admin_login.json())
+    headers = auth_header(admin_login.json())
 
     # 정지 실행
     suspend_res = await client.patch(f"/v1/admin/users/{target_id}/suspend", headers=headers)
@@ -216,3 +212,161 @@ async def test_reported_feed_interleaves_and_paginates(
     assert [i["reportCount"] for i in r2["items"]] == [8999, 8998]
     assert set(ids1).isdisjoint(ids2)
     assert r1["hasMore"] is True
+
+
+# --- 블라인드와 comment_count 정합성 ---
+# comment_count의 정의는 "표시 가능한(미삭제·미블라인드) 댓글 수"다. 목록이 블라인드 댓글을
+# 빼고 내려주므로, 블라인드가 카운트를 건드리지 않으면 "댓글 N개"라고 표시하면서 N-1개만
+# 보이는 불일치가 생긴다.
+
+
+async def _author_headers(client: AsyncClient, email: str, nickname: str) -> dict[str, str]:
+    await client.post(
+        "/v1/auth/signup", json={"email": email, "password": _TEST_PW, "nickname": nickname}
+    )
+    res = await client.post("/v1/auth/login", json={"email": email, "password": _TEST_PW})
+    assert res.status_code == 200, res.text
+    return auth_header(res.json())
+
+
+def _res_id(res) -> str:
+    body = res.json()
+    rid = body.get("data", {}).get("id") or body.get("id")
+    assert rid, res.text
+    return rid
+
+
+async def _comment_count(client: AsyncClient, post_id: str, headers: dict) -> int:
+    res = await client.get(f"/v1/posts/{post_id}", headers=headers)
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    return data.get("commentCount", data.get("comment_count"))
+
+
+async def _visible_comments(client: AsyncClient, post_id: str, headers: dict) -> int:
+    res = await client.get(f"/v1/posts/{post_id}/comments?size=50", headers=headers)
+    assert res.status_code == 200, res.text
+    return len(res.json()["data"]["items"])
+
+
+async def _post_with_comments(client: AsyncClient, headers: dict, n: int) -> tuple[str, list[str]]:
+    res = await client.post(
+        "/v1/posts",
+        json={"title": "블라인드 카운트 테스트", "content": "본문"},
+        headers={**headers, "X-Idempotency-Key": new_ulid_str()},
+    )
+    assert res.status_code == 201, res.text
+    post_id = _res_id(res)
+    comment_ids = []
+    for i in range(n):
+        c = await client.post(
+            f"/v1/posts/{post_id}/comments", json={"content": f"댓글{i}"}, headers=headers
+        )
+        assert c.status_code == 201, c.text
+        comment_ids.append(_res_id(c))
+    return post_id, comment_ids
+
+
+async def test_blind_comment_keeps_count_in_sync(client: AsyncClient, db_session: AsyncSession):
+    """블라인드는 comment_count를 줄이고, 해제는 되돌린다 — 표시 개수와 어긋나지 않는다."""
+    admin = await _admin_headers(client, db_session, "blind-admin@example.com", "블라인드관리자")
+    author = await _author_headers(client, "blind-author@example.com", "블라인드작성자")
+
+    post_id, comment_ids = await _post_with_comments(client, author, 3)
+    assert await _comment_count(client, post_id, author) == 3
+    assert await _visible_comments(client, post_id, author) == 3
+
+    res = await client.patch(f"/v1/admin/comments/{comment_ids[0]}/blind", headers=admin)
+    assert res.status_code == 200, res.text
+    assert await _comment_count(client, post_id, author) == 2
+    assert await _visible_comments(client, post_id, author) == 2  # 표시와 카운트가 일치
+
+    res = await client.patch(f"/v1/admin/comments/{comment_ids[0]}/unblind", headers=admin)
+    assert res.status_code == 200, res.text
+    assert await _comment_count(client, post_id, author) == 3
+    assert await _visible_comments(client, post_id, author) == 3
+
+
+async def test_repeated_moderation_is_idempotent(client: AsyncClient, db_session: AsyncSession):
+    """같은 동작을 반복해도 카운트가 어긋나면 안 된다 — 조정은 실제 상태 전이일 때만."""
+    admin = await _admin_headers(client, db_session, "idem-admin@example.com", "멱등관리자")
+    author = await _author_headers(client, "idem-author@example.com", "멱등작성자")
+
+    post_id, comment_ids = await _post_with_comments(client, author, 3)
+    target = comment_ids[0]
+
+    for _ in range(3):  # 블라인드 반복 — 첫 회만 차감되어야 한다
+        assert (
+            await client.patch(f"/v1/admin/comments/{target}/blind", headers=admin)
+        ).status_code == 200
+    assert await _comment_count(client, post_id, author) == 2
+
+    for _ in range(3):  # 해제 반복 — 첫 회만 복구되어야 한다
+        assert (
+            await client.patch(f"/v1/admin/comments/{target}/unblind", headers=admin)
+        ).status_code == 200
+    assert await _comment_count(client, post_id, author) == 3
+
+    # reset-reports는 블라인드 해제를 겸한다 — 반복해도 카운트 불변.
+    await client.patch(f"/v1/admin/comments/{target}/blind", headers=admin)
+    assert await _comment_count(client, post_id, author) == 2
+    for _ in range(3):
+        assert (
+            await client.patch(f"/v1/admin/comments/{target}/reset-reports", headers=admin)
+        ).status_code == 200
+    assert await _comment_count(client, post_id, author) == 3
+
+
+async def test_deleting_blinded_comment_does_not_double_decrement(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """블라인드된 댓글을 삭제해도 한 댓글로 두 번 차감되지 않는다."""
+    admin = await _admin_headers(client, db_session, "dbl-admin@example.com", "이중차감관리자")
+    author = await _author_headers(client, "dbl-author@example.com", "이중차감작성자")
+
+    post_id, comment_ids = await _post_with_comments(client, author, 3)
+    target = comment_ids[0]
+
+    await client.patch(f"/v1/admin/comments/{target}/blind", headers=admin)
+    assert await _comment_count(client, post_id, author) == 2
+
+    res = await client.delete(f"/v1/posts/{post_id}/comments/{target}", headers=author)
+    assert res.status_code in (200, 204), res.text
+    assert await _comment_count(client, post_id, author) == 2  # 3이 아니라 2에서 그대로
+    assert await _visible_comments(client, post_id, author) == 2
+
+
+async def test_blinding_root_accounts_for_its_replies(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """루트를 블라인드하면 대댓글까지 목록에서 사라지므로 카운트도 그만큼 줄어야 한다."""
+    admin = await _admin_headers(client, db_session, "sub-admin@example.com", "서브트리관리자")
+    author = await _author_headers(client, "sub-author@example.com", "서브트리작성자")
+
+    post_id, comment_ids = await _post_with_comments(client, author, 1)
+    root = comment_ids[0]
+    for i in range(4):
+        r = await client.post(
+            f"/v1/posts/{post_id}/comments",
+            json={"content": f"답글{i}", "parentId": root},
+            headers=author,
+        )
+        assert r.status_code == 201, r.text
+    assert await _comment_count(client, post_id, author) == 5
+
+    res = await client.patch(f"/v1/admin/comments/{root}/blind", headers=admin)
+    assert res.status_code == 200, res.text
+
+    # 루트 1 + 대댓글 4가 통째로 사라진다 — 1만 깎으면 4가 어긋난다.
+    assert await _visible_comments(client, post_id, author) == 0
+    assert await _comment_count(client, post_id, author) == 0
+
+    # 블라인드된 루트의 대댓글은 "더보기"로도 못 본다(목록과 일관).
+    more = await client.get(f"/v1/posts/{post_id}/comments/{root}/replies", headers=author)
+    assert more.status_code == 404, more.text
+
+    # 해제하면 서브트리가 통째로 돌아온다.
+    assert (
+        await client.patch(f"/v1/admin/comments/{root}/unblind", headers=admin)
+    ).status_code == 200
+    assert await _comment_count(client, post_id, author) == 5

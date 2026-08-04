@@ -5,7 +5,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.ids import new_uuid7
@@ -36,6 +36,17 @@ class Comment(Base):
 
     author: Mapped[User | None] = relationship(User, foreign_keys=[author_id], lazy="raise_on_sql")
 
+    __table_args__ = (
+        # 대댓글 preview(window function)·"더보기" keyset이 부모별로 정렬한다. 술어는
+        # _reply_visible_conditions와 일치시켜 인덱스만으로 가시성까지 거른다.
+        Index(
+            "idx_comments_parent_visible",
+            "parent_id",
+            "id",
+            postgresql_where=(deleted_at.is_(None)) & (is_blinded.is_(False)),
+        ),
+    )
+
 
 class CommentLike(Base):
     __tablename__ = "comment_likes"
@@ -44,6 +55,10 @@ class CommentLike(Base):
         PG_UUID, ForeignKey("comments.id", ondelete="CASCADE"), primary_key=True
     )
     user_id: Mapped[UUID] = mapped_column(
-        PG_UUID, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+        PG_UUID,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+        # PostLike와 같은 이유 — PK 선행 컬럼이 아니라 퍼지 집계·CASCADE가 풀스캔이 된다.
+        index=True,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

@@ -32,7 +32,7 @@ from app.infra.redis import get_app_redis
 def _cleanup_jobs(redis_client: Any) -> tuple[PeriodicJob, ...]:
     """주기 정리 잡 정의(보존 정책 포함). 러너(core.cleanup)는 무엇을 도는지 모른다."""
     from app.db import get_connection
-    from app.domain.media.service import MediaService
+    from app.domain.media.service import JOB_LOCK_SWEEP_UNUSED, MediaService
     from app.domain.notifications.service import NotificationService
     from app.domain.users.service import UserService
 
@@ -41,7 +41,7 @@ def _cleanup_jobs(redis_client: Any) -> tuple[PeriodicJob, ...]:
     async def signup_image_cleanup(task_id: str) -> int:
         async with get_connection() as db:
             deleted_count, failed_file_keys = await MediaService.cleanup_expired_signup_images(
-                db, task_id=task_id, redis=redis_client
+                db, task_id=task_id
             )
         if failed_file_keys:
             job_log.warning(
@@ -59,7 +59,8 @@ def _cleanup_jobs(redis_client: Any) -> tuple[PeriodicJob, ...]:
     async def orphan_post_image_cleanup(_task_id: str) -> int:
         # 게시글 작성 중 이탈 등으로 남은 고아 이미지(24h+) 정리
         async with get_connection() as db:
-            return await MediaService.sweep_unused_images(db, redis=redis_client)
+            # 배타 실행은 러너가 lock_key로 보장한다 — 본문은 락을 잡지 않는다.
+            return await MediaService.sweep_unused_images(db)
 
     async def withdrawn_user_purge(_task_id: str) -> int:
         # 탈퇴 유저 파기(30일 경과 하드 삭제, 청크 단위)
@@ -75,9 +76,16 @@ def _cleanup_jobs(redis_client: Any) -> tuple[PeriodicJob, ...]:
 
     return (
         PeriodicJob("signup_image_cleanup", signup_image_cleanup),
-        PeriodicJob("orphan_post_image_cleanup", orphan_post_image_cleanup),
-        PeriodicJob("withdrawn_user_purge", withdrawn_user_purge),
-        PeriodicJob("notification_purge", notification_purge),
+        PeriodicJob(
+            "orphan_post_image_cleanup",
+            orphan_post_image_cleanup,
+            # 요청 유발 경로(sweep_unused_images_detached)와 같은 키라야 서로를 배제한다.
+            lock_key=JOB_LOCK_SWEEP_UNUSED,
+        ),
+        # 퍼지 2종은 테이블이 빌 때까지 청크 삭제를 반복해 백로그가 쌓였을 때 오래 돈다 —
+        # 락이 도중에 만료돼 다른 인스턴스가 끼어들지 않도록 TTL을 넉넉히 준다.
+        PeriodicJob("withdrawn_user_purge", withdrawn_user_purge, lock_ttl_seconds=1800),
+        PeriodicJob("notification_purge", notification_purge, lock_ttl_seconds=1800),
     )
 
 
@@ -121,7 +129,7 @@ async def lifespan(app: FastAPI):
 
     redis_client = get_app_redis(app)
     cleanup_jobs = _cleanup_jobs(redis_client)
-    await run_jobs_once(cleanup_jobs)
+    await run_jobs_once(cleanup_jobs, redis=redis_client)
     stop_event = asyncio.Event()
     cleanup_task = None
     view_flush_task: asyncio.Task[None] | None = None
@@ -132,6 +140,7 @@ async def lifespan(app: FastAPI):
                 cleanup_jobs,
                 stop_event,
                 interval_seconds=max(60, settings.SIGNUP_IMAGE_CLEANUP_INTERVAL),
+                redis=redis_client,
             )
         )
     if redis_client is not None and settings.VIEW_BUFFER_FLUSH_INTERVAL_SECONDS > 0:

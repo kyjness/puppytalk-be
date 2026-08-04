@@ -1,0 +1,143 @@
+"""주기 잡 분산 락 단위 테스트.
+
+운영 전제상 인스턴스가 3~10대다. 락이 없으면 같은 정리 잡이 인스턴스 수만큼 동시에 돌며
+같은 청크를 두고 경합한다. 락을 잡 구현이 아니라 **러너**가 거는 것이 이 설계의 핵심 —
+잡마다 각자 걸게 두면 빠뜨리기 쉽고 실제로 두 개를 빠뜨렸다.
+"""
+
+import asyncio
+from typing import Any, cast
+
+from app.core.cleanup import PeriodicJob, job_lock_key, run_jobs_once
+from app.infra.redis import RedisLike
+
+from tests.unit.fakes import FakeDB, FakeRedis
+
+
+def _job(name: str, calls: list[str], *, boom: bool = False) -> PeriodicJob:
+    async def run(_task_id: str) -> int:
+        calls.append(name)
+        if boom:
+            raise RuntimeError("job exploded")
+        return 1
+
+    return PeriodicJob(name, run)
+
+
+def _run(jobs, redis) -> None:
+    asyncio.run(run_jobs_once(jobs, redis=cast(RedisLike, redis)))
+
+
+def test_job_runs_and_releases_lock():
+    calls: list[str] = []
+    redis = FakeRedis()
+
+    _run([_job("purge", calls)], redis)
+
+    assert calls == ["purge"]
+    # 해제되지 않으면 TTL 만료까지 전 인스턴스가 skip한다.
+    assert job_lock_key("purge") not in redis.kv
+
+
+def test_job_skipped_when_lock_already_held():
+    """다른 인스턴스가 점유 중이면 실행하지 않는다."""
+    calls: list[str] = []
+    redis = FakeRedis(preloaded={job_lock_key("purge"): "other-instance-token"})
+
+    _run([_job("purge", calls)], redis)
+
+    assert calls == []
+    assert redis.kv[job_lock_key("purge")] == "other-instance-token"  # 남의 락 미삭제
+
+
+def test_lock_released_even_when_job_raises():
+    """잡이 터져도 해제 — 안 그러면 한 번의 실패가 TTL 동안 전 인스턴스를 막는다."""
+    calls: list[str] = []
+    redis = FakeRedis()
+
+    _run([_job("boom", calls, boom=True)], redis)
+
+    assert calls == ["boom"]
+    assert job_lock_key("boom") not in redis.kv
+
+
+def test_one_job_lock_does_not_block_others():
+    """잡별로 키가 갈린다 — 한 잡이 점유돼도 나머지는 돈다."""
+    calls: list[str] = []
+    redis = FakeRedis(preloaded={job_lock_key("held"): "token"})
+
+    _run([_job("held", calls), _job("free", calls)], redis)
+
+    assert calls == ["free"]
+
+
+def test_redis_absent_runs_without_lock():
+    """단일 노드 개발 모드 — Redis 없이도 잡은 돌아야 한다."""
+    calls: list[str] = []
+
+    asyncio.run(run_jobs_once([_job("purge", calls)], redis=None))
+
+    assert calls == ["purge"]
+
+
+def test_declared_lock_key_overrides_name_derived_key():
+    """요청 유발 경로와 같은 키를 선언한 잡은 그 키로 배타 실행돼야 한다.
+
+    미디어 sweep은 주기 잡 말고 sweep_unused_images_detached에서도 돈다 — 키가 갈리면
+    두 경로가 서로를 배제하지 못한다.
+    """
+    from app.domain.media.service import JOB_LOCK_SWEEP_UNUSED
+
+    calls: list[str] = []
+    redis = FakeRedis(preloaded={JOB_LOCK_SWEEP_UNUSED: "other-path-token"})
+    job = PeriodicJob("sweep", _job("sweep", calls).run, lock_key=JOB_LOCK_SWEEP_UNUSED)
+
+    _run([job], redis)
+
+    assert calls == []  # 요청 유발 경로가 쥔 락을 존중한다
+    assert job_lock_key("sweep") not in redis.kv  # 이름 파생 키는 쓰지 않는다
+
+
+def test_runner_locked_job_body_still_does_its_work():
+    """러너가 락을 쥔 채 잡 본문을 부를 때, 본문이 그 락 때문에 스스로 막히면 안 된다.
+
+    이전 테스트들은 run을 스텁해 본문을 타지 않았고, 그래서 sweep이 러너와 **같은 키**를
+    다시 SET NX로 잡아 매번 skip하던 것을 잡지 못했다(정리가 영구 no-op). 실제 본문을 태운다.
+    """
+    from app.domain.media import service as media_service
+
+    swept: list[int] = []
+
+    async def fake_keyset_cleanup(db, *, fetch, on_delete_failed):
+        swept.append(1)
+        return 7
+
+    original = media_service._keyset_cleanup
+    media_service._keyset_cleanup = fake_keyset_cleanup
+    try:
+        redis = FakeRedis()
+
+        async def run(_task_id: str) -> int:
+            return await media_service.MediaService.sweep_unused_images(db=cast(Any, FakeDB()))
+
+        job = PeriodicJob(
+            "orphan_post_image_cleanup", run, lock_key=media_service.JOB_LOCK_SWEEP_UNUSED
+        )
+        _run([job], redis)
+    finally:
+        media_service._keyset_cleanup = original
+
+    assert swept == [1], "러너 락이 잡 본문을 스스로 막았다 — 정리가 no-op이 된다"
+
+
+def test_redis_failure_falls_open_to_running():
+    """락 조회 실패로 정리 잡이 멈추면 안 된다 — 중복 실행이 미실행보다 낫다."""
+    calls: list[str] = []
+
+    class _BrokenRedis(FakeRedis):
+        async def set(self, key, val, nx=False, ex=None):
+            raise ConnectionError("redis down")
+
+    _run([_job("purge", calls)], _BrokenRedis())
+
+    assert calls == ["purge"]

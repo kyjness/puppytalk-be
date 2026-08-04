@@ -351,6 +351,14 @@ res = await db.execute(stmt)
 
 **수정**: 루트당 대댓글 preview(top-N) + 별도 "대댓글 더보기" keyset 엔드포인트로 분리. 기능 확장이라 #6과 별개 단위로 다룬다.
 
+> **수정 완료**(3차 감사): `get_reply_previews_for_roots`가 윈도우 함수로 루트당 상위 N건만 남기고,
+> 같은 파티션 스캔의 `count() OVER`로 총 개수까지 얻는다 — 쿼리는 여전히 1회, 행 수는
+> `루트 수 × N`으로 상한이 잡힌다(별도 COUNT 쿼리 없음). 나머지는
+> `GET /posts/{post_id}/comments/{comment_id}/replies`가 루트 목록과 **같은 keyset 패턴·같은
+> 가시성 술어**로 이어 받아, 목록·preview·더보기의 규칙이 갈라지지 않는다. 대댓글 id나 남의
+> 게시글 id 조합은 404 — 2단 트리 구조를 유지한다. `replies`가 preview가 되고
+> `reply_count`·`has_more_replies`가 붙는 계약 변경이라 FE 동반 수정 대상.
+
 ---
 
 ## 2차 전면 감사 (2026-07-13) — #22~#36
@@ -677,11 +685,126 @@ rate limit 미들웨어는 `scope["type"] != "http"`를 그대로 통과시켜 W
 - **큐 기반 소켓별 전달**: 공용 리스너가 로컬 전달을 직접 await하므로 정체 소켓이 리스너를 최대
   5s(send 타임아웃) 지연시킬 수 있다 — 소켓별 bounded 큐+writer 태스크로 격리하면 정체가 해당
   소켓에만 갇히고 유저별 순서도 유지된다. 태스크-per-envelope는 순서가 깨져 기각.
-- **유저당 WS 동시 연결 상한**: 억제 창은 연결 단위라, 연결을 계속 새로 열면(핸드셰이크+인증
-  비용은 크지만) 연결마다 첫 거부 전 Redis 왕복이 발생 — 유저당 연결 수 상한(예: 5)으로 마감.
+- ~~**유저당 WS 동시 연결 상한**~~ → **#42로 해소**(SSE까지 함께 상한). 억제 창은 연결 단위라,
+  연결을 계속 새로 열면 연결마다 첫 거부 전 Redis 왕복이 발생하던 문제.
 - envelope 수신자 목록 단일화·차단 EXISTS 통합은 #34에 기록됨.
 - `get_current_user_optional`은 status 캐시 미적용(필수 인증 경로와 비대칭) — 의도 확인.
 - 고아 해시태그 행 미GC(무해) 인지.
+
+---
+
+### 38. 댓글 블라인드가 게시글 `comment_count`를 조정하지 않음 — P1
+
+**파일**: `app/domain/comments/repository.py`, `app/domain/comments/service.py`, `app/domain/reports/targets.py`
+
+목록 조회는 블라인드 댓글을 제외하는데(`_reply_visible_conditions`) 블라인드 처리는 `is_blinded`만
+세팅하고 `Post.comment_count`를 건드리지 않았다. 삭제 경로는 차감하는데 블라인드만 빠져 있어,
+"댓글 5개"라고 표시하면서 4개만 보이는 불일치가 난다. 신고 임계값 자동 블라인드(`ReportService`)도
+같은 경로라 사용자 행동만으로 드리프트가 쌓인다. 트렌딩 점수에도 가려진 댓글이 계속 기여했다.
+
+**수정 방향**: `comment_count`를 "표시 가능한(미삭제·미블라인드) 댓글 수"로 정의하고, 블라인드
+전이마다 ±1. 상태를 읽고-나서-쓰면 동시 모더레이션에서 이중 조정이 나므로 전이 판정은 원자적으로.
+
+> **수정 완료**: 조건부 UPDATE + RETURNING(`blind_if_visible`·`unblind_if_blinded`)으로 전이를
+> 원자적으로 판정하고, 전이가 실제 일어난 경우에만 게시글 카운트를 조정한다. 조정 주체는 생성·삭제
+> 경로와 같은 서비스층(`CommentModeration`) — `reports/targets.py`의 모더레이션 배선이 COMMENT
+> 타깃으로 이 파사드를 가리켜 `AdminService`·`ReportService`는 분기 없이 그대로 쓴다. 블라인드된
+> 댓글을 삭제할 때의 이중 차감은 `delete_comment`가 **삭제 직전** `is_blinded`를 RETURNING하도록
+> 바꿔 막았다. 블라인드·해제·reset 반복(멱등)과 이중 차감 부재를 통합 테스트로 고정.
+
+---
+
+### 39. 트렌딩 해시태그에 집계 창 부재 — P2
+
+**파일**: `app/domain/posts/repository.py`, `app/domain/posts/services/hashtag_service.py`
+
+`get_trending_hashtags`가 기간 조건 없이 전체 기간 누적 카운트를 셌다. "지금 뜨는 멍태그"라는
+화면 문구와 어긋나고, 누적값은 시간이 갈수록 초기 태그에 고정돼 순위가 사실상 갱신되지 않는다.
+tie-breaker도 없어 동점 태그 순서가 비결정적 — 캐시 갱신마다 목록이 뒤집혀 보인다.
+트렌딩 게시글은 24h 창을 쓰는데(ADR 0004) 해시태그만 창이 없어 랭킹 철학도 불일치했다.
+
+**수정 방향**: 게시글과 같은 서버 고정 24h 창 + 결정적 tie-breaker.
+
+> **수정 완료**: `window_hours`(기본 24) 추가·`name ASC` tie-breaker·희소 시 전체 기간 1회 폴백.
+> 창이 서버 고정이라 캐시 키 분화는 없다(ADR 0004의 `window_hours` 제거 결정과 동일 근거).
+> 함께 트렌딩 점수식을 좋아요·조회수 중심으로 재조정하고(댓글 가중치 3→1) 24h 창과 이중 감쇠였던
+> 지수를 1.3→1.0으로 완화. 가중치·지수는 매직넘버에서 명명 상수로 빼 근거를 코드에 남겼다.
+
+---
+
+## 3차 감사 (2026-08-04) — 운영 전제 위반 점검 #40~#43
+
+> [`00 운영 봉투`](00-operating-envelope-and-scope.md)를 기준으로 전 기능을 재점검했다.
+> 봉투 **초과**(과잉 복잡도)는 지적할 것이 없었다 — Celery 실배선·낙관적 락·SNS 멱등은
+> 모두 ADR로 근거가 있다. 아래는 전부 봉투 **미달** 항목이다.
+> #21(대댓글 상한)도 이 점검에서 함께 해소했다.
+
+### 40. 주기 정리 잡에 분산 락 부재 — P1
+
+**파일**: `app/core/cleanup.py`, `app/main.py`, `app/domain/media/service.py`, `app/infra/lock.py`
+
+`run_periodic`이 락 없이 4개 잡을 각 인스턴스 타이머로 돈다. 봉투상 인스턴스가 3~10대이므로
+같은 정리 잡이 인스턴스 수만큼 동시에 실행된다. 특히 `withdrawn_user_purge`·`notification_purge`는
+테이블이 빌 때까지 청크 삭제를 반복하는 구조라, 10대면 같은 청크를 10번 집어 9번은 헛돌고
+삭제 락 경합이 겹친다 — "청크별 `begin()`으로 부하를 끊는다"는 기존 완화가 N중 동시 실행으로
+무력화된다. 조회수 flush와 미디어 잡에는 락이 있어 **패턴은 이미 있었는데 잡마다 각자 걸게 둔
+구조가 빠뜨리기 쉬웠다**(실제로 둘을 빠뜨렸다).
+
+**수정 방향**: 잡 락을 러너 층에서 잡별로 일괄 적용.
+
+> **수정 완료**: `PeriodicJob`에 `lock_ttl_seconds`를 두고 `run_jobs_once`가 `lock:job:{name}`으로
+> 획득→`finally` 해제한다(잡이 예외로 끝나도 해제 — 안 그러면 한 번의 실패가 TTL 동안 전
+> 인스턴스를 막는다). 퍼지 2종은 오래 도므로 TTL 상향. media의 사설 헬퍼는
+> `infra/lock.try_acquire_job_lock`으로 올려 공용화했고, media 자체 락은 **유지**한다 —
+> `sweep_unused_images`가 업로드 응답 후 BackgroundTasks 경로에서도 불려 러너 락이 그 경로를
+> 덮지 못한다. Redis 부재·장애는 기존 규약대로 락 없이 진행(미실행보다 중복 실행이 낫다).
+
+---
+
+### 41. 인덱스 마이그레이션이 전부 비-`CONCURRENTLY` — P1
+
+**파일**: `migrations/versions/*`, `migrations/script.py.mako`
+
+비-`CONCURRENTLY` `CREATE INDEX`는 대상 테이블에 SHARE 락을 잡아 빌드 내내 쓰기를 차단한다.
+`posts.title`/`content`의 pg_trgm GIN처럼 무거운 인덱스면 라이브 테이블에서 사실상 쓰기 중단이고,
+봉투의 *무중단 롤링 배포*·*99.9%*와 정면 충돌한다. 지금까지 사고가 없었던 건 구축기라 테이블이
+비어 있었기 때문 — 데이터가 쌓인 뒤 같은 습관으로 인덱스를 추가하면 가장 나쁜 시점에 드러난다.
+
+**수정 방향**: 기존 리비전은 두고(적용된 마이그레이션은 재실행되지 않아 소급 수정이 무의미),
+앞으로의 규약을 근거화한다.
+
+> **수정 완료**: [ADR 0015](adr/0015-index-migration-concurrently.md) — `postgresql_concurrently`
+> + `if_not_exists`, `autocommit_block()` 필수(빠뜨리면 배포가 깨지는 지뢰), 실패 시 INVALID 인덱스
+> 정리 절차, 빈 테이블·베이스라인 예외의 판정 기준. `script.py.mako`에 포인터를 남겨 작성 시점에
+> 규약이 보이게 했다.
+
+---
+
+### 42. SSE·WS 유저당 동시 연결 수 상한 부재 — P3
+
+**파일**: `app/domain/notifications/stream.py`·`service.py`·`router.py`, `app/domain/chat/manager.py`·`router.py`
+
+두 팬아웃 매니저 모두 `_by_user`에 연결 수 제한 없이 등록한다. 큐는 bounded(`maxsize=100`)이고
+드롭 정책도 있지만, 연결 수가 무제한이면 유저 한 명이 인스턴스 로컬 상태를 무한히 늘릴 수 있다 —
+WS 메시지 한도는 이미 연 연결의 트래픽만 막지 연결 수는 못 막는다(#37에 이연돼 있던 항목).
+
+> **수정 완료**: `REALTIME_MAX_CONNECTIONS_PER_USER`(기본 5)를 SSE·WS가 공유한다. WS는 close
+> code 1008, SSE는 429. SSE 거절을 위해 등록을 스트림 시작 **전으로 분리**했다 — 제너레이터
+> 안에서 거절하면 이미 200이 나간 뒤라 상태 코드를 바꿀 수 없다.
+
+---
+
+### 43. 차단 목록 API에 페이지네이션 부재 — P2
+
+**파일**: `app/domain/users/model.py`·`service.py`·`router.py`·`schema.py`
+
+`GET /users/me/blocks`가 LIMIT 없이 전량을 반환한다(`joinedload(profile_image)` 동반).
+다른 목록은 전부 커서 페이지네이션인데([ADR 0002](adr/0002-cursor-pagination.md)) 여기만 예외였다.
+
+> **수정 완료**: `CursorPage[BlockedUserItem]`로 전환. 정렬·커서 축은 `blocked_id` —
+> `user_blocks`의 PK가 `(blocker_id, blocked_id)`라 필터+정렬이 **추가 인덱스 없이 PK로 커버**된다.
+> 차단 시점(`created_at`) 정렬은 복합 커서 인코딩이 필요한데 이 목록에 그 복잡도는 정당화되지
+> 않는다. 응답 계약·정렬 축이 바뀌어 FE 동반 수정 대상.
 
 ---
 
@@ -725,3 +848,9 @@ rate limit 미들웨어는 `scope["type"] != "http"`를 그대로 통과시켜 W
 | **P2** | 34 | 소품 모음(멱등 순서·SNS client·경로 표기 등) | 여러 파일 |
 | **P3** | 35 | 죽은 코드 일괄(MySQL 잔재 등) | 여러 파일 |
 | **P3** | 36 | 제품 결정 문서화(단일 세션 refresh 등) | docs |
+| **P1** | 38 | 댓글 블라인드가 게시글 comment_count 미조정 | `comments/repository.py`, `service.py`, `reports/targets.py` |
+| **P2** | 39 | 트렌딩 해시태그 집계 창 부재(+점수식 재조정) | `app/domain/posts/repository.py`, `services/hashtag_service.py` |
+| **P1** | 40 | 주기 정리 잡 분산 락 부재(인스턴스별 중복 실행) | `app/core/cleanup.py`, `app/main.py`, `infra/lock.py` |
+| **P1** | 41 | 인덱스 마이그레이션 비-CONCURRENTLY(배포 중 쓰기 차단) | `migrations/*`, ADR 0015 |
+| **P2** | 43 | 차단 목록 페이지네이션 부재 | `app/domain/users/model.py`, `service.py`, `router.py` |
+| **P3** | 42 | SSE·WS 유저당 연결 수 상한 부재 | `notifications/stream.py`, `chat/manager.py` |

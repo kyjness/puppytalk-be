@@ -75,6 +75,39 @@ async def get_comments(
     return api_response(request, code=ApiCode.OK, data=CursorPage(items=result, has_more=has_more))
 
 
+@router.get(
+    "/{comment_id}/replies",
+    status_code=200,
+    response_model=ApiResponse[CursorPage[CommentResponse]],
+)
+async def get_replies(
+    request: Request,
+    post_id: Annotated[PublicId, Path(..., description="게시글 공개 ID (Base62)")],
+    comment_id: Annotated[PublicId, Path(..., description="루트 댓글 공개 ID (Base62)")],
+    cursor: Annotated[
+        OptionalPublicId,
+        Query(
+            description="무한 스크롤: 직전 응답의 마지막 대댓글 id(공개 ID). 미지정 시 처음부터."
+        ),
+    ] = None,
+    size: int = Query(10, ge=1, le=100, description="페이지 크기"),
+    sort: str | None = Query(None, description="정렬: latest|oldest"),
+    db: AsyncSession = Depends(get_slave_db),
+    current_user: CurrentUser | None = Depends(get_current_user_optional),
+):
+    """목록 응답의 대댓글 preview 뒤를 이어 받는다(has_more_replies가 true일 때)."""
+    result, has_more = await CommentService.get_replies(
+        post_id,
+        comment_id,
+        size,
+        db=db,
+        sort=sort,
+        cursor=cursor,
+        current_user_id=current_user.id if current_user else None,
+    )
+    return api_response(request, code=ApiCode.OK, data=CursorPage(items=result, has_more=has_more))
+
+
 @router.patch("/{comment_id}", status_code=200, response_model=ApiResponse[None])
 async def update_comment(
     request: Request,

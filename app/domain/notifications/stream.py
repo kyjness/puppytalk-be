@@ -4,6 +4,8 @@ import asyncio
 import logging
 from uuid import UUID
 
+from app.core.config import settings
+
 log = logging.getLogger(__name__)
 
 # chat(puppytalk:channel:chat:dm)과 네임스페이스만 다른 동일 envelope 규약.
@@ -20,10 +22,28 @@ class SseFanoutManager:
         self._lock = asyncio.Lock()
         self._by_user: dict[UUID, set[asyncio.Queue[str]]] = {}
 
-    async def register(self, user_id: UUID) -> asyncio.Queue[str]:
+    async def has_capacity(self, user_id: UUID) -> bool:
+        """등록하지 않고 여유만 본다 — 라우터가 429를 **스트림 시작 전에** 판정하기 위한 용도.
+
+        확인과 실제 등록 사이의 창은 남지만(동시 연결 두 개가 함께 통과할 수 있다) 상한을
+        살짝 넘길 뿐이다. 반대로 라우터에서 등록까지 해버리면 제너레이터가 시작되지 않은
+        연결(중단된 요청)의 큐가 해제되지 않아 유저가 상한에 영구히 잠긴다.
+        """
+        async with self._lock:
+            return len(self._by_user.get(user_id, ())) < settings.REALTIME_MAX_CONNECTIONS_PER_USER
+
+    async def register(self, user_id: UUID) -> asyncio.Queue[str] | None:
+        """유저당 상한을 넘으면 None — 큐는 bounded지만 연결 수가 무제한이면
+        유저 한 명이 인스턴스 로컬 상태를 무한히 늘릴 수 있다(WS와 같은 상한 공유)."""
         queue: asyncio.Queue[str] = asyncio.Queue(maxsize=_QUEUE_MAX_SIZE)
         async with self._lock:
-            self._by_user.setdefault(user_id, set()).add(queue)
+            bucket = self._by_user.setdefault(user_id, set())
+            if len(bucket) >= settings.REALTIME_MAX_CONNECTIONS_PER_USER:
+                if not bucket:
+                    del self._by_user[user_id]
+                log.info("SSE 연결 상한 초과 user=%s open=%s", user_id, len(bucket))
+                return None
+            bucket.add(queue)
         return queue
 
     async def unregister(self, user_id: UUID, queue: asyncio.Queue[str]) -> None:
