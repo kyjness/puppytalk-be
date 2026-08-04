@@ -32,6 +32,8 @@ COPY --from=builder /app/.venv /app/.venv
 COPY alembic.ini ./
 COPY migrations ./migrations
 COPY app ./app
+# 운영 도구 — 배포 후 컨테이너 안에서 실행한다(예: python -m scripts.seed_demo).
+COPY scripts ./scripts
 
 USER app
 

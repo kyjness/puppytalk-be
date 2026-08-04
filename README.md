@@ -329,12 +329,41 @@ UPDATE users SET role = 'ADMIN' WHERE email = 'your-admin@example.com';
 
 ---
 
+## 배포
+
+공개 데모는 **인스턴스 한 대에서 compose로** 돕니다 — Caddy(TLS 종단) · API(gunicorn 2) ·
+Celery 워커 · PostgreSQL · Redis. 관리형 서비스(RDS·ElastiCache·ALB)를 쓰지 않는 대신 HA·자동
+백업·무중단 배포를 포기한 **쇼케이스 등급** 배포이며, 그 판단은
+[ADR 0016](docs/adr/0016-demo-deployment-topology.md)에 있습니다. AWS 리소스는
+[인프라 레포의 `demo/`](https://github.com/kyjness/puppytalk-infra/tree/main/demo) terraform root가
+만듭니다.
+
+| 파일 | 역할 |
+|------|------|
+| [`compose.prod.yml`](compose.prod.yml) | 배포 스택. GHCR 이미지를 pull하며 외부로는 Caddy(80·443)만 연다 |
+| [`Caddyfile`](Caddyfile) | `api.<도메인>` 자동 HTTPS · SSE 버퍼링 해제 · WebSocket 업그레이드 |
+| [`.env.prod.example`](.env.prod.example) | 프로덕션 가드가 요구하는 값 전체(실제 값은 서버에만 둔다) |
+| [`scripts/seed_demo.py`](scripts/seed_demo.py) | 데모 데이터 시드 — 빈 사이트에서는 목록·트렌딩·DM·알림을 보여줄 수 없다 |
+| [`scripts/backup_db.sh`](scripts/backup_db.sh) | 일일 `pg_dump` → S3(14일 보관). 컨테이너 볼륨이 유일한 사본이라 필요하다 |
+| [`.github/workflows/cd.yml`](.github/workflows/cd.yml) | CI 성공 후 SSH로 `pull && up -d` + 헬스 체크 |
+
+```bash
+# 서버에서 (배포 파일 4개가 /opt/puppytalk 에 있다고 가정)
+docker compose --env-file .env.prod -f compose.prod.yml up -d
+docker compose --env-file .env.prod -f compose.prod.yml exec backend python -m scripts.seed_demo
+```
+
+전체 적용 절차(도메인 위임·IAM 키 발급·GitHub Secrets)는
+[인프라 README 9장](https://github.com/kyjness/puppytalk-infra#9-라이브-데모-트랙-demo--적용-중)에 있습니다.
+
+---
+
 ## 문서
 
 | 문서 | 설명 |
 |------|------|
 | [00 · 운영 봉투와 범위](docs/00-operating-envelope-and-scope.md) | 모든 설계·복잡도 판정의 단일 근거(전제·과제·재건 순서) |
 | [01 · 아키텍처](docs/01-architecture.md) | 횡단 관심사 결정(식별자·API·트랜잭션·캐시·페이지네이션·관측성·인덱스) |
-| [ADR](docs/adr/) | 핵심 설계 결정 12건 — 각 결정의 트레이드오프와 *안 한 것* |
+| [ADR](docs/adr/) | 핵심 설계 결정 16건 — 각 결정의 트레이드오프와 *안 한 것* |
 | [ROADMAP](docs/ROADMAP.md) | RUP-lite 리팩토링 진행·완료 이력(도메인 단위 + 커밋) |
 | [backlog](docs/backlog.md) | 버그·최적화 백로그와 각 항목의 근거·수정 방향 |

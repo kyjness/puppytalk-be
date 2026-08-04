@@ -1,10 +1,11 @@
 # 빌드 컨텍스트 축소·캐시 안정화. README.md는 builder가 COPY하므로 제외하지 않는다.
+# scripts/ 는 제외하지 않는다 — 배포 후 컨테이너 안에서 돌리는 운영 도구가 들어 있다
+# (python -m scripts.seed_demo). 텍스트 몇 KB라 이미지 크기에 영향이 없다.
 .git
 .github
 .venv
 tests
 docs
-scripts
 dev.sh
 upload
 

@@ -23,6 +23,8 @@ venv.bak/
 .env.local
 .env.*.local
 .env.test
+# 배포 시크릿 — 서버에만 존재한다. .env.prod.example(값 없는 예시)만 커밋한다.
+.env.prod
 
 # 업로드된 이미지 제외, 폴더 구조(.gitkeep)만 커밋
 upload/

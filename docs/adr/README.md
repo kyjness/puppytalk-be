@@ -26,6 +26,7 @@ PuppyTalk 백엔드의 주요 설계 결정을 기록한다. 각 ADR은
 | [0013](0013-product-behavior-decisions.md) | 제품 동작 결정 — 단일 세션·WS 토큰·차단 시맨틱 | 제품 동작 | 채택됨 |
 | [0014](0014-redis-protocol-boundary.md) | Redis 경계 타입 — isinstance 혈통 검사 → RedisLike Protocol | 횡단 | 채택됨 |
 | [0015](0015-index-migration-concurrently.md) | 인덱스 마이그레이션 — 라이브 테이블은 CONCURRENTLY | 횡단·Ops | 채택됨 |
+| [0016](0016-demo-deployment-topology.md) | 라이브 데모 배포 — 단일 인스턴스 compose(관리형 미사용) | Ops | 채택됨 |
 
 > 0006의 얇은 메트릭(`/metrics` RED)·헬스 분리(`/livez`·`/readyz`)는 Transition(Ops)에서 구현됐다
 > — readiness는 DB=hard·Redis=soft(fail-open)로 구체화(0006 구현 노트).
