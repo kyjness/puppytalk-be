@@ -1,5 +1,5 @@
 # Likes 도메인 모델. 게시글 좋아요(PostLike) 테이블 및 CRUD. AsyncSession.
-# comment_likes·CommentLikesModel은 comments 도메인에 유지(순환 참조 방지).
+# comment_likes·CommentLikesRepository은 comments 도메인에 유지(순환 참조 방지).
 
 from datetime import datetime
 from uuid import UUID
@@ -24,7 +24,7 @@ class PostLike(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-class PostLikesModel:
+class PostLikesRepository:
     @classmethod
     async def get_liked_post_ids_for_user(
         cls, user_id: UUID, post_ids: list[UUID], db: AsyncSession

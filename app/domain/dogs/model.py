@@ -75,7 +75,7 @@ class DogProfile(Base):
         return None
 
 
-class DogProfilesModel:
+class DogProfilesRepository:
     @classmethod
     async def get_by_id(cls, dog_id: UUID, owner_id: UUID, db: AsyncSession) -> DogProfile | None:
         stmt = (

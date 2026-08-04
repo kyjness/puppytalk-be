@@ -175,7 +175,7 @@ _TRENDING_POOL_COLS = (
 )
 
 
-class PostsModel:
+class PostsRepository:
     @classmethod
     async def get_category_ids(cls, *, db: AsyncSession) -> frozenset[int]:
         rows = await db.execute(select(Category.id))

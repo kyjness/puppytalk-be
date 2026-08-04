@@ -9,9 +9,9 @@ import inspect
 from app.common.enums import TargetType
 from app.domain.admin.service import AdminService
 from app.domain.comments.model import Comment
-from app.domain.comments.repository import CommentsModel
+from app.domain.comments.repository import CommentsRepository
 from app.domain.posts.model import Post
-from app.domain.posts.repository import PostsModel
+from app.domain.posts.repository import PostsRepository
 from app.domain.reports.model import Report
 from sqlalchemy import func, literal, select
 from sqlalchemy.dialects import postgresql
@@ -25,7 +25,7 @@ def test_get_reported_posts_has_no_inmemory_pagination():
     assert "min(500" not in src
     assert "asyncio" not in src
     # UNION 페이지가 정한 (type, id) 순서로만 조립한다.
-    assert "AdminReportsModel.page_reported_targets" in src
+    assert "AdminReportsRepository.page_reported_targets" in src
 
 
 def test_page_reported_targets_compiles_to_union_all_offset():
@@ -65,7 +65,7 @@ def test_reports_target_index_present():
 
 def test_offset_reported_loaders_replaced_by_ids():
     # 관리자 단독 호출이던 offset 로더는 하이드레이션용 by-ids 로더로 대체됐다.
-    assert not hasattr(PostsModel, "get_reported_posts")
-    assert not hasattr(CommentsModel, "get_reported_comments")
-    assert hasattr(PostsModel, "get_reported_by_ids")
-    assert hasattr(CommentsModel, "get_reported_by_ids")
+    assert not hasattr(PostsRepository, "get_reported_posts")
+    assert not hasattr(CommentsRepository, "get_reported_comments")
+    assert hasattr(PostsRepository, "get_reported_by_ids")
+    assert hasattr(CommentsRepository, "get_reported_by_ids")

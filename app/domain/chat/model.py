@@ -20,9 +20,9 @@ from app.db.base_class import PG_UUID, Base, utc_now
 
 
 def normalize_dm_user_ids(user_a: UUID, user_b: UUID) -> tuple[UUID, UUID]:
-    """채팅방 upsert 시 항상 동일한 (user1_id, user2_id) 행으로 수렴. DB CHECK·UNIQUE와 일치."""
-    if user_a == user_b:
-        raise ValueError("dm_same_user")
+    """채팅방 upsert 시 항상 동일한 (user1_id, user2_id) 행으로 수렴. DB CHECK·UNIQUE와 일치.
+
+    동일 ID 쌍은 호출부(get_or_create_room)가 SelfDmException으로 먼저 거른다."""
     return (user_a, user_b) if user_a < user_b else (user_b, user_a)
 
 

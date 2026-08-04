@@ -32,18 +32,6 @@ class ChatMessageSend(BaseSchema):
         return s
 
 
-class ChatMessageBroadcast(BaseSchema):
-    """서버 → 구독 클라이언트 브로드캐스트."""
-
-    type: Literal["chat.message"] = "chat.message"
-    id: PublicId
-    room_id: PublicId
-    sender_id: PublicId
-    content: str
-    is_read: bool = False
-    created_at: UtcDatetime
-
-
 class ChatWsErrorPayload(BaseSchema):
     """검증 실패 등: 핸들러에서 JSON 직렬화 후 전송. 500 대신 계약된 에러 객체로 응답."""
 
@@ -61,12 +49,10 @@ class ChatMessageItem(BaseSchema):
     created_at: UtcDatetime
 
 
-class ChatMessagesPageData(BaseSchema):
-    items: list[ChatMessageItem]
-    next_cursor: str | None = Field(
-        default=None,
-        description="다음 페이지(더 과거) 조회 시 쿼리 cursor로 전달할 메시지 공개 ID(Base62)",
-    )
+class ChatMessageBroadcast(ChatMessageItem):
+    """서버 → 구독 클라이언트 브로드캐스트. REST 목록 항목과 필드 동일 + type 구분자."""
+
+    type: Literal["chat.message"] = "chat.message"
 
 
 class ChatDirectRoomData(BaseSchema):
@@ -75,13 +61,14 @@ class ChatDirectRoomData(BaseSchema):
     room_id: PublicId
 
 
-class ChatRoomListItem(BaseSchema):
-    room_id: PublicId
+class ChatPeerProfile(BaseSchema):
+    """상대(peer) 표시 정보 공통 필드 — 방 목록·방 상단 정보가 공유한다."""
+
     peer_user_id: PublicId
     peer_nickname: str = Field(default="", description="상대방 닉네임(표시명)")
     peer_profile_image_url: str | None = Field(default=None, description="상대방 프로필 이미지 URL")
     peer_dog_profile_image_url: str | None = Field(
-        default=None, description="상대 대표 강아지 프로필 이미지 URL"
+        default=None, description="상대 대표견 프로필 이미지 URL"
     )
     peer_dog_name: str | None = Field(default=None, description="상대 대표견 이름")
     peer_dog_breed: str | None = Field(default=None, description="상대 대표견 견종")
@@ -89,6 +76,10 @@ class ChatRoomListItem(BaseSchema):
         default=None, description="상대 대표견 성별 코드(male/female)"
     )
     peer_dog_birth_date: DateType | None = Field(default=None, description="상대 대표견 생년월일")
+
+
+class ChatRoomListItem(ChatPeerProfile):
+    room_id: PublicId
     last_message_preview: str = Field(default="", description="최근 메시지 미리보기(짧게)")
     unread_count: int = Field(default=0, ge=0, description="내 기준 미읽음 개수(상대가 보낸 것만)")
     updated_at: UtcDatetime | None = Field(default=None, description="최근 메시지 시각")
@@ -98,23 +89,5 @@ class ChatRoomsListData(BaseSchema):
     items: list[ChatRoomListItem]
 
 
-class ChatRoomMarkedReadData(BaseSchema):
-    ok: bool = True
-
-
-class ChatRoomPeerInfoData(BaseSchema):
+class ChatRoomPeerInfoData(ChatPeerProfile):
     room_id: PublicId
-    peer_user_id: PublicId
-    peer_nickname: str = Field(default="", description="상대방 닉네임(표시명)")
-    peer_profile_image_url: str | None = Field(default=None, description="상대방 프로필 이미지 URL")
-    peer_dog_name: str | None = Field(default=None, description="상대 대표 강아지 이름")
-    peer_dog_profile_image_url: str | None = Field(
-        default=None, description="상대 대표 강아지 프로필 이미지 URL"
-    )
-    peer_dog_breed: str | None = Field(default=None, description="상대 대표 강아지 견종")
-    peer_dog_gender: str | None = Field(
-        default=None, description="상대 대표 강아지 성별 코드(male/female)"
-    )
-    peer_dog_birth_date: DateType | None = Field(
-        default=None, description="상대 대표 강아지 생년월일"
-    )

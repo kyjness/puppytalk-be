@@ -16,8 +16,8 @@ from app.common.exceptions import (
     CommentNotFoundException,
     PostNotFoundException,
 )
-from app.domain.comments.repository import CommentsModel
-from app.domain.posts.repository import PostsModel
+from app.domain.comments.repository import CommentsRepository
+from app.domain.posts.repository import PostsRepository
 
 
 class _ModerationRepo(Protocol):
@@ -45,12 +45,12 @@ class ModerationTarget:
 _BY_TYPE: dict[TargetType, ModerationTarget] = {
     TargetType.POST: ModerationTarget(
         target_type=TargetType.POST,
-        repo=PostsModel,
+        repo=PostsRepository,
         not_found=PostNotFoundException,
     ),
     TargetType.COMMENT: ModerationTarget(
         target_type=TargetType.COMMENT,
-        repo=CommentsModel,
+        repo=CommentsRepository,
         not_found=CommentNotFoundException,
     ),
 }

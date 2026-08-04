@@ -2,7 +2,7 @@
 
 import pytest
 from app.common.enums import NotificationKind
-from app.domain.notifications.model import NotificationsModel
+from app.domain.notifications.model import NotificationsRepository
 from app.domain.users.model import User
 from httpx import AsyncClient
 from sqlalchemy import select
@@ -35,7 +35,7 @@ async def _uid(db: AsyncSession, email: str):
 
 async def _seed(db: AsyncSession, user_id, n: int) -> None:
     for _ in range(n):
-        await NotificationsModel.insert(
+        await NotificationsRepository.insert(
             user_id=user_id,
             kind=NotificationKind.LIKE_POST,
             actor_id=None,

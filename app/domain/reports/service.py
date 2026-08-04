@@ -4,7 +4,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.domain.reports.model import ReportsModel
+from app.domain.reports.model import ReportsRepository
 from app.domain.reports.schema import ReportCreateRequest, ReportSubmitData
 from app.domain.reports.targets import moderation_target
 
@@ -24,7 +24,7 @@ class ReportService:
             new_count = await target.repo.increment_report_count(data.target_id, db=db)
             if new_count is None:
                 raise target.not_found()
-            await ReportsModel.create_report(
+            await ReportsRepository.create_report(
                 reporter_id, target.target_type, data.target_id, data.reason, db=db
             )
             blinded = False

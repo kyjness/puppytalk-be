@@ -4,13 +4,9 @@ from .auth import (
     get_current_admin,
     get_current_user,
     get_current_user_optional,
+    resolve_access_token_user,
 )
-from .client import (
-    get_client_identifier,
-    post_create_idempotency_after_failure,
-    post_create_idempotency_after_success,
-    post_create_idempotency_before,
-)
+from .client import get_client_identifier
 from .db import get_master_db, get_slave_db
 from .permissions import (
     CommentAuthorContext,
@@ -25,9 +21,6 @@ __all__ = [
     "CommentAuthorContext",
     "CurrentUser",
     "get_client_identifier",
-    "post_create_idempotency_after_failure",
-    "post_create_idempotency_after_success",
-    "post_create_idempotency_before",
     "get_current_admin",
     "get_current_user",
     "get_current_user_optional",
@@ -35,6 +28,7 @@ __all__ = [
     "get_slave_db",
     "get_optional_redis",
     "parse_availability_query",
+    "resolve_access_token_user",
     "require_comment_author",
     "require_comment_author_for_delete",
     "require_post_author",

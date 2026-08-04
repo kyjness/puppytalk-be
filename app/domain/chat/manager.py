@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-from typing import Any
 from uuid import UUID
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -15,7 +14,8 @@ CHAT_DM_FANOUT_CHANNEL = "puppytalk:channel:chat:dm"
 
 # 수신 버퍼가 꽉 찬(죽어가는) 소켓의 send가 무한 대기하면, 이 매니저를 핸들러로 쓰는
 # 공용 pubsub 리스너 루프까지 정지한다 — 인스턴스의 실시간 전달 전체가 한 클라이언트에
-# 볼모로 잡히지 않게 상한을 두고, 초과 소켓은 끊는다.
+# 볼모로 잡히지 않게 상한을 두고, 초과 소켓은 끊는다. 소켓별 전송은 병렬이므로
+# 유저당 소켓 수와 무관하게 총 대기도 이 상한이다.
 _SEND_TIMEOUT_SEC = 5.0
 
 
@@ -28,9 +28,7 @@ class ConnectionManager:
 
     async def connect(self, user_id: UUID, ws: WebSocket) -> None:
         async with self._lock:
-            if user_id not in self._by_user:
-                self._by_user[user_id] = set()
-            self._by_user[user_id].add(ws)
+            self._by_user.setdefault(user_id, set()).add(ws)
 
     async def disconnect(self, user_id: UUID, ws: WebSocket) -> None:
         async with self._lock:
@@ -41,22 +39,24 @@ class ConnectionManager:
             if not bucket:
                 del self._by_user[user_id]
 
-    async def send_personal_message(self, user_id: UUID, message: str | dict[str, Any]) -> None:
+    async def send_personal_message(self, user_id: UUID, message: str) -> None:
         async with self._lock:
             sockets = list(self._by_user.get(user_id, ()))
-        for ws in sockets:
-            try:
-                if isinstance(message, dict):
-                    await asyncio.wait_for(ws.send_json(message), timeout=_SEND_TIMEOUT_SEC)
-                else:
-                    await asyncio.wait_for(ws.send_text(message), timeout=_SEND_TIMEOUT_SEC)
-            # TimeoutError ⊂ OSError — 타임아웃 소켓도 아래에서 실제로 닫는다.
-            except (WebSocketDisconnect, RuntimeError, OSError) as e:
-                log.debug("chat ws send skip disconnect user=%s: %s", user_id, e)
-                await self._drop(user_id, ws)
-            except Exception:
-                log.exception("chat ws send error user=%s", user_id)
-                await self._drop(user_id, ws)
+        if not sockets:
+            return
+        # 소켓별 직렬이면 정체 소켓 N개 = 타임아웃 N배가 pubsub 리스너를 붙잡는다 — 병렬로.
+        await asyncio.gather(*(self._send_one(user_id, ws, message) for ws in sockets))
+
+    async def _send_one(self, user_id: UUID, ws: WebSocket, message: str) -> None:
+        try:
+            await asyncio.wait_for(ws.send_text(message), timeout=_SEND_TIMEOUT_SEC)
+        # TimeoutError ⊂ OSError — 타임아웃 소켓도 아래에서 실제로 닫는다.
+        except (WebSocketDisconnect, RuntimeError, OSError) as e:
+            log.debug("chat ws send skip disconnect user=%s: %s", user_id, e)
+            await self._drop(user_id, ws)
+        except Exception:
+            log.exception("chat ws send error user=%s", user_id)
+            await self._drop(user_id, ws)
 
     async def _drop(self, user_id: UUID, ws: WebSocket) -> None:
         """등록 해제 + 연결 종료. 등록만 지우면 클라이언트는 살아 있는 줄 아는 소켓으로

@@ -28,7 +28,7 @@ def _patch_ids(monkeypatch, ids_sequence: list[frozenset[int]]):
         idx = min(len(calls) - 1, len(ids_sequence) - 1)
         return ids_sequence[idx]
 
-    monkeypatch.setattr(ps.PostsModel, "get_category_ids", classmethod(_get))
+    monkeypatch.setattr(ps.PostsRepository, "get_category_ids", classmethod(_get))
     return calls
 
 

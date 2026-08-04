@@ -6,7 +6,7 @@ import uuid
 from app.common.enums import NotificationKind
 from app.common.schemas import CursorPage
 from app.domain.chat.service import ChatService
-from app.domain.notifications.model import Notification, NotificationsModel
+from app.domain.notifications.model import Notification, NotificationsRepository
 from app.domain.notifications.schema import NotificationEvent, build_realtime_payload
 
 
@@ -47,7 +47,7 @@ def test_notification_realtime_payload_is_camelcase():
 def test_notifications_list_is_keyset_not_offset():
     # offset+count(*) → comments와 동형의 id 단일 컬럼 keyset(ADR 0002). 커서 행을 조회하지
     # 않으므로 보관정책 삭제로 커서가 사라져도 400을 내지 않는다.
-    src = inspect.getsource(NotificationsModel.list_for_user)
+    src = inspect.getsource(NotificationsRepository.list_for_user)
     assert "order_by(Notification.id.desc())" in src
     assert "Notification.id < cursor_id" in src
     assert "offset" not in src

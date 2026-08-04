@@ -56,6 +56,8 @@ async def update_me(
     db: AsyncSession = Depends(get_master_db),
 ):
     data = await UserService.update_user_profile(user.id, user_data, db=db)
+    # 닉네임·프로필 이미지는 인증 스냅샷 캐시(CurrentUser)에 실린다 — 변경 즉시 무효화.
+    await AuthService.invalidate_user_status_cache(get_app_redis(request.app), user.id)
     return api_response(request, code=ApiCode.OK, data=data)
 
 

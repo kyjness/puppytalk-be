@@ -18,24 +18,24 @@ from app.common.exceptions import (
     ConcurrentUpdateException,
     PostNotFoundException,
 )
-from app.domain.comments.repository import CommentLikesModel, CommentsModel
-from app.domain.likes.model import PostLikesModel
+from app.domain.comments.repository import CommentLikesRepository, CommentsRepository
+from app.domain.likes.model import PostLikesRepository
 from app.domain.notifications.schema import NotificationEvent
 from app.domain.notifications.service import NotificationService
-from app.domain.posts.repository import PostsModel
+from app.domain.posts.repository import PostsRepository
 from app.infra.redis import RedisLike
 
 
 class _LikeLinks(Protocol):
     """좋아요 링크 행 repo 계약. 첫 인자는 positional-only — 구현의 post_id/comment_id
-    이름 차이를 흡수한다(PostLikesModel·CommentLikesModel이 구조적으로 적합)."""
+    이름 차이를 흡수한다(PostLikesRepository·CommentLikesRepository이 구조적으로 적합)."""
 
     async def create(self, target_id: UUID, user_id: UUID, /, *, db: AsyncSession) -> bool: ...
     async def delete(self, target_id: UUID, user_id: UUID, /, *, db: AsyncSession) -> bool: ...
 
 
 class _LikeCounters(Protocol):
-    """like_count 카운터 소유 repo 계약(PostsModel·CommentsModel이 구조적으로 적합)."""
+    """like_count 카운터 소유 repo 계약(PostsRepository·CommentsRepository이 구조적으로 적합)."""
 
     async def increment_like_count(self, target_id: UUID, /, *, db: AsyncSession) -> int: ...
     async def decrement_like_count(self, target_id: UUID, /, *, db: AsyncSession) -> int: ...
@@ -64,7 +64,7 @@ class _Target:
 
 async def _resolve_post_for_like(post_id: UUID, user_id: UUID, db: AsyncSession) -> _LikeNotify:
     """가시성 확인 + 작성자(알림 수신자) 조회를 1쿼리로 — 차단 술어 포함(목록·댓글과 동일)."""
-    visible = await PostsModel.get_visible_post_author(post_id, db=db, current_user_id=user_id)
+    visible = await PostsRepository.get_visible_post_author(post_id, db=db, current_user_id=user_id)
     if visible is None:
         raise PostNotFoundException()
     return _LikeNotify(
@@ -77,14 +77,16 @@ async def _resolve_post_for_like(post_id: UUID, user_id: UUID, db: AsyncSession)
 
 async def _ensure_post_unlikeable(post_id: UUID, db: AsyncSession) -> None:
     """회수 가드: 미삭제·미블라인드만 — 차단 술어 없음(차단해도 자기 좋아요는 회수 가능)."""
-    if not await PostsModel.post_is_visible(post_id, db=db):
+    if not await PostsRepository.post_is_visible(post_id, db=db):
         raise PostNotFoundException()
 
 
 async def _resolve_comment_for_like(
     comment_id: UUID, user_id: UUID, db: AsyncSession
 ) -> _LikeNotify:
-    meta = await CommentsModel.get_visible_comment_meta(comment_id, db=db, current_user_id=user_id)
+    meta = await CommentsRepository.get_visible_comment_meta(
+        comment_id, db=db, current_user_id=user_id
+    )
     if meta is None:
         raise CommentNotFoundException()
     return _LikeNotify(
@@ -97,20 +99,20 @@ async def _resolve_comment_for_like(
 
 async def _ensure_comment_unlikeable(comment_id: UUID, db: AsyncSession) -> None:
     """회수 가드: 삭제만 검사 — 블라인드·차단은 회수를 막지 않는다."""
-    meta = await CommentsModel.get_comment_meta(comment_id, db=db)
+    meta = await CommentsRepository.get_comment_meta(comment_id, db=db)
     if meta is None or meta.deleted_at is not None:
         raise CommentNotFoundException()
 
 
 _POST = _Target(
-    links=PostLikesModel,
-    counters=PostsModel,
+    links=PostLikesRepository,
+    counters=PostsRepository,
     resolve_for_like=_resolve_post_for_like,
     ensure_unlikeable=_ensure_post_unlikeable,
 )
 _COMMENT = _Target(
-    links=CommentLikesModel,
-    counters=CommentsModel,
+    links=CommentLikesRepository,
+    counters=CommentsRepository,
     resolve_for_like=_resolve_comment_for_like,
     ensure_unlikeable=_ensure_comment_unlikeable,
 )

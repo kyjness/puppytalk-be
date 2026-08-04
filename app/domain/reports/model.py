@@ -48,7 +48,7 @@ def _not_deleted():
     return Report.deleted_at.is_(None)
 
 
-class ReportsModel:
+class ReportsRepository:
     @classmethod
     async def create_report(
         cls,

@@ -9,7 +9,7 @@ from typing import cast
 from uuid import uuid4
 
 from app.core import metrics
-from app.domain.posts.repository import PostsModel
+from app.domain.posts.repository import PostsRepository
 from app.domain.posts.services.trending_post_service import (
     _POOL_ADAPTER,
     TrendingPostService,
@@ -65,7 +65,7 @@ def test_block_overlay_filters_blocked_authors(monkeypatch):
     async def _fake_blocked(cls, blocker_id, *, db):
         return {blocked}
 
-    monkeypatch.setattr(PostsModel, "get_blocked_author_ids", classmethod(_fake_blocked))
+    monkeypatch.setattr(PostsRepository, "get_blocked_author_ids", classmethod(_fake_blocked))
 
     result = asyncio.run(
         TrendingPostService.get_trending_posts(

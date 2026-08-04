@@ -12,8 +12,8 @@ from app.common.exceptions import (
     InvalidPostIdFormatException,
     PostNotFoundException,
 )
-from app.domain.comments.repository import CommentsModel
-from app.domain.posts.repository import PostsModel
+from app.domain.comments.repository import CommentsRepository
+from app.domain.posts.repository import PostsRepository
 
 from .auth import CurrentUser, get_current_user
 from .db import get_slave_db
@@ -25,7 +25,7 @@ async def require_post_author(
     db: AsyncSession = Depends(get_slave_db),
 ) -> UUID:
     async with db.begin():
-        author_id = await PostsModel.get_post_author_id(post_id, db=db)
+        author_id = await PostsRepository.get_post_author_id(post_id, db=db)
     if author_id is None:
         raise PostNotFoundException()
     if author_id != user.id:
@@ -48,7 +48,7 @@ async def _require_comment_author(
     include_deleted_comment: bool,
 ) -> CommentAuthorContext:
     async with db.begin():
-        row = await CommentsModel.load_comment_author_permission_row(
+        row = await CommentsRepository.load_comment_author_permission_row(
             post_id,
             comment_id,
             db=db,

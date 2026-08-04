@@ -8,16 +8,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.common import UserStatus
 from app.common.enums import TargetType
 from app.common.exceptions import UserNotFoundException, UserWithdrawnException
-from app.domain.admin.model import AdminReportsModel
+from app.domain.admin.repository import AdminReportsRepository
 from app.domain.admin.schema import ReportedPostAuthorInfo, ReportedPostItem
 from app.domain.auth.service import AuthService
-from app.domain.comments.repository import CommentsModel
+from app.domain.comments.repository import CommentsRepository
 from app.domain.comments.service import CommentService
-from app.domain.posts.repository import PostsModel
+from app.domain.posts.repository import PostsRepository
 from app.domain.posts.services import PostService
-from app.domain.reports.model import ReportsModel
+from app.domain.reports.model import ReportsRepository
 from app.domain.reports.targets import moderation_target
-from app.domain.users.model import UsersModel
+from app.domain.users.model import UsersRepository
 from app.infra.redis import RedisLike
 
 CONTENT_PREVIEW_LEN = 80  # 게시글/댓글 내용 미리보기 글자 수
@@ -39,18 +39,18 @@ class AdminService:
         async with db.begin():
             # 신고된 게시글·댓글을 DB-side UNION ALL로 합쳐 정렬·페이지(#5). 인메모리 병합·cap 없이
             # 페이지 경계·total이 정확하다. 여기서 나온 (type, id) 순서를 그대로 유지해 하이드레이션한다.
-            page_rows, total = await AdminReportsModel.page_reported_targets(
+            page_rows, total = await AdminReportsRepository.page_reported_targets(
                 offset=(page - 1) * size, size=size, db=db
             )
             post_ids = [tid for ttype, tid in page_rows if ttype is TargetType.POST]
             comment_ids = [tid for ttype, tid in page_rows if ttype is TargetType.COMMENT]
 
-            posts = await PostsModel.get_reported_by_ids(post_ids, db=db)
-            comments = await CommentsModel.get_reported_by_ids(comment_ids, db=db)
-            reasons_map, last_at_map = await ReportsModel.bulk_report_meta(
+            posts = await PostsRepository.get_reported_by_ids(post_ids, db=db)
+            comments = await CommentsRepository.get_reported_by_ids(comment_ids, db=db)
+            reasons_map, last_at_map = await ReportsRepository.bulk_report_meta(
                 post_ids=post_ids, comment_ids=comment_ids, db=db
             )
-            titles_map = await PostsModel.get_titles_by_ids(
+            titles_map = await PostsRepository.get_titles_by_ids(
                 list({c.post_id for c in comments}), db=db
             )
 
@@ -121,7 +121,7 @@ class AdminService:
     ) -> None:
         t = moderation_target(target_type)
         async with db.begin():
-            await ReportsModel.delete_by_target(t.target_type, target_id, db=db)
+            await ReportsRepository.delete_by_target(t.target_type, target_id, db=db)
             await db.flush()  # delete 반영 후 reset 실행해 재신고 시 목록 노출 보장
             ok = await t.repo.reset_reports(target_id, db=db)
         if not ok:
@@ -140,12 +140,12 @@ class AdminService:
         revoke_refresh: bool,
     ) -> None:
         async with db.begin():
-            user = await UsersModel.get_user_by_id_including_deleted(user_id, db=db)
+            user = await UsersRepository.get_user_by_id_including_deleted(user_id, db=db)
             if not user:
                 raise UserNotFoundException()
             if user.deleted_at is not None or UserStatus.is_withdrawn_value(user.status):
                 raise UserWithdrawnException()
-            await UsersModel.update_user(user_id, db=db, status=status.value)
+            await UsersRepository.update_user(user_id, db=db, status=status.value)
         if revoke_refresh:
             await AuthService.revoke_refresh_for_user(user_id, redis)
         await AuthService.invalidate_user_status_cache(redis, user_id)

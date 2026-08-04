@@ -41,7 +41,7 @@ def _patch_db(monkeypatch, on_delta):
     async def _delta(cls, post_id, db, *, delta=1):
         return await on_delta(post_id, delta)
 
-    monkeypatch.setattr(ps.PostsModel, "increment_view_count", classmethod(_delta))
+    monkeypatch.setattr(ps.PostsRepository, "increment_view_count", classmethod(_delta))
     monkeypatch.setattr("app.db.session.get_connection", _fake_get_connection)
 
 
@@ -192,7 +192,7 @@ def _patch_detail_load(monkeypatch, post):
     async def _load(cls, post_id, *, db, current_user_id=None):
         return (post, False) if post is not None else None
 
-    monkeypatch.setattr(ps.PostsModel, "get_post_detail", classmethod(_load))
+    monkeypatch.setattr(ps.PostsRepository, "get_post_detail", classmethod(_load))
 
 
 async def test_get_post_detail_raises_when_not_found(monkeypatch):
@@ -220,7 +220,7 @@ async def test_get_post_detail_falls_back_to_writer_and_reflects_increment(monke
         incremented.append((post_id, db))
         return True
 
-    monkeypatch.setattr(ps.PostsModel, "increment_view_count", classmethod(_inc))
+    monkeypatch.setattr(ps.PostsRepository, "increment_view_count", classmethod(_inc))
 
     reader, writer = RecordingDB(), RecordingDB()
     data = await ps.PostService.get_post_detail(
@@ -261,7 +261,7 @@ async def test_get_post_detail_dedup_blocked_repeat_touches_nothing(monkeypatch)
         incremented.append(post_id)
         return True
 
-    monkeypatch.setattr(ps.PostsModel, "increment_view_count", classmethod(_inc))
+    monkeypatch.setattr(ps.PostsRepository, "increment_view_count", classmethod(_inc))
 
     writer = RecordingDB()
     first = await ps.PostService.get_post_detail(
