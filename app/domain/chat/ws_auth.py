@@ -13,7 +13,7 @@ from app.common.exceptions import ForbiddenException, UnauthorizedException
 from app.core.ids import jwt_sub_to_uuid
 from app.core.security import access_jti_blacklist_redis_key, verify_access_token
 from app.domain.users.model import UsersModel
-from app.infra.redis import RedisLike, get_app_redis
+from app.infra.redis import RedisLike, get_websocket_redis
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ async def authenticate_chat_websocket(websocket: WebSocket, db: AsyncSession) ->
         raise UnauthorizedException(message="인증 토큰이 유효하지 않습니다.") from None
     jti = payload.get("jti")
     if isinstance(jti, str) and jti.strip():
-        redis_client = get_app_redis(websocket.scope.get("app"))
+        redis_client = get_websocket_redis(websocket)
         if await _jti_blacklisted(redis_client, jti.strip()):
             raise UnauthorizedException(message="인증 토큰이 유효하지 않습니다.")
     sub = payload.get("sub")

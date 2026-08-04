@@ -87,6 +87,15 @@ class ForbiddenException(BaseProjectException):
     code = ApiCode.FORBIDDEN
 
 
+# --- Chat ---
+class SelfDmException(BaseProjectException):
+    """자기 자신과의 DM 시도(400). REST·WS 공용 — WS 표면은 code 문자열이 에러 프레임에 노출된다."""
+
+    status_code = 400
+    code = ApiCode.DM_SAME_USER
+    default_message = "자기 자신과는 채팅할 수 없습니다."
+
+
 # --- Comments ---
 class CommentNotFoundException(BaseProjectException):
     status_code = 404
@@ -145,3 +154,9 @@ class NotFoundException(BaseProjectException):
 
     status_code = 404
     code = ApiCode.NOT_FOUND
+
+
+def ws_close_code(exc: BaseProjectException) -> int:
+    """WebSocket 표면의 예외 → close code. 선언된 status_code에서 파생한다 —
+    4xx는 1008(정책 위반), 5xx는 1011(내부 오류). 예외별 매핑을 따로 두지 않는다."""
+    return 1011 if exc.status_code >= 500 else 1008

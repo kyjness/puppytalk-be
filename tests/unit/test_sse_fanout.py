@@ -177,24 +177,6 @@ async def test_chat_fanout_sends_locally_regardless_of_publish_result(monkeypatc
     assert json.loads(raw)["target_user_ids"] == [str(peer), str(sender)]
 
 
-async def test_chat_fanout_dedups_self_dm(monkeypatch):
-    """peer == sender(자기 자신 DM 방어선)면 로컬 전달·envelope 수신자 모두 1회."""
-    sent: list[tuple[Any, str]] = []
-
-    async def fake_send(user_id, message):
-        sent.append((user_id, message))
-
-    monkeypatch.setattr(
-        "app.domain.chat.service.chat_connection_manager.send_personal_message", fake_send
-    )
-    me = uuid4()
-    redis = FakeRedis()
-    await ChatService._fanout_dm(redis, peer_id=me, sender_id=me, wire="w")  # type: ignore[arg-type]
-    assert sent == [(me, "w")]
-    [(_, raw)] = redis.published
-    assert json.loads(raw)["target_user_ids"] == [str(me)]
-
-
 async def test_publish_user_envelope_returns_false_without_redis():
     assert await publish_user_envelope(None, "ch", target_user_ids=[uuid4()], payload="p") is False
 

@@ -13,9 +13,6 @@ from app.api.dependencies import (
     get_current_user_optional,
     get_master_db,
     get_slave_db,
-    post_create_idempotency_after_failure,
-    post_create_idempotency_after_success,
-    post_create_idempotency_before,
     require_post_author,
 )
 from app.common import (
@@ -25,6 +22,11 @@ from app.common import (
     OptionalPublicId,
     PublicId,
     api_response,
+)
+from app.domain.posts.idempotency import (
+    post_create_idempotency_after_failure,
+    post_create_idempotency_after_success,
+    post_create_idempotency_before,
 )
 from app.domain.posts.schemas import (
     PostCreateRequest,

@@ -50,6 +50,11 @@ def get_app_redis(app: Any) -> RedisLike | None:
     return getattr(app.state, "redis", None) if app is not None else None
 
 
+def get_websocket_redis(websocket: Any) -> RedisLike | None:
+    """WebSocket scope 경유 조회 — Request가 없는 WS 핸들러용 get_app_redis 형제."""
+    return get_app_redis(websocket.scope.get("app"))
+
+
 async def eval_script_cached(
     redis: RedisLike, script: str, sha: str, numkeys: int, /, *args: Any
 ) -> Any:

@@ -273,19 +273,28 @@ class UsersModel:
         return result.first() is not None
 
     @classmethod
-    async def block_exists_between(cls, user_a: UUID, user_b: UUID, db: AsyncSession) -> bool:
-        """양방향 차단 관계 존재 여부(방향 무관). DM 등 상호작용 차단 판정용."""
-        result = await db.execute(
-            select(UserBlock.blocker_id)
+    async def get_status_and_block_between(
+        cls, user_id: UUID, other_id: UUID, db: AsyncSession
+    ) -> Any | None:
+        """상대(other)의 status와 양방향 차단 여부(방향 무관)를 한 문장으로.
+
+        DM 등 상호작용 진입점의 사전 검사용 — 존재·활성 확인과 차단 판정에 각각
+        왕복하지 않는다. 반환 행은 (status, blocked); 미존재·탈퇴면 None.
+        """
+        blocked = (
+            exists(1)
             .where(
                 or_(
-                    and_(UserBlock.blocker_id == user_a, UserBlock.blocked_id == user_b),
-                    and_(UserBlock.blocker_id == user_b, UserBlock.blocked_id == user_a),
+                    and_(UserBlock.blocker_id == user_id, UserBlock.blocked_id == other_id),
+                    and_(UserBlock.blocker_id == other_id, UserBlock.blocked_id == user_id),
                 )
             )
-            .limit(1)
+            .label("blocked")
         )
-        return result.first() is not None
+        result = await db.execute(
+            select(User.status, blocked).where(User.id == other_id, User.deleted_at.is_(None))
+        )
+        return result.one_or_none()
 
     @classmethod
     async def block_user(cls, blocker_id: UUID, blocked_id: UUID, db: AsyncSession) -> None:

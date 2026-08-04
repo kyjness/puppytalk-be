@@ -119,3 +119,44 @@ def count_rejection(limit: str) -> None:
     즉시 거부 등)도 반드시 이 함수로 센다 — 아니면 스팸 급증 구간에서 메트릭이
     거부의 대부분을 놓쳐 대시보드가 '한도가 거의 안 걸린다'고 오판하게 된다."""
     RATE_LIMIT_REJECTIONS.labels(limit=limit).inc()
+
+
+class LocalRejectionGate:
+    """연결/세션 단위 로컬 거부 게이트 — check_fixed_window 앞단의 억제 창.
+
+    거부되면 retry_after 동안 Redis 왕복 없이 로컬에서 즉시 거부해(스팸의 공유 Redis 부하
+    증폭 방지), 억제 창을 피해서 페이싱하든 말든 **연속 거부 누계**가 임계에 닿으면
+    should_close=True로 연결 종료를 지시한다. 계측 라벨은 check_fixed_window와 동일하게
+    key의 첫 콜론 앞 접두사에서 파생 — 한 거부 메트릭에 라벨 정의처가 둘이 되지 않게 한다.
+    """
+
+    def __init__(self, key: str, *, close_threshold: int) -> None:
+        self._key = key
+        self._limit_label = key.split(":", 1)[0]
+        self._close_threshold = close_threshold
+        self._blocked_until = 0.0
+        self._consecutive_rejections = 0
+
+    async def check(
+        self,
+        redis: RedisLike | None,
+        *,
+        window_sec: int,
+        max_count: int,
+    ) -> tuple[bool, int, bool]:
+        """(allowed, retry_after, should_close). 억제 창 안이면 Redis 왕복 없이 거부한다."""
+        now = time.monotonic()
+        if now < self._blocked_until:
+            count_rejection(self._limit_label)
+            self._consecutive_rejections += 1
+            retry_after = int(self._blocked_until - now) + 1
+            return False, retry_after, self._consecutive_rejections >= self._close_threshold
+        allowed, retry_after = await check_fixed_window(
+            redis, self._key, window_sec=window_sec, max_count=max_count
+        )
+        if allowed:
+            self._consecutive_rejections = 0
+            return True, 0, False
+        self._blocked_until = max(self._blocked_until, now + max(retry_after, 1))
+        self._consecutive_rejections += 1
+        return False, retry_after, self._consecutive_rejections >= self._close_threshold

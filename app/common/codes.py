@@ -31,6 +31,8 @@ class ApiCode(StrEnum):
     # --- Comments ---
     COMMENT_NOT_FOUND = "COMMENT_NOT_FOUND"
     INVALID_POSTID_FORMAT = "INVALID_POSTID_FORMAT"
+    # --- Chat ---
+    DM_SAME_USER = "DM_SAME_USER"
     # --- 요청/검증 (공통·미디어 등) ---
     INVALID_REQUEST = "INVALID_REQUEST"
     INVALID_REQUEST_BODY = "INVALID_REQUEST_BODY"

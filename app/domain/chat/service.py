@@ -1,26 +1,31 @@
 # 1:1 DM 비즈니스 로직. 방 upsert·메시지 저장·Redis 팬아웃·커서 목록.
 
+import asyncio
 import json
-import logging
+from typing import Any
 from uuid import UUID
 
-from sqlalchemy import case, func, or_, select, tuple_, update
+from sqlalchemy import Select, and_, case, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
+from app.common import split_page
 from app.common.enums import UserStatus
-from app.common.exceptions import ForbiddenException, InvalidRequestException, UserNotFoundException
-from app.core.ids import new_uuid7, uuid_to_base62
+from app.common.exceptions import (
+    ForbiddenException,
+    InvalidRequestException,
+    SelfDmException,
+    UserNotFoundException,
+)
+from app.core.ids import new_uuid7
 from app.db.base_class import utc_now
 from app.domain.chat.model import ChatMessage, ChatRoom, normalize_dm_user_ids
 from app.domain.chat.schema import (
     ChatMessageBroadcast,
     ChatMessageItem,
     ChatMessageSend,
-    ChatMessagesPageData,
     ChatRoomListItem,
-    ChatRoomMarkedReadData,
     ChatRoomPeerInfoData,
     ChatRoomsListData,
 )
@@ -32,9 +37,59 @@ from app.infra.redis import RedisLike
 
 from .manager import CHAT_DM_FANOUT_CHANNEL, chat_connection_manager
 
-log = logging.getLogger(__name__)
 
-DM_SAME_USER = "dm_same_user"
+class _PeerJoin:
+    """방 목록·방 상단 정보가 공유하는 상대(peer) 표시 정보 한 벌.
+
+    peer 판별 CASE 식, alias 4개, 조인 4단, 결과 행 → 스키마 필드 매핑까지 같은 골격이라
+    여기 한 곳에서 소유한다 — peer 표시 컬럼이 늘면 columns·fields만 고친다.
+    """
+
+    def __init__(self, user_id: UUID) -> None:
+        self.peer_id = case(
+            (ChatRoom.user1_id == user_id, ChatRoom.user2_id),
+            else_=ChatRoom.user1_id,
+        ).label("peer_id")
+        self._peer = aliased(User)
+        self._peer_img = aliased(Image)
+        self._peer_dog = aliased(DogProfile)
+        self._peer_dog_img = aliased(Image)
+        self.columns = (
+            self.peer_id,
+            self._peer.nickname.label("peer_nickname"),
+            self._peer_img.file_url.label("peer_profile_image_url"),
+            self._peer_dog_img.file_url.label("peer_dog_profile_image_url"),
+            self._peer_dog.name.label("peer_dog_name"),
+            self._peer_dog.breed.label("peer_dog_breed"),
+            self._peer_dog.gender.label("peer_dog_gender"),
+            self._peer_dog.birth_date.label("peer_dog_birth_date"),
+        )
+
+    def apply(self, stmt: Select[Any]) -> Select[Any]:
+        return (
+            stmt.join(self._peer, self._peer.id == self.peer_id)
+            .outerjoin(self._peer_img, self._peer_img.id == self._peer.profile_image_id)
+            .outerjoin(
+                self._peer_dog,
+                (self._peer_dog.owner_id == self._peer.id)
+                & (self._peer_dog.is_representative.is_(True)),
+            )
+            .outerjoin(self._peer_dog_img, self._peer_dog_img.id == self._peer_dog.profile_image_id)
+        )
+
+    @staticmethod
+    def fields(row: Any) -> dict[str, Any]:
+        """SELECT 라벨 → ChatPeerProfile 필드 kwargs."""
+        return {
+            "peer_user_id": row.peer_id,
+            "peer_nickname": row.peer_nickname or "",
+            "peer_profile_image_url": row.peer_profile_image_url,
+            "peer_dog_profile_image_url": row.peer_dog_profile_image_url,
+            "peer_dog_name": row.peer_dog_name,
+            "peer_dog_breed": row.peer_dog_breed,
+            "peer_dog_gender": row.peer_dog_gender,
+            "peer_dog_birth_date": row.peer_dog_birth_date,
+        }
 
 
 class ChatService:
@@ -46,26 +101,9 @@ class ChatService:
         user_id: UUID,
         peer_id: UUID,
     ) -> UUID:
-        """커밋 전에 room PK를 확정해 반환(만료 ORM으로 인한 room.id None 방지)."""
-        if peer_id == user_id:
-            raise InvalidRequestException(message="자기 자신과는 채팅할 수 없습니다.")
+        """1:1 방 조회·없으면 생성 후 room id 반환."""
         async with db.begin():
-            peer = await UsersModel.get_user_by_id(peer_id, db=db)
-            if not peer or not UserStatus.is_active_value(peer.status):
-                raise UserNotFoundException(message="상대방을 찾을 수 없습니다.")
-            room = await cls.get_or_create_room(db, user_id=user_id, peer_id=peer_id)
-            rid = room.id
-            if rid is None:
-                await db.refresh(room)
-                rid = room.id
-            if rid is None:
-                log.error(
-                    "chat room id missing after get_or_create user_id=%s peer_id=%s",
-                    user_id,
-                    peer_id,
-                )
-                raise InvalidRequestException(message="채팅방을 열 수 없습니다.")
-            return rid
+            return await cls.get_or_create_room(db, user_id=user_id, peer_id=peer_id)
 
     @classmethod
     async def get_or_create_room(
@@ -74,34 +112,31 @@ class ChatService:
         *,
         user_id: UUID,
         peer_id: UUID,
-    ) -> ChatRoom:
-        # 방향 무관 차단 검사를 방 생성/재개 지점에 둔다 — WS 전송·REST 방 열기 등 어떤
-        # 진입점이든 여기를 지나므로 경로별로 검사를 기억할 필요가 없다. 문구는 누가
-        # 차단했는지 노출하지 않는 중립 표현.
-        if await UsersModel.block_exists_between(user_id, peer_id, db=db):
+    ) -> UUID:
+        """방 upsert 후 room id 반환.
+
+        자기 자신·상대 존재/활성·차단 검사를 전부 이 지점에 둔다 — WS 전송·REST 방 열기 등
+        어떤 진입점이든 여기를 지나므로 경로별로 검사를 기억할 필요가 없다. 차단 문구는
+        누가 차단했는지 노출하지 않는 중립 표현.
+        """
+        if peer_id == user_id:
+            raise SelfDmException()
+        peer = await UsersModel.get_status_and_block_between(user_id, peer_id, db=db)
+        if peer is None or not UserStatus.is_active_value(peer.status):
+            raise UserNotFoundException(message="상대방을 찾을 수 없습니다.")
+        if peer.blocked:
             raise ForbiddenException(message="메시지를 보낼 수 없는 상대입니다.")
         u1, u2 = normalize_dm_user_ids(user_id, peer_id)
         now = utc_now()
-        rid = new_uuid7()
-        await db.execute(
-            pg_insert(ChatRoom)
-            .values(id=rid, user1_id=u1, user2_id=u2, created_at=now, updated_at=now)
-            .on_conflict_do_nothing(constraint="uq_chat_rooms_user_pair")
-        )
-        await db.flush()
         res = await db.execute(
-            select(ChatRoom).where(ChatRoom.user1_id == u1, ChatRoom.user2_id == u2).limit(1)
+            pg_insert(ChatRoom)
+            .values(id=new_uuid7(), user1_id=u1, user2_id=u2, created_at=now, updated_at=now)
+            # DO NOTHING은 충돌(기존 방) 경로에서 RETURNING이 비므로, 기존 행의 updated_at을
+            # 갱신하는 DO UPDATE로 두 경로 모두 한 문장에서 id가 돌아오게 한다.
+            .on_conflict_do_update(constraint="uq_chat_rooms_user_pair", set_={"updated_at": now})
+            .returning(ChatRoom.id)
         )
-        row = res.scalar_one_or_none()
-        if row is None:
-            log.error("chat room missing after upsert u1=%s u2=%s", u1, u2)
-            raise InvalidRequestException(message="채팅방을 열 수 없습니다.")
-        if row.id is None:
-            await db.refresh(row)
-        if row.id is None:
-            log.error("chat room row id still null after refresh u1=%s u2=%s", u1, u2)
-            raise InvalidRequestException(message="채팅방을 열 수 없습니다.")
-        return row
+        return res.scalar_one()
 
     @classmethod
     async def send_dm_from_ws(
@@ -113,17 +148,12 @@ class ChatService:
         redis: RedisLike | None,
     ) -> None:
         peer_id = payload.peer_user_id
-        if peer_id == sender_id:
-            raise ValueError(DM_SAME_USER)
         async with db.begin():
-            peer = await UsersModel.get_user_by_id(peer_id, db=db)
-            if not peer or not UserStatus.is_active_value(peer.status):
-                raise UserNotFoundException(message="상대방을 찾을 수 없습니다.")
-            # 차단 검사는 get_or_create_room 안에서 수행된다(모든 진입점 공통).
-            room = await cls.get_or_create_room(db, user_id=sender_id, peer_id=peer_id)
+            # 자기 자신·상대·차단 검사는 get_or_create_room 안에서 수행된다(모든 진입점 공통).
+            room_id = await cls.get_or_create_room(db, user_id=sender_id, peer_id=peer_id)
             msg = ChatMessage(
                 id=new_uuid7(),
-                room_id=room.id,
+                room_id=room_id,
                 sender_id=sender_id,
                 content=payload.content,
                 is_read=False,
@@ -131,16 +161,8 @@ class ChatService:
             )
             db.add(msg)
             await db.flush()
-            broadcast = ChatMessageBroadcast(
-                id=msg.id,
-                room_id=room.id,
-                sender_id=sender_id,
-                content=msg.content,
-                is_read=msg.is_read,
-                created_at=msg.created_at,
-            )
             wire = json.dumps(
-                broadcast.model_dump(mode="json", by_alias=True),
+                ChatMessageBroadcast.model_validate(msg).model_dump(mode="json", by_alias=True),
                 ensure_ascii=False,
             )
         await cls._fanout_dm(redis, peer_id=peer_id, sender_id=sender_id, wire=wire)
@@ -154,18 +176,52 @@ class ChatService:
         sender_id: UUID,
         wire: str,
     ) -> None:
-        # 같은 인스턴스 소켓은 먼저 직접 전달 — Redis·구독 리스너 상태에 의존하지 않는다
+        # 로컬 소켓 직접 전달과 크로스 인스턴스 envelope 발행은 서로 의존이 없고 각자
+        # 실패를 삼키므로 병렬로 — 정체 소켓·Redis 지연이 합산되지 않는다.
         # (publish 성공이 로컬 전달을 보장하지 않는다: 소비는 별도 리스너 연결 몫이라
-        # 리스너 재연결 창에서는 성공한 publish도 로컬에 도달하지 않는다).
-        # 크로스 인스턴스는 수신자 목록을 담은 envelope 1건 — 리스너가 origin 비교로 자기
-        # 발행분을 건너뛰므로 중복 전달 없음. publish 실패는 다른 인스턴스 수신자만
-        # 유실(at-most-once).
-        targets = [peer_id] if peer_id == sender_id else [peer_id, sender_id]
-        for uid in targets:
-            await chat_connection_manager.send_personal_message(uid, wire)
-        await publish_user_envelope(
-            redis, CHAT_DM_FANOUT_CHANNEL, target_user_ids=targets, payload=wire
+        # 리스너 재연결 창에서는 성공한 publish도 로컬에 도달하지 않는다. 리스너가 origin
+        # 비교로 자기 발행분을 건너뛰므로 중복 전달 없음. publish 실패는 다른 인스턴스
+        # 수신자만 유실 — at-most-once.)
+        targets = [peer_id, sender_id]
+        await asyncio.gather(
+            *(chat_connection_manager.send_personal_message(uid, wire) for uid in targets),
+            publish_user_envelope(
+                redis, CHAT_DM_FANOUT_CHANNEL, target_user_ids=targets, payload=wire
+            ),
         )
+
+    @classmethod
+    async def _room_membership_guard(
+        cls,
+        db: AsyncSession,
+        *,
+        room_id: UUID,
+        user_id: UUID,
+        cursor_message_id: UUID | None = None,
+    ) -> tuple[Any, Any] | None:
+        """메시지 조회·UPDATE 앞의 authz 가드. 멤버 판정에 필요한 두 컬럼만 로드하며,
+        방이 없거나 멤버가 아니면 Forbidden.
+
+        cursor_message_id가 주어지면 커서 행 로드를 같은 문장에 접어(outerjoin) 별도
+        왕복을 없애고 (created_at, id)를 반환한다 — 방에 없는 커서는 InvalidRequest.
+        """
+        stmt: Select[Any] = select(ChatRoom.user1_id, ChatRoom.user2_id)
+        if cursor_message_id is not None:
+            stmt = select(
+                ChatRoom.user1_id, ChatRoom.user2_id, ChatMessage.created_at, ChatMessage.id
+            ).outerjoin(
+                ChatMessage,
+                and_(ChatMessage.id == cursor_message_id, ChatMessage.room_id == room_id),
+            )
+        stmt = stmt.select_from(ChatRoom).where(ChatRoom.id == room_id).limit(1)
+        row = (await db.execute(stmt)).one_or_none()
+        if row is None or user_id not in (row.user1_id, row.user2_id):
+            raise ForbiddenException(message="이 채팅방에 접근할 수 없습니다.")
+        if cursor_message_id is None:
+            return None
+        if row.created_at is None:
+            raise InvalidRequestException(message="유효하지 않은 cursor 입니다.")
+        return row.created_at, row.id
 
     @classmethod
     async def list_room_messages(
@@ -176,52 +232,23 @@ class ChatService:
         user_id: UUID,
         cursor_message_id: UUID | None,
         limit: int,
-    ) -> ChatMessagesPageData:
+    ) -> tuple[list[ChatMessageItem], bool]:
         async with db.begin():
-            # 메시지 조회 앞의 authz 가드. 전체 엔티티 대신 멤버 판정에 필요한 두 컬럼만 로드한다.
-            rres = await db.execute(
-                select(ChatRoom.user1_id, ChatRoom.user2_id).where(ChatRoom.id == room_id).limit(1)
+            cursor_row = await cls._room_membership_guard(
+                db, room_id=room_id, user_id=user_id, cursor_message_id=cursor_message_id
             )
-            room = rres.one_or_none()
-            if room is None or user_id not in (room.user1_id, room.user2_id):
-                raise ForbiddenException(message="이 채팅방에 접근할 수 없습니다.")
             stmt = select(ChatMessage).where(ChatMessage.room_id == room_id)
-            if cursor_message_id is not None:
-                cur = await db.execute(
-                    select(ChatMessage.created_at, ChatMessage.id).where(
-                        ChatMessage.id == cursor_message_id,
-                        ChatMessage.room_id == room_id,
-                    )
-                )
-                cur_row = cur.one_or_none()
-                if cur_row is None:
-                    raise InvalidRequestException(message="유효하지 않은 cursor 입니다.")
-                c_at, c_id = cur_row[0], cur_row[1]
+            if cursor_row is not None:
                 stmt = stmt.where(
-                    tuple_(ChatMessage.created_at, ChatMessage.id) < tuple_(c_at, c_id),
+                    tuple_(ChatMessage.created_at, ChatMessage.id) < tuple_(*cursor_row)
                 )
             stmt = stmt.order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc()).limit(
                 limit + 1
             )
             mres = await db.execute(stmt)
             rows = list(mres.scalars().all())
-        has_more = len(rows) > limit
-        page_rows = rows[:limit]
-        items = [
-            ChatMessageItem(
-                id=m.id,
-                room_id=m.room_id,
-                sender_id=m.sender_id,
-                content=m.content,
-                is_read=m.is_read,
-                created_at=m.created_at,
-            )
-            for m in page_rows
-        ]
-        next_cursor: str | None = None
-        if has_more and page_rows:
-            next_cursor = uuid_to_base62(page_rows[-1].id)
-        return ChatMessagesPageData(items=items, next_cursor=next_cursor)
+        page_rows, has_more = split_page(rows, limit)
+        return [ChatMessageItem.model_validate(m) for m in page_rows], has_more
 
     @classmethod
     async def list_recent_rooms(
@@ -237,12 +264,7 @@ class ChatService:
         - 미읽음은 내 기준: is_read=false AND sender_id != me
         - N+1 방지: 방/상대/최근메시지/미읽음을 1회 쿼리로 조립
         """
-        limit = max(1, min(int(limit), 50))
-
-        peer_id_expr = case(
-            (ChatRoom.user1_id == user_id, ChatRoom.user2_id),
-            else_=ChatRoom.user1_id,
-        ).label("peer_id")
+        pj = _PeerJoin(user_id)
 
         # 두 서브쿼리(최근메시지 윈도우·미읽음 집계)를 호출자 방으로 한정한다.
         # 스코프가 없으면 전체 chat_messages를 스캔·집계해 메시지 누적에 비례해 비용이 커진다(#16).
@@ -291,35 +313,16 @@ class ChatService:
             .subquery()
         )
 
-        peer = aliased(User)
-        peer_img = aliased(Image)
-        peer_dog = aliased(DogProfile)
-        peer_dog_img = aliased(Image)
-
         async with db.begin():
+            stmt = select(
+                ChatRoom.id.label("room_id"),
+                *pj.columns,
+                last_msg.c.last_content,
+                last_msg.c.last_created_at,
+                func.coalesce(unread.c.unread_count, 0).label("unread_count"),
+            ).where(or_(ChatRoom.user1_id == user_id, ChatRoom.user2_id == user_id))
             stmt = (
-                select(
-                    ChatRoom.id.label("room_id"),
-                    peer_id_expr,
-                    peer.nickname.label("peer_nickname"),
-                    peer_img.file_url.label("peer_profile_image_url"),
-                    peer_dog_img.file_url.label("peer_dog_profile_image_url"),
-                    peer_dog.name.label("peer_dog_name"),
-                    peer_dog.breed.label("peer_dog_breed"),
-                    peer_dog.gender.label("peer_dog_gender"),
-                    peer_dog.birth_date.label("peer_dog_birth_date"),
-                    last_msg.c.last_content,
-                    last_msg.c.last_created_at,
-                    func.coalesce(unread.c.unread_count, 0).label("unread_count"),
-                )
-                .where(or_(ChatRoom.user1_id == user_id, ChatRoom.user2_id == user_id))
-                .join(peer, peer.id == peer_id_expr)
-                .outerjoin(peer_img, peer_img.id == peer.profile_image_id)
-                .outerjoin(
-                    peer_dog,
-                    (peer_dog.owner_id == peer.id) & (peer_dog.is_representative.is_(True)),
-                )
-                .outerjoin(peer_dog_img, peer_dog_img.id == peer_dog.profile_image_id)
+                pj.apply(stmt)
                 .join(last_msg, last_msg.c.room_id == ChatRoom.id)
                 .outerjoin(unread, unread.c.room_id == ChatRoom.id)
                 .order_by(last_msg.c.last_created_at.desc(), ChatRoom.id.desc())
@@ -336,17 +339,10 @@ class ChatService:
             items.append(
                 ChatRoomListItem(
                     room_id=r.room_id,
-                    peer_user_id=r.peer_id,
-                    peer_nickname=r.peer_nickname or "",
-                    peer_profile_image_url=r.peer_profile_image_url,
-                    peer_dog_profile_image_url=r.peer_dog_profile_image_url,
-                    peer_dog_name=r.peer_dog_name,
-                    peer_dog_breed=r.peer_dog_breed,
-                    peer_dog_gender=r.peer_dog_gender,
-                    peer_dog_birth_date=r.peer_dog_birth_date,
                     last_message_preview=preview,
                     unread_count=int(r.unread_count or 0),
                     updated_at=r.last_created_at,
+                    **_PeerJoin.fields(r),
                 )
             )
         return ChatRoomsListData(items=items)
@@ -358,16 +354,10 @@ class ChatService:
         *,
         room_id: UUID,
         user_id: UUID,
-    ) -> ChatRoomMarkedReadData:
+    ) -> None:
         """내 기준 미읽음(상대가 보낸 메시지)을 읽음으로 일괄 표시."""
         async with db.begin():
-            # UPDATE 앞의 authz 가드. 전체 엔티티 대신 멤버 판정에 필요한 두 컬럼만 로드한다.
-            rres = await db.execute(
-                select(ChatRoom.user1_id, ChatRoom.user2_id).where(ChatRoom.id == room_id).limit(1)
-            )
-            room = rres.one_or_none()
-            if room is None or user_id not in (room.user1_id, room.user2_id):
-                raise ForbiddenException(message="이 채팅방에 접근할 수 없습니다.")
+            await cls._room_membership_guard(db, room_id=room_id, user_id=user_id)
             await db.execute(
                 update(ChatMessage)
                 .where(
@@ -377,7 +367,6 @@ class ChatService:
                 )
                 .values(is_read=True)
             )
-        return ChatRoomMarkedReadData(ok=True)
 
     @classmethod
     async def get_room_peer_info(
@@ -392,57 +381,19 @@ class ChatService:
         - 멤버가 아니면 Forbidden
         - N+1 없이 1쿼리
         """
-        peer_id_expr = case(
-            (ChatRoom.user1_id == user_id, ChatRoom.user2_id),
-            else_=ChatRoom.user1_id,
-        ).label("peer_id")
-
-        peer = aliased(User)
-        peer_img = aliased(Image)
-        peer_dog = aliased(DogProfile)
-        peer_dog_img = aliased(Image)
+        pj = _PeerJoin(user_id)
 
         async with db.begin():
             # 멤버십 가드를 projection의 WHERE에 접어넣어 같은 방을 두 번 조회하지 않는다(#19).
             # 비멤버·부재 방이면 행이 없으므로 None → Forbidden.
-            stmt = (
-                select(
-                    ChatRoom.id.label("room_id"),
-                    peer_id_expr,
-                    peer.nickname.label("peer_nickname"),
-                    peer_img.file_url.label("peer_profile_image_url"),
-                    peer_dog.name.label("peer_dog_name"),
-                    peer_dog_img.file_url.label("peer_dog_profile_image_url"),
-                    peer_dog.breed.label("peer_dog_breed"),
-                    peer_dog.gender.label("peer_dog_gender"),
-                    peer_dog.birth_date.label("peer_dog_birth_date"),
-                )
-                .where(
-                    ChatRoom.id == room_id,
-                    or_(ChatRoom.user1_id == user_id, ChatRoom.user2_id == user_id),
-                )
-                .join(peer, peer.id == peer_id_expr)
-                .outerjoin(peer_img, peer_img.id == peer.profile_image_id)
-                .outerjoin(
-                    peer_dog,
-                    (peer_dog.owner_id == peer.id) & (peer_dog.is_representative.is_(True)),
-                )
-                .outerjoin(peer_dog_img, peer_dog_img.id == peer_dog.profile_image_id)
-                .limit(1)
+            stmt = select(ChatRoom.id.label("room_id"), *pj.columns).where(
+                ChatRoom.id == room_id,
+                or_(ChatRoom.user1_id == user_id, ChatRoom.user2_id == user_id),
             )
+            stmt = pj.apply(stmt).limit(1)
             res = await db.execute(stmt)
             row = res.one_or_none()
             if row is None:
                 raise ForbiddenException(message="이 채팅방에 접근할 수 없습니다.")
 
-        return ChatRoomPeerInfoData(
-            room_id=row.room_id,
-            peer_user_id=row.peer_id,
-            peer_nickname=row.peer_nickname or "",
-            peer_profile_image_url=row.peer_profile_image_url,
-            peer_dog_name=row.peer_dog_name,
-            peer_dog_profile_image_url=row.peer_dog_profile_image_url,
-            peer_dog_breed=row.peer_dog_breed,
-            peer_dog_gender=row.peer_dog_gender,
-            peer_dog_birth_date=row.peer_dog_birth_date,
-        )
+        return ChatRoomPeerInfoData(room_id=row.room_id, **_PeerJoin.fields(row))
