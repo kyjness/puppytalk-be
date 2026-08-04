@@ -685,6 +685,45 @@ rate limit 미들웨어는 `scope["type"] != "http"`를 그대로 통과시켜 W
 
 ---
 
+### 38. 댓글 블라인드가 게시글 `comment_count`를 조정하지 않음 — P1
+
+**파일**: `app/domain/comments/repository.py`, `app/domain/comments/service.py`, `app/domain/reports/targets.py`
+
+목록 조회는 블라인드 댓글을 제외하는데(`_reply_visible_conditions`) 블라인드 처리는 `is_blinded`만
+세팅하고 `Post.comment_count`를 건드리지 않았다. 삭제 경로는 차감하는데 블라인드만 빠져 있어,
+"댓글 5개"라고 표시하면서 4개만 보이는 불일치가 난다. 신고 임계값 자동 블라인드(`ReportService`)도
+같은 경로라 사용자 행동만으로 드리프트가 쌓인다. 트렌딩 점수에도 가려진 댓글이 계속 기여했다.
+
+**수정 방향**: `comment_count`를 "표시 가능한(미삭제·미블라인드) 댓글 수"로 정의하고, 블라인드
+전이마다 ±1. 상태를 읽고-나서-쓰면 동시 모더레이션에서 이중 조정이 나므로 전이 판정은 원자적으로.
+
+> **수정 완료**: 조건부 UPDATE + RETURNING(`blind_if_visible`·`unblind_if_blinded`)으로 전이를
+> 원자적으로 판정하고, 전이가 실제 일어난 경우에만 게시글 카운트를 조정한다. 조정 주체는 생성·삭제
+> 경로와 같은 서비스층(`CommentModeration`) — `reports/targets.py`의 모더레이션 배선이 COMMENT
+> 타깃으로 이 파사드를 가리켜 `AdminService`·`ReportService`는 분기 없이 그대로 쓴다. 블라인드된
+> 댓글을 삭제할 때의 이중 차감은 `delete_comment`가 **삭제 직전** `is_blinded`를 RETURNING하도록
+> 바꿔 막았다. 블라인드·해제·reset 반복(멱등)과 이중 차감 부재를 통합 테스트로 고정.
+
+---
+
+### 39. 트렌딩 해시태그에 집계 창 부재 — P2
+
+**파일**: `app/domain/posts/repository.py`, `app/domain/posts/services/hashtag_service.py`
+
+`get_trending_hashtags`가 기간 조건 없이 전체 기간 누적 카운트를 셌다. "지금 뜨는 멍태그"라는
+화면 문구와 어긋나고, 누적값은 시간이 갈수록 초기 태그에 고정돼 순위가 사실상 갱신되지 않는다.
+tie-breaker도 없어 동점 태그 순서가 비결정적 — 캐시 갱신마다 목록이 뒤집혀 보인다.
+트렌딩 게시글은 24h 창을 쓰는데(ADR 0004) 해시태그만 창이 없어 랭킹 철학도 불일치했다.
+
+**수정 방향**: 게시글과 같은 서버 고정 24h 창 + 결정적 tie-breaker.
+
+> **수정 완료**: `window_hours`(기본 24) 추가·`name ASC` tie-breaker·희소 시 전체 기간 1회 폴백.
+> 창이 서버 고정이라 캐시 키 분화는 없다(ADR 0004의 `window_hours` 제거 결정과 동일 근거).
+> 함께 트렌딩 점수식을 좋아요·조회수 중심으로 재조정하고(댓글 가중치 3→1) 24h 창과 이중 감쇠였던
+> 지수를 1.3→1.0으로 완화. 가중치·지수는 매직넘버에서 명명 상수로 빼 근거를 코드에 남겼다.
+
+---
+
 ## 요약표
 
 | 우선순위 | # | 항목 | 파일 |
@@ -725,3 +764,5 @@ rate limit 미들웨어는 `scope["type"] != "http"`를 그대로 통과시켜 W
 | **P2** | 34 | 소품 모음(멱등 순서·SNS client·경로 표기 등) | 여러 파일 |
 | **P3** | 35 | 죽은 코드 일괄(MySQL 잔재 등) | 여러 파일 |
 | **P3** | 36 | 제품 결정 문서화(단일 세션 refresh 등) | docs |
+| **P1** | 38 | 댓글 블라인드가 게시글 comment_count 미조정 | `comments/repository.py`, `service.py`, `reports/targets.py` |
+| **P2** | 39 | 트렌딩 해시태그 집계 창 부재(+점수식 재조정) | `app/domain/posts/repository.py`, `services/hashtag_service.py` |
