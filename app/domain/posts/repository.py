@@ -174,6 +174,21 @@ _TRENDING_POOL_COLS = (
     Post.user_id,
 )
 
+# 트렌딩 점수 가중치 — 좋아요·조회수 중심. 비율의 근거는 신호의 희소성이다:
+# 좋아요 1개 ≈ 조회 20회 ≈ 댓글 2개. 조회수는 뷰어별 1시간 dedup(ADR 0007)을 거쳐
+# 사실상 "시간당 고유 조회자 수"라 좋아요와 같은 단위로 섞어도 된다.
+# 댓글은 보조 신호로만 둔다 — comment_count가 작성자 본인 답글·대댓글까지 포함해
+# "몇 명이 반응했나"를 뜻하지 않으므로, 가중치를 높이면 핑퐁 대화가 랭킹을 먹는다.
+_W_LIKE = 2
+_W_VIEW = 0.1
+_W_COMMENT = 1
+# 감쇠 지수. 집계 창(24h) 자체가 1차 감쇠라 지수까지 크면 이중 감쇠가 되어
+# "방금 올라온 글"만 노출된다(1.3이면 24h 된 글의 상대 페널티가 약 28배).
+# 1.0에서는 13배 — 최신 글 우대는 유지하면서 창 안의 좋아요·조회수 차이가 순위에 반영된다.
+_DECAY_EXPONENT = 1.0
+# 나이 0인 글의 분모가 0이 되지 않게 하는 하한(시간). 갓 올라온 글의 점수 폭주도 막는다.
+_DECAY_AGE_FLOOR_HOURS = 2
+
 
 class PostsRepository:
     @classmethod
@@ -393,8 +408,10 @@ class PostsRepository:
         if use_time_decay:
             age_hours = func.extract("epoch", func.now() - Post.created_at) / 3600.0
             score = (
-                Post.comment_count * 3 + Post.like_count * 2 + Post.view_count * 0.1
-            ) / func.power(age_hours + 2, 1.3)
+                Post.like_count * _W_LIKE
+                + Post.view_count * _W_VIEW
+                + Post.comment_count * _W_COMMENT
+            ) / func.power(age_hours + _DECAY_AGE_FLOOR_HOURS, _DECAY_EXPONENT)
             stmt = stmt.order_by(score.desc(), Post.id.desc())
         else:
             stmt = stmt.order_by(
