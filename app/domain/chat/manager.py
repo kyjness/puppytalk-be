@@ -6,6 +6,8 @@ from uuid import UUID
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from app.core.config import settings
+
 log = logging.getLogger(__name__)
 
 # DM 분산 브로드캐스트 채널 — 알림 puppytalk:channel:notif:sse 와 네임스페이스 분리.
@@ -26,9 +28,21 @@ class ConnectionManager:
         self._lock = asyncio.Lock()
         self._by_user: dict[UUID, set[WebSocket]] = {}
 
-    async def connect(self, user_id: UUID, ws: WebSocket) -> None:
+    async def connect(self, user_id: UUID, ws: WebSocket) -> bool:
+        """등록 성공 여부. 유저당 상한을 넘으면 등록하지 않는다(호출부가 소켓을 닫는다).
+
+        상한이 없으면 유저 한 명이 연결을 계속 열어 인스턴스 로컬 상태를 무한히 늘릴 수
+        있다 — 메시지 한도(수신 루프)는 이미 연 연결의 트래픽만 막지 연결 수는 못 막는다.
+        """
         async with self._lock:
-            self._by_user.setdefault(user_id, set()).add(ws)
+            bucket = self._by_user.setdefault(user_id, set())
+            if len(bucket) >= settings.REALTIME_MAX_CONNECTIONS_PER_USER:
+                if not bucket:
+                    del self._by_user[user_id]
+                log.info("chat ws 연결 상한 초과 user=%s open=%s", user_id, len(bucket))
+                return False
+            bucket.add(ws)
+            return True
 
     async def disconnect(self, user_id: UUID, ws: WebSocket) -> None:
         async with self._lock:

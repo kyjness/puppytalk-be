@@ -247,6 +247,45 @@ async def test_send_personal_message_disconnects_stalled_socket(monkeypatch):
     assert stalled.closed_with == 1011
 
 
+class _DummyWs:
+    """소켓은 set에 담기므로 해시 가능해야 한다(SimpleNamespace는 __eq__ 때문에 불가)."""
+
+
+async def test_connect_rejects_past_per_user_connection_cap():
+    """연결 수 상한 — 메시지 한도(수신 루프)는 이미 연 연결의 트래픽만 막지 연결 수는 못 막는다."""
+    from app.core.config import settings
+    from app.domain.chat import manager as manager_mod
+
+    manager = manager_mod.ConnectionManager()
+    uid = uuid.uuid4()
+    cap = settings.REALTIME_MAX_CONNECTIONS_PER_USER
+
+    sockets = [cast(Any, _DummyWs()) for _ in range(cap)]
+    for ws in sockets:
+        assert await manager.connect(uid, ws) is True
+
+    assert await manager.connect(uid, cast(Any, _DummyWs())) is False
+
+    # 하나 끊으면 자리가 난다.
+    await manager.disconnect(uid, sockets[0])
+    assert await manager.connect(uid, cast(Any, _DummyWs())) is True
+
+
+async def test_connect_rejection_does_not_leak_empty_bucket():
+    from app.core.config import settings
+    from app.domain.chat import manager as manager_mod
+
+    manager = manager_mod.ConnectionManager()
+    uid = uuid.uuid4()
+    sockets = [cast(Any, _DummyWs()) for _ in range(settings.REALTIME_MAX_CONNECTIONS_PER_USER)]
+    for ws in sockets:
+        await manager.connect(uid, ws)
+    await manager.connect(uid, cast(Any, _DummyWs()))  # 거절
+    for ws in sockets:
+        await manager.disconnect(uid, ws)
+    assert manager._by_user == {}
+
+
 # --- 로컬 거부 게이트 (억제 창 + 연속 거부 종료) ---
 
 

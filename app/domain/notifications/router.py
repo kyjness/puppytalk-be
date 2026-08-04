@@ -42,8 +42,10 @@ async def notifications_stream(
     """로컬 팬아웃 큐 기반 SSE. Redis 장애 시에도 스트림은 유지되고 같은 인스턴스
     이벤트는 계속 수신된다(fail-open) — 503으로 끊는 것보다 낫다."""
 
+    # 등록을 먼저 — 상한 초과는 429로 끊는다(스트림이 시작되면 상태 코드를 못 바꾼다).
+    queue = await NotificationService.sse_register(user.id)
     return StreamingResponse(
-        NotificationService.sse_subscribe(user.id),
+        NotificationService.sse_subscribe(user.id, queue),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

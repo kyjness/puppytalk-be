@@ -195,7 +195,10 @@ async def chat_dm_websocket(websocket: WebSocket) -> None:
             return
 
     await websocket.accept()
-    await chat_connection_manager.connect(user_id, websocket)
+    if not await chat_connection_manager.connect(user_id, websocket):
+        # 1008 = policy violation. 클라이언트가 무한 재연결하지 않도록 사유를 실어 보낸다.
+        await websocket.close(code=1008, reason="Too many concurrent connections")
+        return
     redis = get_websocket_redis(websocket)
     gate = LocalRejectionGate(f"chat:ws:{user_id}", close_threshold=_REJECT_CLOSE_THRESHOLD)
     try:

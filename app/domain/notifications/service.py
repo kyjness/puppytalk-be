@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from app.common.enums import NotificationKind
+from app.common.exceptions import TooManyRequestsException
 from app.core.config import settings
 from app.core.ids import uuid_to_base62
 from app.domain.notifications.model import Notification, NotificationsRepository
@@ -227,15 +228,25 @@ class NotificationService:
         return total
 
     @staticmethod
+    async def sse_register(user_id: UUID) -> asyncio.Queue[str]:
+        """스트림 시작 **전에** 큐를 잡는다 — 상한 초과를 429로 돌려주려면 등록이 응답
+        본문 시작보다 앞서야 한다(제너레이터 안에서 거절하면 이미 200이 나간 뒤다)."""
+        queue = await notification_sse_manager.register(user_id)
+        if queue is None:
+            raise TooManyRequestsException(
+                message="동시 실시간 연결 수를 초과했습니다. 사용하지 않는 탭을 닫고 다시 시도해주세요."
+            )
+        return queue
+
+    @staticmethod
     async def sse_subscribe(
         user_id: UUID,
+        queue: asyncio.Queue[str],
         *,
         heartbeat_interval_sec: float = 25.0,
     ) -> AsyncGenerator[str]:
         """로컬 팬아웃 큐 대기 — 연결마다 Redis pubsub을 점유하지 않는다(공유 풀 고갈 방지).
         클라이언트 연결 해제 시 제너레이터 취소 → 큐 등록 해제."""
-
-        queue = await notification_sse_manager.register(user_id)
         try:
             while True:
                 try:

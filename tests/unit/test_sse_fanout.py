@@ -11,6 +11,8 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from app.common.exceptions import TooManyRequestsException
+from app.core.config import settings
 from app.domain.chat.service import ChatService
 from app.domain.notifications.schema import NotificationEvent
 from app.domain.notifications.service import NotificationService
@@ -64,9 +66,10 @@ async def test_manager_drops_when_queue_full():
 
 async def test_sse_subscribe_yields_delivered_payload_and_unregisters():
     uid = uuid4()
-    stream = NotificationService.sse_subscribe(uid, heartbeat_interval_sec=5.0)
+    queue = await NotificationService.sse_register(uid)
+    stream = NotificationService.sse_subscribe(uid, queue, heartbeat_interval_sec=5.0)
     task = asyncio.ensure_future(anext(stream))
-    await asyncio.sleep(0)  # register까지 진행
+    await asyncio.sleep(0)
     await notification_sse_manager.deliver(uid, '{"k":1}')
     assert await task == 'data: {"k":1}\n\n'
     await stream.aclose()
@@ -75,11 +78,45 @@ async def test_sse_subscribe_yields_delivered_payload_and_unregisters():
 
 async def test_sse_subscribe_emits_ping_on_idle():
     uid = uuid4()
-    stream = NotificationService.sse_subscribe(uid, heartbeat_interval_sec=0.01)
+    queue = await NotificationService.sse_register(uid)
+    stream = NotificationService.sse_subscribe(uid, queue, heartbeat_interval_sec=0.01)
     try:
         assert await anext(stream) == ": ping\n\n"
     finally:
         await stream.aclose()
+
+
+async def test_sse_register_rejects_past_connection_cap():
+    """큐는 bounded지만 연결 수가 무제한이면 유저 한 명이 로컬 상태를 무한히 늘린다.
+
+    거절은 등록 시점(=스트림 시작 전)이라 429로 내려갈 수 있다 — 제너레이터 안에서
+    거절하면 이미 200이 나간 뒤다.
+    """
+    uid = uuid4()
+    cap = settings.REALTIME_MAX_CONNECTIONS_PER_USER
+    queues = [await NotificationService.sse_register(uid) for _ in range(cap)]
+    try:
+        with pytest.raises(TooManyRequestsException):
+            await NotificationService.sse_register(uid)
+
+        # 하나 닫으면 자리가 나야 한다.
+        await notification_sse_manager.unregister(uid, queues.pop())
+        queues.append(await NotificationService.sse_register(uid))
+    finally:
+        for q in queues:
+            await notification_sse_manager.unregister(uid, q)
+
+
+async def test_manager_register_returns_none_at_cap_without_leaking_bucket():
+    manager = SseFanoutManager()
+    uid = uuid4()
+    queues = [
+        await manager.register(uid) for _ in range(settings.REALTIME_MAX_CONNECTIONS_PER_USER)
+    ]
+    assert await manager.register(uid) is None
+    for q in queues:
+        await manager.unregister(uid, q)
+    assert manager._by_user == {}  # 거절이 빈 버킷을 남기지 않는다
 
 
 # --- publish_after_commit 팬아웃 경로 ---
