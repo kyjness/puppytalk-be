@@ -232,20 +232,20 @@ class CommentService:
     @classmethod
     async def delete_comment(cls, post_id: UUID, comment_id: UUID, db: AsyncSession) -> None:
         async with db.begin():
-            # UPDATE 우선(행복 경로 1쿼리) — 0건이면 메타로 미존재/이미 삭제(멱등 204)를 가른다.
-            was_blinded = await CommentsRepository.delete_comment(post_id, comment_id, db=db)
-            if was_blinded is not None:
-                # 블라인드된 댓글은 블라인드 시점에 이미 차감됐다 — 여기서 또 빼면 이중 차감.
-                if not was_blinded:
-                    try:
-                        await PostsRepository.decrement_comment_count(post_id, db=db)
-                    except StaleDataError as e:
-                        raise ConcurrentUpdateException() from e
+            # UPDATE 우선(행복 경로 1쿼리) — 표시 중이던 댓글을 지운 경우에만 post_id가 온다.
+            deleted_from = await CommentsRepository.delete_comment(post_id, comment_id, db=db)
+            if deleted_from is not None:
+                try:
+                    await PostsRepository.decrement_comment_count(deleted_from, db=db)
+                except StaleDataError as e:
+                    raise ConcurrentUpdateException() from e
                 return
+            # 여기까지 오는 셋: 미존재 · 이미 삭제 · 방금 지운 블라인드 댓글.
+            # 뒤의 둘은 deleted_at이 채워져 있어 멱등 204로 수렴한다.
             meta = await CommentsRepository.get_comment_meta(comment_id, db=db)
             if meta is None or meta.post_id != post_id or meta.deleted_at is None:
                 raise CommentNotFoundException()
-            return  # 이미 삭제됨 → 204 (멱등)
+            return
 
 
 class CommentModeration:

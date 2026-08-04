@@ -4,16 +4,11 @@ import pytest
 from app.core.ids import new_ulid_str
 from httpx import AsyncClient
 
+from tests.integration.conftest import auth_header
+
 pytestmark = pytest.mark.asyncio
 
 _TEST_PW = "LikeTestPW123!"
-
-
-def _auth_header(login_json: dict) -> dict[str, str]:
-    token_data = login_json.get("data", login_json)
-    token = token_data.get("accessToken") or token_data.get("access_token")
-    assert token
-    return {"Authorization": f"Bearer {token}"}
 
 
 async def setup_post_and_headers(client: AsyncClient) -> tuple[dict[str, str], str]:
@@ -31,7 +26,7 @@ async def setup_post_and_headers(client: AsyncClient) -> tuple[dict[str, str], s
         json={"email": payload["email"], "password": payload["password"]},
     )
     assert login_res.status_code == 200
-    headers = _auth_header(login_res.json())
+    headers = auth_header(login_res.json())
 
     post_res = await client.post(
         "/v1/posts",

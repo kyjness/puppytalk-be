@@ -19,7 +19,12 @@ class PostLike(Base):
         PG_UUID, ForeignKey("posts.id", ondelete="CASCADE"), primary_key=True
     )
     user_id: Mapped[UUID] = mapped_column(
-        PG_UUID, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+        PG_UUID,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+        # PK가 (post_id, user_id)라 user_id는 선행 컬럼이 아니다 — 탈퇴 퍼지의 집계와
+        # 유저 삭제 CASCADE가 이 인덱스 없이는 테이블 전체를 훑는다.
+        index=True,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

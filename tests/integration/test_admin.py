@@ -11,17 +11,12 @@ from httpx import AsyncClient
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.integration.conftest import auth_header
+
 pytestmark = pytest.mark.asyncio
 
 # SignUpRequest: PasswordStr 8~20자
 _TEST_PW = "AdminTestPW123!"
-
-
-def _auth_header(login_json: dict) -> dict[str, str]:
-    token_data = login_json.get("data", login_json)
-    token = token_data.get("accessToken") or token_data.get("access_token")
-    assert token, "accessToken 없음"
-    return {"Authorization": f"Bearer {token}"}
 
 
 async def _admin_headers(client: AsyncClient, db: AsyncSession, email: str, nickname: str) -> dict:
@@ -32,7 +27,7 @@ async def _admin_headers(client: AsyncClient, db: AsyncSession, email: str, nick
     await db.commit()
     res = await client.post("/v1/auth/login", json={"email": email, "password": _TEST_PW})
     assert res.status_code == 200, res.text
-    return _auth_header(res.json())
+    return auth_header(res.json())
 
 
 async def test_admin_access_denied_for_normal_user(client: AsyncClient, db_session: AsyncSession):
@@ -43,7 +38,7 @@ async def test_admin_access_denied_for_normal_user(client: AsyncClient, db_sessi
         json={"email": payload["email"], "password": payload["password"]},
     )
     assert login_res.status_code == 200
-    headers = _auth_header(login_res.json())
+    headers = auth_header(login_res.json())
 
     res = await client.get("/v1/admin/reported-posts", headers=headers)
     assert res.status_code == 403
@@ -64,7 +59,7 @@ async def test_admin_access_success(client: AsyncClient, db_session: AsyncSessio
         json={"email": payload["email"], "password": payload["password"]},
     )
     assert login_res.status_code == 200
-    headers = _auth_header(login_res.json())
+    headers = auth_header(login_res.json())
 
     res = await client.get("/v1/admin/reported-posts", headers=headers)
     assert res.status_code == 200
@@ -108,7 +103,7 @@ async def test_suspend_revokes_refresh_token(client: AsyncClient, db_session: As
         "/v1/auth/login",
         json={"email": admin["email"], "password": admin["password"]},
     )
-    headers = _auth_header(admin_login.json())
+    headers = auth_header(admin_login.json())
 
     # 정지 실행
     suspend_res = await client.patch(f"/v1/admin/users/{target_id}/suspend", headers=headers)
@@ -231,7 +226,7 @@ async def _author_headers(client: AsyncClient, email: str, nickname: str) -> dic
     )
     res = await client.post("/v1/auth/login", json={"email": email, "password": _TEST_PW})
     assert res.status_code == 200, res.text
-    return _auth_header(res.json())
+    return auth_header(res.json())
 
 
 def _res_id(res) -> str:

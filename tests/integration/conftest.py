@@ -76,3 +76,28 @@ async def client(db_session: AsyncSession) -> AsyncIterator[AsyncClient]:
 
     app.dependency_overrides.pop(get_master_db, None)
     app.dependency_overrides.pop(get_slave_db, None)
+
+
+# --- 인증 공용 헬퍼 ---
+# accessToken/access_token 폴백은 응답 봉투의 세부사항이다 — 파일마다 복사하면 봉투가
+# 바뀔 때 손댈 곳이 그만큼 늘어난다. conftest는 같은 디렉터리 전체가 자동으로 본다.
+
+
+def auth_header(login_json: dict) -> dict[str, str]:
+    """로그인 응답 → Authorization 헤더."""
+    data = login_json.get("data", login_json)
+    token = data.get("accessToken") or data.get("access_token")
+    assert token, f"accessToken 없음: {login_json}"
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def signup_login(
+    client: AsyncClient, email: str, nickname: str, *, password: str
+) -> dict[str, str]:
+    """가입 후 로그인해 Authorization 헤더를 돌려준다(이미 가입돼 있어도 로그인만 한다)."""
+    await client.post(
+        "/v1/auth/signup", json={"email": email, "password": password, "nickname": nickname}
+    )
+    res = await client.post("/v1/auth/login", json={"email": email, "password": password})
+    assert res.status_code == 200, res.text
+    return auth_header(res.json())

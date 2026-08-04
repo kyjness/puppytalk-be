@@ -10,25 +10,15 @@ from app.core.ids import new_ulid_str
 from app.domain.comments.service import REPLY_PREVIEW_LIMIT
 from httpx import AsyncClient
 
+from tests.integration.conftest import signup_login
+
 pytestmark = pytest.mark.asyncio
 
 _PW = "CommentTestPW123!"
 
 
-def _auth_header(login_json: dict) -> dict[str, str]:
-    data = login_json.get("data", login_json)
-    token = data.get("accessToken") or data.get("access_token")
-    assert token
-    return {"Authorization": f"Bearer {token}"}
-
-
 async def _signup_login(client: AsyncClient, email: str, nickname: str) -> dict[str, str]:
-    await client.post(
-        "/v1/auth/signup", json={"email": email, "password": _PW, "nickname": nickname}
-    )
-    res = await client.post("/v1/auth/login", json={"email": email, "password": _PW})
-    assert res.status_code == 200, res.text
-    return _auth_header(res.json())
+    return await signup_login(client, email, nickname, password=_PW)
 
 
 def _data_id(res) -> str:

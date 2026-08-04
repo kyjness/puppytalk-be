@@ -3,7 +3,7 @@
 from typing import Any, NamedTuple
 from uuid import UUID
 
-from sqlalchemy import and_, exists, func, or_, select, update
+from sqlalchemy import and_, case, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, joinedload
 
@@ -308,19 +308,24 @@ class CommentsRepository:
         return row is not None
 
     @classmethod
-    async def delete_comment(cls, post_id: UUID, comment_id: UUID, db: AsyncSession) -> bool | None:
-        """soft-delete. 반환 None=미존재·이미 삭제, 그 외는 **삭제 직전** is_blinded.
+    async def delete_comment(cls, post_id: UUID, comment_id: UUID, db: AsyncSession) -> UUID | None:
+        """soft-delete. **표시 중이던** 댓글을 지웠을 때만 post_id 반환 — 형제 전이 메서드
+        (blind_if_visible·unblind_if_blinded)와 같은 규약이다.
 
-        호출부가 게시글 comment_count(= 표시 가능한 댓글 수)를 줄일지 판단하려면 삭제 직전의
-        블라인드 여부가 필요하다 — 이미 블라인드된 댓글은 그때 이미 차감됐으므로 또 빼면 안 된다.
-        RETURNING은 UPDATE 후 값을 주지만 이 UPDATE는 is_blinded를 건드리지 않아 값이 같다.
+        None은 셋을 뭉뚱그린다: 미존재·이미 삭제·블라인드된 댓글. 셋 다 카운트를 건드리면
+        안 된다는 점에서 같고(블라인드분은 블라인드 시점에 이미 차감됐다), 404인지 멱등 204인지는
+        호출부가 get_comment_meta로 가른다. 블라인드된 댓글은 삭제는 되지만 값이 NULL이라
+        그 경로로 흘러 204가 된다 — 의도한 결과다.
+
+        is_blinded를 WHERE에 넣으면 블라인드 댓글이 아예 삭제되지 않으므로 RETURNING에서 가른다.
+        이 UPDATE는 is_blinded를 건드리지 않아 반환값이 삭제 직전 상태를 반영한다.
         """
         return await update_one_returning(
             db,
             Comment,
             [Comment.id == comment_id, Comment.post_id == post_id, Comment.deleted_at.is_(None)],
             {"deleted_at": utc_now()},
-            Comment.is_blinded,
+            case((Comment.is_blinded.is_(False), Comment.post_id), else_=None),
         )
 
     @classmethod
