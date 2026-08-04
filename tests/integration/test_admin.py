@@ -334,3 +334,39 @@ async def test_deleting_blinded_comment_does_not_double_decrement(
     assert res.status_code in (200, 204), res.text
     assert await _comment_count(client, post_id, author) == 2  # 3이 아니라 2에서 그대로
     assert await _visible_comments(client, post_id, author) == 2
+
+
+async def test_blinding_root_accounts_for_its_replies(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """루트를 블라인드하면 대댓글까지 목록에서 사라지므로 카운트도 그만큼 줄어야 한다."""
+    admin = await _admin_headers(client, db_session, "sub-admin@example.com", "서브트리관리자")
+    author = await _author_headers(client, "sub-author@example.com", "서브트리작성자")
+
+    post_id, comment_ids = await _post_with_comments(client, author, 1)
+    root = comment_ids[0]
+    for i in range(4):
+        r = await client.post(
+            f"/v1/posts/{post_id}/comments",
+            json={"content": f"답글{i}", "parentId": root},
+            headers=author,
+        )
+        assert r.status_code == 201, r.text
+    assert await _comment_count(client, post_id, author) == 5
+
+    res = await client.patch(f"/v1/admin/comments/{root}/blind", headers=admin)
+    assert res.status_code == 200, res.text
+
+    # 루트 1 + 대댓글 4가 통째로 사라진다 — 1만 깎으면 4가 어긋난다.
+    assert await _visible_comments(client, post_id, author) == 0
+    assert await _comment_count(client, post_id, author) == 0
+
+    # 블라인드된 루트의 대댓글은 "더보기"로도 못 본다(목록과 일관).
+    more = await client.get(f"/v1/posts/{post_id}/comments/{root}/replies", headers=author)
+    assert more.status_code == 404, more.text
+
+    # 해제하면 서브트리가 통째로 돌아온다.
+    assert (
+        await client.patch(f"/v1/admin/comments/{root}/unblind", headers=admin)
+    ).status_code == 200
+    assert await _comment_count(client, post_id, author) == 5

@@ -643,6 +643,11 @@ class PostsRepository:
         )
 
     @classmethod
+    async def set_comment_count(cls, post_id: UUID, value: int, db: AsyncSession) -> bool:
+        """카운트를 절대값으로 확정 — 모더레이션처럼 변화량을 손으로 셀 수 없는 경로용."""
+        return await _update_post(db, post_id, comment_count=max(0, value)) is not None
+
+    @classmethod
     async def decrement_comment_count(cls, post_id: UUID, db: AsyncSession) -> bool:
         return (
             await _update_post(db, post_id, comment_count=func.greatest(Post.comment_count - 1, 0))

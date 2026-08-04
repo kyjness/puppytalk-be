@@ -172,6 +172,17 @@ class CommentsRepository:
         return await cls._select_comment_meta(comment_id, db)
 
     @classmethod
+    async def get_visible_root_meta(
+        cls, comment_id: UUID, *, db: AsyncSession
+    ) -> CommentMeta | None:
+        """블라인드되지 않은 댓글의 메타 — 대댓글 "더보기"의 루트 가드용.
+
+        삭제(deleted_at)는 막지 않는다: 삭제 루트는 목록에 placeholder로 남고 그 대댓글도
+        계속 보이므로 여기서도 열려 있어야 한다. 블라인드는 반대로 서브트리를 감춘다.
+        """
+        return await cls._select_comment_meta(comment_id, db, Comment.is_blinded.is_(False))
+
+    @classmethod
     async def get_visible_comment_meta(
         cls, comment_id: UUID, *, db: AsyncSession, current_user_id: UUID | None = None
     ) -> CommentMeta | None:
@@ -418,6 +429,31 @@ class CommentsRepository:
             await _update_comment(db, comment_id, alive=True, touch=True, report_count=0)
             is not None
         )
+
+    @classmethod
+    async def count_visible_for_post(cls, post_id: UUID, *, db: AsyncSession) -> int:
+        """게시글의 표시 가능한 댓글 수 — 루트가 블라인드되면 그 **서브트리 전체**가 목록에서
+        사라지므로, 목록이 실제로 보여주는 것과 같은 규칙으로 센다.
+
+        루트: 미삭제·미블라인드. 대댓글: 부모가 살아 있고 자신도 미삭제·미블라인드.
+        (차단은 사용자별이라 카운트에 반영하지 않는다 — 표시 개수는 사용자 무관 값이다.)
+        """
+        parent = aliased(Comment)
+        alive_root = and_(Comment.deleted_at.is_(None), Comment.is_blinded.is_(False))
+        stmt = (
+            select(func.count())
+            .select_from(Comment)
+            .outerjoin(parent, Comment.parent_id == parent.id)
+            .where(
+                Comment.post_id == post_id,
+                alive_root,
+                or_(
+                    Comment.parent_id.is_(None),
+                    and_(parent.deleted_at.is_(None), parent.is_blinded.is_(False)),
+                ),
+            )
+        )
+        return int((await db.execute(stmt)).scalar_one() or 0)
 
     @classmethod
     async def decrement_like_counts_for_users(cls, user_ids: list[UUID], db: AsyncSession) -> None:

@@ -59,7 +59,8 @@ def _cleanup_jobs(redis_client: Any) -> tuple[PeriodicJob, ...]:
     async def orphan_post_image_cleanup(_task_id: str) -> int:
         # 게시글 작성 중 이탈 등으로 남은 고아 이미지(24h+) 정리
         async with get_connection() as db:
-            return await MediaService.sweep_unused_images(db, redis=redis_client)
+            # 배타 실행은 러너가 lock_key로 보장한다 — 본문은 락을 잡지 않는다.
+            return await MediaService.sweep_unused_images(db)
 
     async def withdrawn_user_purge(_task_id: str) -> int:
         # 탈퇴 유저 파기(30일 경과 하드 삭제, 청크 단위)

@@ -66,8 +66,7 @@ async def test_manager_drops_when_queue_full():
 
 async def test_sse_subscribe_yields_delivered_payload_and_unregisters():
     uid = uuid4()
-    queue = await NotificationService.sse_register(uid)
-    stream = NotificationService.sse_subscribe(uid, queue, heartbeat_interval_sec=5.0)
+    stream = NotificationService.sse_subscribe(uid, heartbeat_interval_sec=5.0)
     task = asyncio.ensure_future(anext(stream))
     await asyncio.sleep(0)
     await notification_sse_manager.deliver(uid, '{"k":1}')
@@ -78,33 +77,42 @@ async def test_sse_subscribe_yields_delivered_payload_and_unregisters():
 
 async def test_sse_subscribe_emits_ping_on_idle():
     uid = uuid4()
-    queue = await NotificationService.sse_register(uid)
-    stream = NotificationService.sse_subscribe(uid, queue, heartbeat_interval_sec=0.01)
+    stream = NotificationService.sse_subscribe(uid, heartbeat_interval_sec=0.01)
     try:
         assert await anext(stream) == ": ping\n\n"
     finally:
         await stream.aclose()
 
 
-async def test_sse_register_rejects_past_connection_cap():
-    """큐는 bounded지만 연결 수가 무제한이면 유저 한 명이 로컬 상태를 무한히 늘린다.
-
-    거절은 등록 시점(=스트림 시작 전)이라 429로 내려갈 수 있다 — 제너레이터 안에서
-    거절하면 이미 200이 나간 뒤다.
-    """
+async def test_sse_capacity_check_rejects_past_cap():
+    """상한 판정은 스트림 시작 전에 일어나야 429로 내려갈 수 있다."""
     uid = uuid4()
     cap = settings.REALTIME_MAX_CONNECTIONS_PER_USER
-    queues = [await NotificationService.sse_register(uid) for _ in range(cap)]
+    queues = [await notification_sse_manager.register(uid) for _ in range(cap)]
     try:
         with pytest.raises(TooManyRequestsException):
-            await NotificationService.sse_register(uid)
+            await NotificationService.ensure_sse_capacity(uid)
 
-        # 하나 닫으면 자리가 나야 한다.
         await notification_sse_manager.unregister(uid, queues.pop())
-        queues.append(await NotificationService.sse_register(uid))
+        await NotificationService.ensure_sse_capacity(uid)  # 자리가 나면 통과
+        queues.append(await notification_sse_manager.register(uid))
     finally:
         for q in queues:
             await notification_sse_manager.unregister(uid, q)
+
+
+async def test_unstarted_stream_leaves_no_slot():
+    """제너레이터를 시작하지 않고 버려도 슬롯이 남으면 안 된다.
+
+    등록을 라우터로 올렸던 동안에는 여기서 큐가 고아가 되어, 상한이 그 유저를 영구히
+    429로 잠갔다(연결 중단·탭 닫힘으로 실제로 일어난다).
+    """
+    uid = uuid4()
+    for _ in range(settings.REALTIME_MAX_CONNECTIONS_PER_USER + 2):
+        stream = NotificationService.sse_subscribe(uid)
+        await stream.aclose()  # 한 번도 anext 하지 않고 폐기
+    assert uid not in notification_sse_manager._by_user
+    await NotificationService.ensure_sse_capacity(uid)  # 여전히 연결 가능해야 한다
 
 
 async def test_manager_register_returns_none_at_cap_without_leaking_bucket():

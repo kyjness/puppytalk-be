@@ -6,12 +6,12 @@
 """
 
 import asyncio
-from typing import cast
+from typing import Any, cast
 
 from app.core.cleanup import PeriodicJob, job_lock_key, run_jobs_once
 from app.infra.redis import RedisLike
 
-from tests.unit.fakes import FakeRedis
+from tests.unit.fakes import FakeDB, FakeRedis
 
 
 def _job(name: str, calls: list[str], *, boom: bool = False) -> PeriodicJob:
@@ -96,6 +96,38 @@ def test_declared_lock_key_overrides_name_derived_key():
 
     assert calls == []  # 요청 유발 경로가 쥔 락을 존중한다
     assert job_lock_key("sweep") not in redis.kv  # 이름 파생 키는 쓰지 않는다
+
+
+def test_runner_locked_job_body_still_does_its_work():
+    """러너가 락을 쥔 채 잡 본문을 부를 때, 본문이 그 락 때문에 스스로 막히면 안 된다.
+
+    이전 테스트들은 run을 스텁해 본문을 타지 않았고, 그래서 sweep이 러너와 **같은 키**를
+    다시 SET NX로 잡아 매번 skip하던 것을 잡지 못했다(정리가 영구 no-op). 실제 본문을 태운다.
+    """
+    from app.domain.media import service as media_service
+
+    swept: list[int] = []
+
+    async def fake_keyset_cleanup(db, *, fetch, on_delete_failed):
+        swept.append(1)
+        return 7
+
+    original = media_service._keyset_cleanup
+    media_service._keyset_cleanup = fake_keyset_cleanup
+    try:
+        redis = FakeRedis()
+
+        async def run(_task_id: str) -> int:
+            return await media_service.MediaService.sweep_unused_images(db=cast(Any, FakeDB()))
+
+        job = PeriodicJob(
+            "orphan_post_image_cleanup", run, lock_key=media_service.JOB_LOCK_SWEEP_UNUSED
+        )
+        _run([job], redis)
+    finally:
+        media_service._keyset_cleanup = original
+
+    assert swept == [1], "러너 락이 잡 본문을 스스로 막았다 — 정리가 no-op이 된다"
 
 
 def test_redis_failure_falls_open_to_running():

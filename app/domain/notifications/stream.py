@@ -22,6 +22,16 @@ class SseFanoutManager:
         self._lock = asyncio.Lock()
         self._by_user: dict[UUID, set[asyncio.Queue[str]]] = {}
 
+    async def has_capacity(self, user_id: UUID) -> bool:
+        """등록하지 않고 여유만 본다 — 라우터가 429를 **스트림 시작 전에** 판정하기 위한 용도.
+
+        확인과 실제 등록 사이의 창은 남지만(동시 연결 두 개가 함께 통과할 수 있다) 상한을
+        살짝 넘길 뿐이다. 반대로 라우터에서 등록까지 해버리면 제너레이터가 시작되지 않은
+        연결(중단된 요청)의 큐가 해제되지 않아 유저가 상한에 영구히 잠긴다.
+        """
+        async with self._lock:
+            return len(self._by_user.get(user_id, ())) < settings.REALTIME_MAX_CONNECTIONS_PER_USER
+
     async def register(self, user_id: UUID) -> asyncio.Queue[str] | None:
         """유저당 상한을 넘으면 None — 큐는 bounded지만 연결 수가 무제한이면
         유저 한 명이 인스턴스 로컬 상태를 무한히 늘릴 수 있다(WS와 같은 상한 공유)."""

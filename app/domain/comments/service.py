@@ -193,7 +193,10 @@ class CommentService:
             await _ensure_post_visible(post_id, db=db, current_user_id=current_user_id)
             # 루트가 이 게시글에 속한 실제 루트인지 확인 — 대댓글 id로 조회해 트리를
             # 한 단계 더 파고드는 요청(2단 구조 위반)과 남의 글 id 조합을 함께 막는다.
-            meta = await CommentsRepository.get_comment_meta(comment_id, db=db)
+            # 블라인드 루트도 막는다: 목록에서는 서브트리가 통째로 사라지는데 여기만
+            # 열려 있으면 루트 공개 id를 아는 사람에게 모더레이션이 무력해진다.
+            # (삭제 루트는 placeholder로 남으므로 대댓글 조회를 허용한다.)
+            meta = await CommentsRepository.get_visible_root_meta(comment_id, db=db)
             if meta is None or meta.post_id != post_id or meta.parent_id is not None:
                 raise CommentNotFoundException()
             fetched = await CommentsRepository.get_replies_page(
@@ -267,10 +270,22 @@ class CommentModeration:
         return await CommentsRepository.increment_report_count(comment_id, db=db)
 
     @classmethod
+    async def _resync_count(cls, post_id: UUID, *, db: AsyncSession) -> None:
+        """블라인드 전이 뒤 게시글 카운트를 다시 세어 넣는다.
+
+        ±1로는 맞출 수 없다 — 루트를 블라인드하면 대댓글까지 목록에서 사라지므로 실제
+        변화량은 1 + (그 루트의 표시 가능 대댓글 수)다. 모더레이션은 드문 경로라
+        COUNT 한 번이 싸고, 서브트리 크기를 손으로 세다 어긋나는 종류를 통째로 없앤다.
+        """
+        await PostsRepository.set_comment_count(
+            post_id, await CommentsRepository.count_visible_for_post(post_id, db=db), db=db
+        )
+
+    @classmethod
     async def set_blinded(cls, comment_id: UUID, /, db: AsyncSession) -> bool:
         post_id = await CommentsRepository.blind_if_visible(comment_id, db=db)
         if post_id is not None:
-            await PostsRepository.decrement_comment_count(post_id, db=db)
+            await cls._resync_count(post_id, db=db)
             return True
         # 전이가 없었다 — 이미 블라인드(멱등 성공)인지 미존재·삭제(404)인지 가른다.
         return await cls._is_alive(comment_id, db=db)
@@ -279,7 +294,7 @@ class CommentModeration:
     async def unblind(cls, comment_id: UUID, /, db: AsyncSession) -> bool:
         post_id = await CommentsRepository.unblind_if_blinded(comment_id, db=db)
         if post_id is not None:
-            await PostsRepository.increment_comment_count(post_id, db=db)
+            await cls._resync_count(post_id, db=db)
             return True
         return await cls._is_alive(comment_id, db=db)
 
