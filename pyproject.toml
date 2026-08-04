@@ -97,7 +97,11 @@ lint-check = "python3 -m ruff check ."
 format-check = "python3 -m ruff format . --check"
 typecheck = "python3 -m pyright"
 vulture-check = "python3 -m vulture"
-audit-export = "python3 scripts/export_requirements_for_audit.py"
+# 감사 대상은 설치된 환경이 아니라 uv.lock에서 뽑는다 — pip freeze는 venv 밖에서 돌면
+# 시스템 site-packages를 그대로 집어와 엉뚱한 패키지 집합을 감사한다.
+# pip은 락에만 있고 배포물에 실리지 않으므로 제외.
+# --quiet: -o로 파일을 써도 stdout에 전체 목록을 한 번 더 뱉어 check 출력이 묻힌다.
+audit-export = "uv export --quiet --frozen --no-emit-project --no-emit-package pip --no-hashes --no-annotate --all-extras --format requirements-txt -o .audit-requirements.txt"
 audit-run = "python3 -m pip_audit -r .audit-requirements.txt --no-deps --disable-pip --ignore-vuln CVE-2026-4539"
 audit-clean = "rm -f .audit-requirements.txt"
 audit = ["audit-export", "audit-run", "audit-clean"]
