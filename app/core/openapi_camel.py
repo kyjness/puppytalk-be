@@ -7,6 +7,12 @@ from typing import Any
 from app.common.schemas import to_camel
 
 
+def _camel_key(name: str) -> str:
+    """snake_case 키만 변환한다. BaseSchema 스키마는 alias로 이미 camelCase라, 밑줄 없는
+    키에 to_camel을 또 태우면 'hasMore'→'hasmore'로 뭉개져 스펙이 실응답과 어긋난다."""
+    return to_camel(name) if "_" in name else name
+
+
 def _convert_schema_object(obj: Any) -> Any:
     """스키마 객체 내 'properties' 키를 camelCase로 변환. $ref는 유지.
 
@@ -25,9 +31,9 @@ def _convert_schema_object(obj: Any) -> Any:
     for k, v in obj.items():
         if k == "required" and isinstance(v, list):
             # properties 키를 camelCase로 바꾸면 required 이름도 동일하게 맞춰야 스펙이 유효함
-            out[k] = [to_camel(item) if isinstance(item, str) else item for item in v]
+            out[k] = [_camel_key(item) if isinstance(item, str) else item for item in v]
         elif k == "properties" and isinstance(v, dict):
-            out[k] = {to_camel(key): _convert_schema_object(val) for key, val in v.items()}
+            out[k] = {_camel_key(key): _convert_schema_object(val) for key, val in v.items()}
         else:
             out[k] = _convert_schema_object(v)
     return out
