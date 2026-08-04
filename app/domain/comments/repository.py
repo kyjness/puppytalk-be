@@ -246,15 +246,20 @@ class CommentsRepository:
         return row is not None
 
     @classmethod
-    async def delete_comment(cls, post_id: UUID, comment_id: UUID, db: AsyncSession) -> bool:
-        row = await update_one_returning(
+    async def delete_comment(cls, post_id: UUID, comment_id: UUID, db: AsyncSession) -> bool | None:
+        """soft-delete. 반환 None=미존재·이미 삭제, 그 외는 **삭제 직전** is_blinded.
+
+        호출부가 게시글 comment_count(= 표시 가능한 댓글 수)를 줄일지 판단하려면 삭제 직전의
+        블라인드 여부가 필요하다 — 이미 블라인드된 댓글은 그때 이미 차감됐으므로 또 빼면 안 된다.
+        RETURNING은 UPDATE 후 값을 주지만 이 UPDATE는 is_blinded를 건드리지 않아 값이 같다.
+        """
+        return await update_one_returning(
             db,
             Comment,
             [Comment.id == comment_id, Comment.post_id == post_id, Comment.deleted_at.is_(None)],
             {"deleted_at": utc_now()},
-            Comment.id,
+            Comment.is_blinded,
         )
-        return row is not None
 
     @classmethod
     async def soft_delete_by_post(cls, post_id: UUID, db: AsyncSession) -> None:
@@ -301,19 +306,41 @@ class CommentsRepository:
             Comment.report_count,
         )
 
+    # --- 블라인드 전이 ---
+    # 무조건 UPDATE(is_blinded=True)를 쓰지 않는 이유: 게시글 comment_count를 전이당 정확히
+    # 한 번만 조정해야 하는데, 상태를 읽고-나서-쓰면 동시 모더레이션이 같은 전이를 둘 다
+    # 관측해 이중 조정이 난다. 조건부 UPDATE로 전이 자체를 원자적으로 판정하고, 전이가
+    # 실제로 일어났을 때만 소속 post_id를 돌려준다 — 조정은 CommentModeration이 수행한다.
+    # alive 가드 — 삭제 댓글 blind는 404 판정(posts와 동일 시맨틱).
+
     @classmethod
-    async def set_blinded(cls, comment_id: UUID, db: AsyncSession) -> bool:
-        # alive 가드 — 삭제 댓글 blind는 404 판정(posts와 동일 시맨틱).
-        return (
-            await _update_comment(db, comment_id, alive=True, touch=True, is_blinded=True)
-            is not None
+    async def blind_if_visible(cls, comment_id: UUID, db: AsyncSession) -> UUID | None:
+        """미블라인드 → 블라인드 전이면 post_id, 이미 블라인드거나 삭제·미존재면 None."""
+        return await update_one_returning(
+            db,
+            Comment,
+            [
+                Comment.id == comment_id,
+                Comment.deleted_at.is_(None),
+                Comment.is_blinded.is_(False),
+            ],
+            {"is_blinded": True, "updated_at": utc_now()},
+            Comment.post_id,
         )
 
     @classmethod
-    async def unblind(cls, comment_id: UUID, db: AsyncSession) -> bool:
-        return (
-            await _update_comment(db, comment_id, alive=True, touch=True, is_blinded=False)
-            is not None
+    async def unblind_if_blinded(cls, comment_id: UUID, db: AsyncSession) -> UUID | None:
+        """블라인드 → 미블라인드 전이면 post_id, 이미 미블라인드거나 삭제·미존재면 None."""
+        return await update_one_returning(
+            db,
+            Comment,
+            [
+                Comment.id == comment_id,
+                Comment.deleted_at.is_(None),
+                Comment.is_blinded.is_(True),
+            ],
+            {"is_blinded": False, "updated_at": utc_now()},
+            Comment.post_id,
         )
 
     @classmethod

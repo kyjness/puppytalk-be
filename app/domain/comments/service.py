@@ -1,4 +1,5 @@
-# 댓글 비즈니스 로직. Full-Async. 생성/삭제 시 게시글 comment_count 조정은 서비스에서 조율.
+# 댓글 비즈니스 로직. Full-Async. 생성/삭제/블라인드 시 게시글 comment_count 조정은
+# 서비스에서 조율한다 — 모더레이션 조율은 CommentModeration이 맡는다.
 
 from uuid import UUID
 
@@ -178,13 +179,63 @@ class CommentService:
     async def delete_comment(cls, post_id: UUID, comment_id: UUID, db: AsyncSession) -> None:
         async with db.begin():
             # UPDATE 우선(행복 경로 1쿼리) — 0건이면 메타로 미존재/이미 삭제(멱등 204)를 가른다.
-            if await CommentsRepository.delete_comment(post_id, comment_id, db=db):
-                try:
-                    await PostsRepository.decrement_comment_count(post_id, db=db)
-                except StaleDataError as e:
-                    raise ConcurrentUpdateException() from e
+            was_blinded = await CommentsRepository.delete_comment(post_id, comment_id, db=db)
+            if was_blinded is not None:
+                # 블라인드된 댓글은 블라인드 시점에 이미 차감됐다 — 여기서 또 빼면 이중 차감.
+                if not was_blinded:
+                    try:
+                        await PostsRepository.decrement_comment_count(post_id, db=db)
+                    except StaleDataError as e:
+                        raise ConcurrentUpdateException() from e
                 return
             meta = await CommentsRepository.get_comment_meta(comment_id, db=db)
             if meta is None or meta.post_id != post_id or meta.deleted_at is None:
                 raise CommentNotFoundException()
             return  # 이미 삭제됨 → 204 (멱등)
+
+
+class CommentModeration:
+    """댓글 모더레이션 파사드 — 블라인드 전이에 맞춰 게시글 comment_count까지 조율한다.
+
+    `comment_count`의 정의는 **표시 가능한(미삭제·미블라인드) 댓글 수**다. 목록 조회가
+    블라인드 댓글을 빼고 내려주므로(`_reply_visible_conditions`), 블라인드가 카운트를
+    건드리지 않으면 "댓글 5개"라고 표시하면서 4개만 보이는 불일치가 생긴다.
+
+    저장소가 아니라 여기서 조율하는 이유는 생성·삭제 경로와 같다 — 게시글 카운트는
+    댓글 도메인의 서비스가 소유한다. `reports/targets.py`의 모더레이션 배선이 COMMENT
+    타깃으로 이 클래스를 가리켜, AdminService·ReportService는 분기 없이 그대로 쓴다.
+    """
+
+    @classmethod
+    async def increment_report_count(
+        cls, comment_id: UUID, /, db: AsyncSession
+    ) -> int | None:  # 카운트 조율과 무관 — 저장소로 위임(모더레이션 계약 충족용).
+        return await CommentsRepository.increment_report_count(comment_id, db=db)
+
+    @classmethod
+    async def set_blinded(cls, comment_id: UUID, /, db: AsyncSession) -> bool:
+        post_id = await CommentsRepository.blind_if_visible(comment_id, db=db)
+        if post_id is not None:
+            await PostsRepository.decrement_comment_count(post_id, db=db)
+            return True
+        # 전이가 없었다 — 이미 블라인드(멱등 성공)인지 미존재·삭제(404)인지 가른다.
+        return await cls._is_alive(comment_id, db=db)
+
+    @classmethod
+    async def unblind(cls, comment_id: UUID, /, db: AsyncSession) -> bool:
+        post_id = await CommentsRepository.unblind_if_blinded(comment_id, db=db)
+        if post_id is not None:
+            await PostsRepository.increment_comment_count(post_id, db=db)
+            return True
+        return await cls._is_alive(comment_id, db=db)
+
+    @classmethod
+    async def reset_reports(cls, comment_id: UUID, /, db: AsyncSession) -> bool:
+        # reset은 블라인드 해제를 겸한다 — 해제 전이가 있었다면 카운트도 되돌린다.
+        await cls.unblind(comment_id, db=db)
+        return await CommentsRepository.reset_reports(comment_id, db=db)
+
+    @classmethod
+    async def _is_alive(cls, comment_id: UUID, *, db: AsyncSession) -> bool:
+        meta = await CommentsRepository.get_comment_meta(comment_id, db=db)
+        return meta is not None and meta.deleted_at is None
