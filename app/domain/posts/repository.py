@@ -367,22 +367,40 @@ class PostsRepository:
         return list(result.unique().scalars().all())
 
     @classmethod
-    async def get_trending_hashtags(
+    def get_trending_hashtags_query(
         cls,
         *,
-        db: AsyncSession,
+        window_hours: int | None = 24,
         limit: int = 10,
-    ) -> list[tuple[str, int]]:
+    ) -> Select[Any]:
+        # 집계 창은 트렌딩 게시글과 같은 24h(ADR 0004) — 창이 없으면 "지금 뜨는"이 아니라
+        # 전체 기간 누적이라 순위가 시간이 갈수록 고정된다. window_hours=None은 폴백 전용.
         count_expr = func.count(post_hashtags.c.post_id).label("count")
         stmt = (
             select(Hashtag.name, count_expr)
             .join(post_hashtags, Hashtag.id == post_hashtags.c.hashtag_id)
             .join(Post, Post.id == post_hashtags.c.post_id)
             .where(Post.deleted_at.is_(None), Post.is_blinded.is_(False))
-            .group_by(Hashtag.id, Hashtag.name)
-            .order_by(count_expr.desc())
+        )
+        if window_hours is not None:
+            stmt = stmt.where(Post.created_at >= utc_now() - timedelta(hours=window_hours))
+        return (
+            stmt.group_by(Hashtag.id, Hashtag.name)
+            # name ASC tie-breaker — 없으면 동점 태그의 순서가 비결정적이라
+            # 캐시 갱신 때마다 목록이 뒤집혀 보인다.
+            .order_by(count_expr.desc(), Hashtag.name.asc())
             .limit(limit)
         )
+
+    @classmethod
+    async def get_trending_hashtags(
+        cls,
+        *,
+        db: AsyncSession,
+        window_hours: int | None = 24,
+        limit: int = 10,
+    ) -> list[tuple[str, int]]:
+        stmt = cls.get_trending_hashtags_query(window_hours=window_hours, limit=limit)
         rows = (await db.execute(stmt)).all()
         return [(str(r[0]), int(r[1] or 0)) for r in rows]
 
