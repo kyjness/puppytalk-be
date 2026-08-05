@@ -18,9 +18,9 @@ jobs:
     name: lint · format · type · vulture
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
       - name: Sync (dev)
@@ -58,7 +58,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: ap-northeast-2
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # 공식 minio 이미지는 `server /data` 인자가 필요해 GH service로 못 띄우므로 docker run으로 기동.
       - name: Start MinIO
         run: |
@@ -76,7 +76,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: minioadmin
           AWS_DEFAULT_REGION: ap-northeast-2
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
       - name: Sync (dev)
@@ -89,9 +89,9 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
       - name: Sync (dev)
@@ -103,19 +103,19 @@ jobs:
     runs-on: ubuntu-latest
     needs: [quality, test]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       # main push일 때만 GHCR 로그인·push. PR/기타 브랜치는 빌드 검증만.
       - name: Log in to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build (and push on main)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
