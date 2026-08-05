@@ -320,7 +320,9 @@ docker run -d --name pg -e POSTGRES_PASSWORD=PASSWORD -e POSTGRES_DB=puppytalk_t
 응답·스펙 필드는 프론트 OpenAPI codegen 계약을 위해 **camelCase**로 노출됩니다.
 
 로그인 화면의 "데모 계정으로 둘러보기"가 쓰는 계정과 콘텐츠(글·댓글·좋아요·알림·DM)는
-시드로 만듭니다. 계정 값은 프론트 `src/config.ts`의 `DEMO_ACCOUNT`와 같아야 합니다:
+시드로 만듭니다. 계정은 `demo@puppytalk.shop` / `PuppyTalk!demo1` — 로그인 화면에 그대로
+노출되는 공개 값이며, 프론트 `src/config.ts`의 `DEMO_ACCOUNT`와 **같아야 합니다**
+(시더는 비밀번호를 stdout에 찍지 않습니다 — CI 로그에 남길 이유가 없습니다):
 
 ```bash
 uv run poe seed-demo            # 데모 계정 4개 + 둘러볼 콘텐츠

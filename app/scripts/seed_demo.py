@@ -201,7 +201,10 @@ async def _seed() -> int:
         await _dm(db, demo, coco, "좋아요! 토요일 오전 어떠세요?")
         print(f"DM {_counts['dm']}건 생성")
 
-    print(f"\n완료 — 로그인: {DEMO_EMAIL} / {DEMO_PASSWORD}")
+    # 비밀번호는 찍지 않는다. 값 자체는 로그인 화면에 공개되지만, 이름이 password인 것을
+    # stdout에 흘리면 CI 로그·터미널 스크롤백에 그대로 남고 정적 분석에도 걸린다
+    # (CodeQL py/clear-text-logging-sensitive-data). 값은 FE config.ts·README에 있다.
+    print(f"\n완료 — 로그인 계정: {DEMO_EMAIL} (비밀번호는 README 참고)")
     return 0
 
 
