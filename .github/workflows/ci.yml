@@ -135,12 +135,9 @@ jobs:
     # 이 PR이 **새로 들여온** 취약 의존성만 막는다 — 기존 부채에 발이 묶이지 않으면서
     # 회귀는 확실히 잡는 조합. push에는 비교할 base가 없어 PR 전용.
     #
-    # TODO(설정): Settings → Code security → **Dependency graph**를 켜야 동작한다.
-    # 그 토글은 UI 전용이라 API·워크플로로 켤 수 없어서, 켜기 전까지 이 잡이 CI 전체를
-    # 빨갛게 만들지 않도록 continue-on-error를 둔다. **켠 뒤에는 이 줄을 지울 것** —
-    # 남겨두면 취약 의존성이 들어와도 통과하는, 있으나 마나 한 게이트가 된다.
+    # 리포의 Dependency graph 설정이 켜져 있어야 동작한다(UI 전용 토글). 꺼지면 이 잡은
+    # "not supported"로 실패한다 — 그때 continue-on-error로 덮지 말고 설정을 다시 켤 것.
     if: github.event_name == 'pull_request'
-    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
