@@ -1,8 +1,8 @@
-"""댓글 목록 keyset 트리 페이지네이션 통합 테스트.
+"""댓글 목록 트리 페이지네이션 통합 테스트.
 
-루트 keyset + 대댓글 preview(#6·#21)를 API 레벨로 검증한다: 트리 조립, has_more/cursor 전진,
-삭제 루트 placeholder 시맨틱, 목록 is_liked, 그리고 preview 상한과 "더보기" 페이지네이션.
-실 Postgres(TEST_DB_URL) 필요.
+루트 목록(offset+total, ADR 0016)과 대댓글 preview(#21, 커서 유지)를 API 레벨로 검증한다:
+트리 조립, page/total 전진, 인기순·최신순 정렬, 삭제 루트 placeholder 시맨틱, 목록 is_liked,
+그리고 preview 상한과 "더보기" 페이지네이션. 실 Postgres(TEST_DB_URL) 필요.
 """
 
 import pytest
@@ -49,10 +49,10 @@ async def _add_comment(
     return _data_id(res)
 
 
-async def _list(client: AsyncClient, headers, post_id, *, size=10, cursor=None, sort=None) -> dict:
+async def _list(client: AsyncClient, headers, post_id, *, size=10, page=None, sort=None) -> dict:
     params: dict = {"size": size}
-    if cursor is not None:
-        params["cursor"] = cursor
+    if page is not None:
+        params["page"] = page
     if sort is not None:
         params["sort"] = sort
     res = await client.get(f"/v1/posts/{post_id}/comments", params=params, headers=headers)
@@ -75,21 +75,35 @@ async def test_list_builds_root_with_replies(client: AsyncClient):
     assert len(root["replies"]) == 2
 
 
-async def test_keyset_pagination_over_roots(client: AsyncClient):
+async def test_offset_pagination_over_roots(client: AsyncClient):
     headers = await _signup_login(client, "c_page@example.com", "페이지퍼피")
     post_id = await _create_post(client, headers)
     created = [await _add_comment(client, headers, post_id, f"루트{i}") for i in range(3)]
 
-    page1 = await _list(client, headers, post_id, size=2, sort="latest")
+    page1 = await _list(client, headers, post_id, size=2, page=1, sort="latest")
     assert page1["hasMore"] is True
+    assert page1["total"] == 3
     assert len(page1["items"]) == 2
     # latest = 최신(마지막 생성)부터
     assert [it["id"] for it in page1["items"]] == [created[2], created[1]]
 
-    cursor = page1["items"][-1]["id"]
-    page2 = await _list(client, headers, post_id, size=2, cursor=cursor, sort="latest")
+    page2 = await _list(client, headers, post_id, size=2, page=2, sort="latest")
     assert page2["hasMore"] is False
+    assert page2["total"] == 3
     assert [it["id"] for it in page2["items"]] == [created[0]]
+
+
+async def test_page_past_last_keeps_total(client: AsyncClient):
+    # total이 0으로 무너지면 FE의 페이지 nav가 통째로 사라진다 — 행이 없어도 건수는 살아야 한다.
+    headers = await _signup_login(client, "c_over@example.com", "너머퍼피")
+    post_id = await _create_post(client, headers)
+    for i in range(3):
+        await _add_comment(client, headers, post_id, f"루트{i}")
+
+    data = await _list(client, headers, post_id, size=2, page=9, sort="latest")
+    assert data["items"] == []
+    assert data["hasMore"] is False
+    assert data["total"] == 3
 
 
 async def test_deleted_root_with_reply_kept_as_placeholder(client: AsyncClient):
@@ -150,14 +164,29 @@ async def test_double_like_comment_does_not_double_count(client: AsyncClient):
     assert data["items"][0]["likeCount"] == 1
 
 
-async def test_popular_sort_removed_falls_back_gracefully(client: AsyncClient):
-    # 인기순은 제거됐다. sort=popular는 에러 없이 기본(latest)로 동작해야 한다.
+async def test_popular_sort_orders_by_like_count(client: AsyncClient):
+    # 인기순은 offset 전환과 함께 복원됐다(ADR 0016) — 좋아요 순, 동률은 최신 id가 앞.
     headers = await _signup_login(client, "c_pop@example.com", "인기퍼피")
     post_id = await _create_post(client, headers)
-    await _add_comment(client, headers, post_id, "댓글")
+    first = await _add_comment(client, headers, post_id, "먼저 쓴 인기 댓글")
+    second = await _add_comment(client, headers, post_id, "나중에 쓴 무관심 댓글")
 
-    data = await _list(client, headers, post_id, sort="popular")
-    assert len(data["items"]) == 1
+    assert (await client.post(f"/v1/likes/comments/{first}", headers=headers)).status_code == 200
+
+    popular = await _list(client, headers, post_id, sort="popular")
+    assert [it["id"] for it in popular["items"]] == [first, second]
+    # 같은 데이터에서 최신순은 순서가 반대여야 인기순이 실제로 작동한 것이다.
+    latest = await _list(client, headers, post_id, sort="latest")
+    assert [it["id"] for it in latest["items"]] == [second, first]
+
+
+async def test_unknown_sort_falls_back_to_latest(client: AsyncClient):
+    headers = await _signup_login(client, "c_sort@example.com", "정렬퍼피")
+    post_id = await _create_post(client, headers)
+    created = [await _add_comment(client, headers, post_id, f"루트{i}") for i in range(2)]
+
+    data = await _list(client, headers, post_id, sort="oldest")
+    assert [it["id"] for it in data["items"]] == [created[1], created[0]]
 
 
 # --- 대댓글 preview + 더보기 (#21) ---

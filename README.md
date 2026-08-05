@@ -319,11 +319,28 @@ docker run -d --name pg -e POSTGRES_PASSWORD=PASSWORD -e POSTGRES_DB=puppytalk_t
 
 응답·스펙 필드는 프론트 OpenAPI codegen 계약을 위해 **camelCase**로 노출됩니다.
 
-관리자 API(`/v1/admin/*`)는 `role='ADMIN'` 유저만 사용할 수 있습니다:
+로그인 화면의 "데모 계정으로 둘러보기"가 쓰는 계정과 콘텐츠(글·댓글·좋아요·알림·DM)는
+시드로 만듭니다. 계정은 `demo@puppytalk.shop` / `PuppyTalk!demo1` — 로그인 화면에 그대로
+노출되는 공개 값이며, 프론트 `src/config.ts`의 `DEMO_ACCOUNT`와 **같아야 합니다**
+(시더는 비밀번호를 stdout에 찍지 않습니다 — CI 로그에 남길 이유가 없습니다):
 
-```sql
-UPDATE users SET role = 'ADMIN' WHERE email = 'your-admin@example.com';
+```bash
+uv run poe seed-demo            # 데모 계정 4개 + 둘러볼 콘텐츠
+uv run poe seed-demo --purge    # 데모 계정·콘텐츠 삭제(개발용)
 ```
+
+관리자 API(`/v1/admin/*`)는 `role='ADMIN'` 유저만 사용할 수 있습니다. 권한 상승
+엔드포인트는 두지 않으므로(공격면 제거) 부여는 CLI로 합니다:
+
+```bash
+uv run poe grant-admin --email your-admin@example.com   # 부여
+uv run poe grant-admin --email your-admin@example.com --revoke   # 회수
+uv run poe grant-admin --list                            # 현재 관리자 목록
+```
+
+`role`은 Redis 인증 스냅샷(`user:auth:{id}`, TTL 240초)에 함께 실립니다 —
+**SQL로 `UPDATE`만 하면 최대 4분간 예전 권한으로 판정됩니다**(재로그인해도
+캐시가 먼저 맞습니다). 위 CLI는 UPDATE와 캐시 무효화를 한 번에 처리합니다.
 
 </details>
 
