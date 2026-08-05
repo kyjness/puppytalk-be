@@ -1,11 +1,17 @@
 version: 2
 
-# 액션을 커밋 SHA로 고정했기 때문에 이 파일이 필요하다 — 태그와 달리 SHA는 스스로
-# 갱신되지 않아서, 없으면 핀이 그대로 굳어 보안 패치를 놓친다. 공급망 고정과 최신성은
-# 세트로만 성립한다.
+# PR은 전부 develop으로 받는다. Dependabot의 기본 대상은 기본 브랜치(main)인데, 그러면
+# main에만 락파일이 앞서서 다음 develop→main 머지가 uv.lock에서 충돌한다(실제로 겪었다).
+# 통합 브랜치는 develop 하나로 유지한다.
+#
+# 주의: 보안 업데이트(Settings의 Dependabot security updates)는 여기 **해당 생태계 항목이
+# 있을 때만** target-branch를 따른다. 항목이 없으면 기본 브랜치로 열린다.
 updates:
+  # 액션은 커밋 SHA로 고정돼 있어 스스로 갱신되지 않는다 — 그래서 버전 업데이트를 켠다.
+  # 고정(공급망)과 최신성(보안 패치)은 세트로만 성립한다.
   - package-ecosystem: github-actions
     directory: "/"
+    target-branch: develop
     schedule:
       interval: weekly
     commit-message:
@@ -15,3 +21,15 @@ updates:
     groups:
       actions:
         update-types: [minor, patch]
+
+  # 파이썬 의존성은 **보안 건만** 받는다.
+  # open-pull-requests-limit: 0 은 정기 버전 업데이트를 끄는 스위치다 — 이 항목을 둔 이유는
+  # 업데이트를 받으려는 게 아니라, 보안 PR이 main 대신 develop으로 오게 하는 것뿐이다.
+  # (락은 uv가 관리하므로 생태계 이름도 uv다 — 브랜치가 dependabot/uv/... 로 열린다)
+  - package-ecosystem: uv
+    directory: "/"
+    target-branch: develop
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    labels: ["dependencies", "security"]
