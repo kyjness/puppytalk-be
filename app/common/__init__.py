@@ -11,6 +11,7 @@ from .schemas import (
     PaginatedResponse,
     PublicId,
     RootData,
+    offset_of,
     split_page,
 )
 from .validators import UtcDatetime, ensure_utc_datetime
@@ -24,6 +25,7 @@ __all__ = [
     "dump_api_response",
     "get_request_id",
     "DogGender",
+    "offset_of",
     "OptionalPublicId",
     "PaginatedResponse",
     "PublicId",

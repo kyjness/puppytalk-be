@@ -29,7 +29,9 @@
 
 1. **UNION ALL 페이지 쿼리** — `posts`·`comments`를 각각 `(target_type, id, report_count, created_at)`로
    투영해 `UNION ALL`, `ORDER BY report_count DESC, created_at DESC, id DESC LIMIT size OFFSET off`.
-   **단일 ORDER BY**로 정렬 축 불일치를 없앤다. `count(*) over union`으로 정확한 `total`.
+   **단일 ORDER BY**로 정렬 축 불일치를 없앤다. `total`은 같은 UNION 서브쿼리에 `COUNT(*)`를
+   **따로** 돌려 얻는다(페이지 쿼리와 2문장 — 윈도우 집계로 합치면 `LIMIT`이 무력화된다.
+   [ADR 0016](0016-comment-list-offset-pagination.md) 결정 3번에 근거를 적었다).
 2. **하이드레이션** — 페이지의 `(type, id)`만 받아 posts/comments를 id 배치로 로드(`get_reported_by_ids`),
    report 집계는 기존 배치(`bulk_max_created_at`·`bulk_reasons`)를 재사용, **UNION이 정한 순서를 그대로
    유지**해 재정렬 없이 조립. 인메모리 병합·정렬·cap 전부 제거.
@@ -60,7 +62,7 @@
 | 대안 | 기각 사유 |
 |------|-----------|
 | cursor(id keyset) `CursorPage` | uuid7 id 정렬로 가면 **"많이 신고된 순" triage 정렬 상실**(최신 신고 콘텐츠 순이 됨). admin 저트래픽에 커서(deep-offset 회피) 이득 없음 |
-| cursor(report_count 튜플 keyset) | `report_count`는 변동값 → keyset 경계 **드리프트**(중복·누락). comments 인기순 keyset을 같은 이유로 제거한 결정과 배치됨 |
+| cursor(report_count 튜플 keyset) | `report_count`는 변동값 → keyset 경계 **드리프트**(중복·누락). comments 인기순 keyset을 같은 이유로 제거한 결정과 배치됨 (그 결정은 이후 [ADR 0016](0016-comment-list-offset-pagination.md)에서 *정렬 제거*가 아니라 *offset 전환*으로 대체됐다 — "변동 축에 keyset을 얹지 않는다"는 논거는 그대로 유지된다) |
 | 두 엔드포인트 분리(reported-posts / reported-comments 각 단일 테이블 keyset) | 각각은 단순하나 **통합 triage 피드 UX를 깨고** FE 계약을 이원화 |
 | 현행 인메모리 병합·슬라이스 | #5 버그 그 자체(cap 소실·total 불일치) |
 

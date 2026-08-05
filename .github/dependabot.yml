@@ -1,0 +1,17 @@
+version: 2
+
+# 액션을 커밋 SHA로 고정했기 때문에 이 파일이 필요하다 — 태그와 달리 SHA는 스스로
+# 갱신되지 않아서, 없으면 핀이 그대로 굳어 보안 패치를 놓친다. 공급망 고정과 최신성은
+# 세트로만 성립한다.
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(ci)"
+    labels: ["dependencies"]
+    # 액션 하나당 PR 하나면 리뷰가 산만하다 — 마이너·패치는 묶는다.
+    groups:
+      actions:
+        update-types: [minor, patch]

@@ -4,9 +4,10 @@
 그 상태로는 커서 페이지네이션·무한스크롤·검색·조회수·해시태그·DM·알림 중 무엇도 보여줄 수
 없으므로, 방문자가 기능을 확인할 수 있는 최소한의 콘텐츠를 심는다.
 
-실행(컨테이너 안에서):
-    docker compose exec backend python -m scripts.seed_demo
-    docker compose exec backend python -m scripts.seed_demo --force   # 지우고 다시 만들기
+실행:
+    uv run poe seed-demo                 # 로컬
+    uv run poe seed-demo --force         # 지우고 다시 만들기
+    docker compose exec backend python -m app.scripts.seed_demo   # 배포된 컨테이너 안에서
 
 설계상 지켜야 하는 두 가지:
 
@@ -28,6 +29,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.common.enums import NotificationKind
 from app.core.config import settings
 from app.core.ids import new_ulid_str
@@ -35,15 +39,15 @@ from app.core.security import hash_password, password_with_pepper
 from app.db import AsyncSessionLocal
 from app.domain.chat.model import ChatMessage, ChatRoom, normalize_dm_user_ids
 from app.domain.comments.model import Comment
+from app.domain.comments.repository import CommentsRepository
 from app.domain.dogs.model import DogProfile
 from app.domain.likes.model import PostLike
 from app.domain.media.model import Image
 from app.domain.notifications.model import Notification
 from app.domain.posts.model import Hashtag, Post, PostImage, post_hashtags
+from app.domain.posts.repository import PostsRepository
 from app.domain.users.model import User
 from app.infra.storage import build_url
-from sqlalchemy import delete, select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 # ---------------------------------------------------------------------------
 # 데모 계정 — 이 목록이 "무엇이 데모 데이터인가"의 단일 정의처다(멱등·--force 판정 기준).
@@ -294,6 +298,13 @@ async def purge_demo_data(db: AsyncSession) -> None:
     user_ids = list((await db.execute(select(User.id).where(User.email.in_(emails)))).scalars())
     if not user_ids:
         return
+
+    # 데모 계정이 **남의 글·댓글**에 누른 좋아요를 먼저 되돌린다. FK는 좋아요 행만 지우고
+    # 대상의 비정규화 like_count는 모른다(UserService.purge_withdrawn_users가 문서화한 짝).
+    # 데모끼리는 아래에서 글째로 지워지니 무관하지만, 공개 데모 계정은 방문자가 그대로
+    # 로그인해 쓰는 계정이라 남의 콘텐츠에도 흔적을 남길 수 있다.
+    await PostsRepository.decrement_like_counts_for_users(user_ids, db=db)
+    await CommentsRepository.decrement_like_counts_for_users(user_ids, db=db)
 
     post_rows = await db.execute(select(Post.id).where(Post.user_id.in_(user_ids)))
     post_ids = list(post_rows.scalars())
@@ -592,9 +603,11 @@ async def seed(*, force: bool, post_count: int, with_images: bool) -> int:
         await create_engagement(db, users, posts, rng)
         await create_chats(db, users, rng)
 
+    # 비밀번호는 찍지 않는다. 값 자체는 로그인 화면에 공개되지만, 이름이 password인 것을
+    # stdout에 흘리면 CI 로그·배포 셸 히스토리에 그대로 남고 정적 분석에도 걸린다
+    # (CodeQL py/clear-text-logging-sensitive-data). 값은 README와 프론트 config.ts에 있다.
     print("\n완료. 데모 계정으로 로그인해 보세요:")
-    print(f"  이메일   {DEMO_USERS[0]['email']}")
-    print(f"  비밀번호 {DEMO_PASSWORD}")
+    print(f"  이메일   {DEMO_USERS[0]['email']}  (비밀번호는 README 참고)")
     return 0
 
 

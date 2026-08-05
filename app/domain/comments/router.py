@@ -21,6 +21,7 @@ from app.common import (
     ApiResponse,
     CursorPage,
     OptionalPublicId,
+    PaginatedResponse,
     PublicId,
     api_response,
 )
@@ -49,30 +50,35 @@ async def create_comment(
     return api_response(request, code=ApiCode.OK, data=data)
 
 
-@router.get("", status_code=200, response_model=ApiResponse[CursorPage[CommentResponse]])
+@router.get("", status_code=200, response_model=ApiResponse[PaginatedResponse[CommentResponse]])
 async def get_comments(
     request: Request,
     post_id: Annotated[PublicId, Path(..., description="게시글 공개 ID (Base62)")],
-    cursor: Annotated[
-        OptionalPublicId,
-        Query(
-            description="무한 스크롤: 직전 응답의 마지막 루트 댓글 id(공개 ID). 미지정 시 처음부터."
-        ),
-    ] = None,
+    page: int = Query(1, ge=1, description="1-base 페이지 번호"),
     size: int = Query(10, ge=1, le=100, description="페이지 크기"),
-    sort: str | None = Query(None, description="정렬: latest|oldest"),
+    sort: str | None = Query(None, description="정렬: latest|popular"),
     db: AsyncSession = Depends(get_slave_db),
     current_user: CurrentUser | None = Depends(get_current_user_optional),
 ):
-    result, has_more = await CommentService.get_comments(
+    """루트 댓글 목록 — 커서가 아니라 offset+total이다(ADR 0016).
+
+    인기순은 정렬 축(`like_count`)이 변동값이라 keyset이 성립하지 않고, 댓글은 게시글
+    1건에 국한된 유한 집합이라 깊은 offset이 실질 문제가 되지 않는다. 대댓글
+    ("/{comment_id}/replies")은 축이 불변이라 커서를 유지한다.
+    """
+    result, total = await CommentService.get_comments(
         post_id,
+        page,
         size,
         db=db,
         sort=sort,
-        cursor=cursor,
         current_user_id=current_user.id if current_user else None,
     )
-    return api_response(request, code=ApiCode.OK, data=CursorPage(items=result, has_more=has_more))
+    return api_response(
+        request,
+        code=ApiCode.OK,
+        data=PaginatedResponse.from_page(result, page=page, size=size, total=total),
+    )
 
 
 @router.get(

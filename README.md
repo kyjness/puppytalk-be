@@ -319,11 +319,28 @@ docker run -d --name pg -e POSTGRES_PASSWORD=PASSWORD -e POSTGRES_DB=puppytalk_t
 
 응답·스펙 필드는 프론트 OpenAPI codegen 계약을 위해 **camelCase**로 노출됩니다.
 
-관리자 API(`/v1/admin/*`)는 `role='ADMIN'` 유저만 사용할 수 있습니다:
+로그인 화면의 "데모 계정으로 둘러보기"가 쓰는 계정과 콘텐츠(글·댓글·좋아요·알림·DM)는
+시드로 만듭니다. 계정은 `demo@puppytalk.shop` / `PuppyTalk!demo1` — 로그인 화면에 그대로
+노출되는 공개 값이며, 프론트 `src/config.ts`의 `DEMO_ACCOUNT`와 **같아야 합니다**
+(시더는 비밀번호를 stdout에 찍지 않습니다 — CI 로그에 남길 이유가 없습니다):
 
-```sql
-UPDATE users SET role = 'ADMIN' WHERE email = 'your-admin@example.com';
+```bash
+uv run poe seed-demo            # 데모 계정·게시글·댓글·좋아요·DM·알림
+uv run poe seed-demo --force    # 기존 데모 데이터를 지우고 다시 만든다
 ```
+
+관리자 API(`/v1/admin/*`)는 `role='ADMIN'` 유저만 사용할 수 있습니다. 권한 상승
+엔드포인트는 두지 않으므로(공격면 제거) 부여는 CLI로 합니다:
+
+```bash
+uv run poe grant-admin --email your-admin@example.com   # 부여
+uv run poe grant-admin --email your-admin@example.com --revoke   # 회수
+uv run poe grant-admin --list                            # 현재 관리자 목록
+```
+
+`role`은 Redis 인증 스냅샷(`user:auth:{id}`, TTL 240초)에 함께 실립니다 —
+**SQL로 `UPDATE`만 하면 최대 4분간 예전 권한으로 판정됩니다**(재로그인해도
+캐시가 먼저 맞습니다). 위 CLI는 UPDATE와 캐시 무효화를 한 번에 처리합니다.
 
 </details>
 
@@ -334,7 +351,7 @@ UPDATE users SET role = 'ADMIN' WHERE email = 'your-admin@example.com';
 공개 데모는 **인스턴스 한 대에서 compose로** 돕니다 — Caddy(TLS 종단) · API(gunicorn 2) ·
 Celery 워커 · PostgreSQL · Redis. 관리형 서비스(RDS·ElastiCache·ALB)를 쓰지 않는 대신 HA·자동
 백업·무중단 배포를 포기한 **쇼케이스 등급** 배포이며, 그 판단은
-[ADR 0016](docs/adr/0016-demo-deployment-topology.md)에 있습니다. AWS 리소스는
+[ADR 0017](docs/adr/0017-demo-deployment-topology.md)에 있습니다. AWS 리소스는
 [인프라 레포의 `demo/`](https://github.com/kyjness/puppytalk-infra/tree/main/demo) terraform root가
 만듭니다.
 
@@ -343,14 +360,14 @@ Celery 워커 · PostgreSQL · Redis. 관리형 서비스(RDS·ElastiCache·ALB)
 | [`compose.prod.yml`](compose.prod.yml) | 배포 스택. GHCR 이미지를 pull하며 외부로는 Caddy(80·443)만 연다 |
 | [`Caddyfile`](Caddyfile) | `api.<도메인>` 자동 HTTPS · SSE 버퍼링 해제 · WebSocket 업그레이드 |
 | [`.env.prod.example`](.env.prod.example) | 프로덕션 가드가 요구하는 값 전체(실제 값은 서버에만 둔다) |
-| [`scripts/seed_demo.py`](scripts/seed_demo.py) | 데모 데이터 시드 — 빈 사이트에서는 목록·트렌딩·DM·알림을 보여줄 수 없다 |
+| [`app/scripts/seed_demo.py`](app/scripts/seed_demo.py) | 데모 데이터 시드 — 빈 사이트에서는 목록·트렌딩·DM·알림을 보여줄 수 없다 |
 | [`scripts/backup_db.sh`](scripts/backup_db.sh) | 일일 `pg_dump` → S3(14일 보관). 컨테이너 볼륨이 유일한 사본이라 필요하다 |
 | [`.github/workflows/cd.yml`](.github/workflows/cd.yml) | CI 성공 후 SSH로 `pull && up -d` + 헬스 체크 |
 
 ```bash
 # 서버에서 (배포 파일 4개가 /opt/puppytalk 에 있다고 가정)
 docker compose --env-file .env.prod -f compose.prod.yml up -d
-docker compose --env-file .env.prod -f compose.prod.yml exec backend python -m scripts.seed_demo
+docker compose --env-file .env.prod -f compose.prod.yml exec backend python -m app.scripts.seed_demo
 ```
 
 전체 적용 절차(도메인 위임·IAM 키 발급·GitHub Secrets)는

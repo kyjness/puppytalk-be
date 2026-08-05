@@ -41,29 +41,27 @@ def test_replies_attach_under_correct_root():
     a = _row(parent_id=r1.id)
     b = _row(parent_id=r1.id)
     c = _row(parent_id=r2.id)
-    tree = _build_comment_tree([r1, r2], [(a, 2), (b, 2), (c, 1)], liked_ids=set(), sort="oldest")
+    tree = _build_comment_tree([r1, r2], [(a, 2), (b, 2), (c, 1)], liked_ids=set())
     assert [t.id for t in tree] == [r1.id, r2.id]  # 루트 순서 보존
     assert {rp.id for rp in tree[0].replies} == {a.id, b.id}
     assert [rp.id for rp in tree[1].replies] == [c.id]
 
 
-def test_root_order_preserved_replies_sorted_by_mode():
-    # 루트는 keyset 순서(입력 순서) 그대로, 대댓글만 sort에 따라 정렬
+def test_root_order_preserved_replies_always_newest_first():
+    # 루트는 DB가 정한 입력 순서 그대로, 대댓글은 정렬 옵션과 무관하게 항상 최신순(id DESC).
+    # 대댓글엔 좋아요 UI가 없어 인기순이 성립하지 않고, 등록순은 계약에서 빠졌다(ADR 0016).
     r = _row()
     reps = [_row(parent_id=r.id) for _ in range(3)]
     ids_asc = sorted(rp.id for rp in reps)
 
-    latest = _build_comment_tree([r], _previews(reps), liked_ids=set(), sort="latest")
-    assert [rp.id for rp in latest[0].replies] == list(reversed(ids_asc))
-
-    oldest = _build_comment_tree([r], _previews(reps), liked_ids=set(), sort="oldest")
-    assert [rp.id for rp in oldest[0].replies] == ids_asc
+    tree = _build_comment_tree([r], _previews(reps), liked_ids=set())
+    assert [rp.id for rp in tree[0].replies] == list(reversed(ids_asc))
 
 
 def test_deleted_root_renders_placeholder():
     r = _row(deleted=True, content="원문")
     child = _row(parent_id=r.id, content="대댓글은 유지")
-    tree = _build_comment_tree([r], [(child, 1)], liked_ids=set(), sort="latest")
+    tree = _build_comment_tree([r], [(child, 1)], liked_ids=set())
     assert tree[0].is_deleted is True
     assert tree[0].content == "삭제된 댓글입니다."
     assert tree[0].replies[0].content == "대댓글은 유지"
@@ -72,7 +70,7 @@ def test_deleted_root_renders_placeholder():
 def test_is_liked_driven_by_liked_ids():
     r = _row()
     child = _row(parent_id=r.id)
-    tree = _build_comment_tree([r], [(child, 1)], liked_ids={child.id}, sort="latest")
+    tree = _build_comment_tree([r], [(child, 1)], liked_ids={child.id})
     assert tree[0].is_liked is False
     assert tree[0].replies[0].is_liked is True
 
@@ -81,7 +79,7 @@ def test_reply_with_unmatched_parent_is_dropped():
     # 저장소가 부모∈roots를 보장하지만, 방어적으로 미매칭 대댓글은 조용히 버린다.
     r = _row()
     orphan = _row(parent_id=uuid.uuid4())
-    tree = _build_comment_tree([r], [(orphan, 1)], liked_ids=set(), sort="latest")
+    tree = _build_comment_tree([r], [(orphan, 1)], liked_ids=set())
     assert tree[0].replies == []
     assert len(tree) == 1
 
@@ -90,7 +88,7 @@ def test_reply_count_and_has_more_reflect_total_not_preview_size():
     """preview는 잘려 있어도 reply_count는 전체 개수여야 한다 — FE가 '더보기'를 띄우는 근거."""
     r = _row()
     preview = [_row(parent_id=r.id) for _ in range(3)]
-    tree = _build_comment_tree([r], _previews(preview, total=17), liked_ids=set(), sort="latest")
+    tree = _build_comment_tree([r], _previews(preview, total=17), liked_ids=set())
 
     assert len(tree[0].replies) == 3
     assert tree[0].reply_count == 17
@@ -100,7 +98,7 @@ def test_reply_count_and_has_more_reflect_total_not_preview_size():
 def test_no_more_replies_when_preview_covers_all():
     r = _row()
     preview = [_row(parent_id=r.id) for _ in range(2)]
-    tree = _build_comment_tree([r], _previews(preview, total=2), liked_ids=set(), sort="latest")
+    tree = _build_comment_tree([r], _previews(preview, total=2), liked_ids=set())
 
     assert tree[0].reply_count == 2
     assert tree[0].has_more_replies is False
@@ -108,7 +106,7 @@ def test_no_more_replies_when_preview_covers_all():
 
 def test_root_without_replies_reports_zero():
     r = _row()
-    tree = _build_comment_tree([r], [], liked_ids=set(), sort="latest")
+    tree = _build_comment_tree([r], [], liked_ids=set())
 
     assert tree[0].replies == []
     assert tree[0].reply_count == 0

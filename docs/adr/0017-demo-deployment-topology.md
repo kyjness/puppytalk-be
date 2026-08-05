@@ -1,8 +1,8 @@
-# ADR 0016 — 라이브 데모 배포: 단일 인스턴스 compose (관리형 서비스 미사용)
+# ADR 0017 — 라이브 데모 배포: 단일 인스턴스 compose (관리형 서비스 미사용)
 
 - **상태**: 채택됨 (Accepted) · 2026-08-05
 - **관련 코드**: `compose.prod.yml`, `Caddyfile`, `.env.prod.example`,
-  `scripts/seed_demo.py`, `scripts/backup_db.sh`, `.github/workflows/cd.yml`,
+  `app/scripts/seed_demo.py`, `scripts/backup_db.sh`, `.github/workflows/cd.yml`,
   `puppytalk-infra/demo/`(terraform root)
 
 ## 맥락 (Context)
@@ -36,7 +36,7 @@
    그대로 전달되므로(`app/infra/storage.py`), MinIO를 인스턴스 안에 두면 그 엔드포인트를 외부에
    노출·프록시해야 한다. 실제 S3면 코드 분기 없이(ADR 0010의 단일 경로) 그대로 동작한다.
 5. **프론트는 S3 + CloudFront**, apex 도메인 하나로 정적 파일과 `/media/*`를 함께 서빙한다.
-6. **데모 데이터를 심는다**(`scripts/seed_demo.py`) — 빈 사이트에서는 커서 페이지네이션·
+6. **데모 데이터를 심는다**(`app/scripts/seed_demo.py`) — 빈 사이트에서는 커서 페이지네이션·
    조회수·트렌딩·DM·알림 중 무엇도 보여줄 수 없다.
 
 ## 트레이드오프 (Consequences)

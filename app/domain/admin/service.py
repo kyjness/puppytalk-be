@@ -5,7 +5,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.common import UserStatus
+from app.common import UserStatus, offset_of
 from app.common.enums import TargetType
 from app.common.exceptions import UserNotFoundException, UserWithdrawnException
 from app.domain.admin.repository import AdminReportsRepository
@@ -40,7 +40,7 @@ class AdminService:
             # 신고된 게시글·댓글을 DB-side UNION ALL로 합쳐 정렬·페이지(#5). 인메모리 병합·cap 없이
             # 페이지 경계·total이 정확하다. 여기서 나온 (type, id) 순서를 그대로 유지해 하이드레이션한다.
             page_rows, total = await AdminReportsRepository.page_reported_targets(
-                offset=(page - 1) * size, size=size, db=db
+                offset=offset_of(page, size), size=size, db=db
             )
             post_ids = [tid for ttype, tid in page_rows if ttype is TargetType.POST]
             comment_ids = [tid for ttype, tid in page_rows if ttype is TargetType.COMMENT]

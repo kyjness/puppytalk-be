@@ -32,6 +32,7 @@
 - [x] **comments / likes** — #11 twin 대표견만 로드 · #6 트리 페이지네이션 · #15 좋아요 카운터 중복
   - [x] #11 twin: 댓글 작성자 대표견만 로드(`_comment_author_loads`, posts와 동형)
   - [x] #6: 루트 keyset + 대댓글 부모별 배치 로드 + `CursorPage`(ADR 0002 결정을 코드로). 인메모리 슬라이스·500 cap·부정확 total 제거. 좋아요 keyset 드리프트 부정당 → 인기순(popular) 정렬 제거
+    - 이후 인기순이 제품 요구로 복원됐다 — 루트 목록만 offset+`total`로 전환([ADR 0016](adr/0016-comment-list-offset-pagination.md)), 대댓글은 커서 유지. "변동 축에 keyset을 얹지 않는다"는 판단은 그대로다
   - [x] #15: 좋아요 카운터를 `CommentsModel`로 일원화(`CommentLikesModel` 중복 제거, posts 패턴 정합)
   - [x] 별건: 게시글 목록 `is_liked` 항상 False 버그 수정(배치 조회)
   - [x] 테스트: 트리 조립 단위(`test_comment_tree`) + keyset·삭제 시맨틱·is_liked·무이중집계 통합(`test_comments`·`test_posts`)
