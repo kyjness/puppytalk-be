@@ -31,6 +31,8 @@ RUN groupadd -r app && useradd -r -g app app
 COPY --from=builder /app/.venv /app/.venv
 COPY alembic.ini ./
 COPY migrations ./migrations
+# 운영 CLI(app/scripts/)도 여기 함께 들어온다 — 배포 후 컨테이너에서
+# `python -m app.scripts.seed_demo`·`grant_admin`을 실행한다.
 COPY app ./app
 
 USER app

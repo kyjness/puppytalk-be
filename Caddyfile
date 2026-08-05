@@ -1,0 +1,19 @@
+# 데모 배포의 TLS 종단·리버스 프록시. ALB 대신 이 한 파일이 그 역할을 한다.
+# 인증서는 Let's Encrypt에서 자동 발급·갱신되며 caddy_data 볼륨에 저장된다.
+#
+# API_DOMAIN 은 compose.prod.yml 이 주입한다:
+#   - 배포:      api.puppytalk.shop   → 자동 HTTPS(80은 리다이렉트·ACME 챌린지)
+#   - 로컬 스모크: :80                → TLS 없이 평문. 도메인 없이 기동 검증할 때.
+
+{$API_DOMAIN} {
+	reverse_proxy backend:8000 {
+		# 알림 SSE 스트림이 프록시 버퍼에 갇히면 이벤트가 실시간으로 안 나간다.
+		# -1 은 "버퍼링 없이 즉시 flush". WebSocket(DM) 업그레이드는 Caddy가 알아서 처리한다.
+		flush_interval -1
+	}
+
+	log {
+		output stderr
+		format console
+	}
+}
