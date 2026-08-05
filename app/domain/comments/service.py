@@ -6,7 +6,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.exc import StaleDataError
 
-from app.common import split_page
+from app.common import offset_of, split_page
 from app.common.enums import NotificationKind
 from app.common.exceptions import (
     CommentNotFoundException,
@@ -66,12 +66,13 @@ def _build_comment_tree(
     roots: list,
     reply_previews: list[tuple],
     liked_ids: set,
-    sort: str = "latest",
 ) -> list[CommentResponse]:
-    """루트 순서는 keyset로 이미 확정돼 있으므로 보존하고, 대댓글 preview만 부모에 붙여 정렬한다.
+    """루트 순서는 DB가 이미 확정했으므로 보존하고, 대댓글 preview만 부모에 붙여 정렬한다.
 
     reply_previews는 (대댓글, 그 부모의 총 표시 가능 대댓글 수) 쌍이다 — 총 개수를 별도
     COUNT 쿼리 없이 같은 조회에서 받아, 응답의 reply_count·has_more_replies를 채운다.
+
+    대댓글은 항상 최신순(id DESC) — get_reply_previews_for_roots가 뽑는 순서와 같다.
     """
     root_resps = [_comment_to_response(r, liked_ids) for r in roots]
     by_id = {r.id: resp for r, resp in zip(roots, root_resps)}
@@ -80,9 +81,8 @@ def _build_comment_tree(
         if parent is not None:
             parent.replies.append(_comment_to_response(rp, liked_ids))
             parent.reply_count = total
-    reverse = sort != "oldest"
     for resp in root_resps:
-        resp.replies.sort(key=lambda x: x.id, reverse=reverse)
+        resp.replies.sort(key=lambda x: x.id, reverse=True)
         resp.has_more_replies = resp.reply_count > len(resp.replies)
     return root_resps
 
@@ -140,29 +140,30 @@ class CommentService:
     async def get_comments(
         cls,
         post_id: UUID,
+        page: int,
         size: int,
         db: AsyncSession,
         sort: str | None = None,
-        cursor: UUID | None = None,
         current_user_id: UUID | None = None,
-    ) -> tuple[list[CommentResponse], bool]:
-        sort_mode = sort if sort in ("latest", "oldest") else "latest"
+    ) -> tuple[list[CommentResponse], int]:
+        """루트 댓글 한 페이지와 전체 건수 — offset 기반(ADR 0016)."""
+        sort_mode = sort if sort in ("latest", "popular") else "latest"
         async with db.begin():
             await _ensure_post_visible(post_id, db=db, current_user_id=current_user_id)
-            fetched = await CommentsRepository.get_root_comments(
+            roots, total = await CommentsRepository.page_root_comments(
                 post_id,
+                offset_of(page, size),
                 size,
                 db=db,
-                cursor=cursor,
                 sort=sort_mode,
                 current_user_id=current_user_id,
             )
-            roots, has_more = split_page(fetched, size)
+            # 대댓글 순서는 루트 정렬을 따라가지 않는다(항상 최신순) — 좋아요 UI가 루트에만
+            # 있어 인기순이 성립하지 않는다.
             reply_previews = await CommentsRepository.get_reply_previews_for_roots(
                 [r.id for r in roots],
                 db=db,
                 limit_per_root=REPLY_PREVIEW_LIMIT,
-                sort=sort_mode,
                 current_user_id=current_user_id,
             )
             comment_ids = [c.id for c in roots] + [c.id for c, _ in reply_previews]
@@ -173,8 +174,8 @@ class CommentService:
                 if current_user_id is not None
                 else set()
             )
-            result = _build_comment_tree(roots, reply_previews, liked_ids, sort=sort_mode)
-        return result, has_more
+            result = _build_comment_tree(roots, reply_previews, liked_ids)
+        return result, total
 
     @classmethod
     async def get_replies(

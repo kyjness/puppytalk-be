@@ -45,6 +45,28 @@ class Comment(Base):
             "id",
             postgresql_where=(deleted_at.is_(None)) & (is_blinded.is_(False)),
         ),
+        # 루트 목록의 두 정렬 축(ADR 0016). offset 페이지는 매 요청 정렬을 타므로 순서까지
+        # 인덱스로 받는다 — post_id 단일 인덱스만으로는 파티션 전체를 읽고 정렬해야 한다.
+        # ASC로 선언해도 되는 이유: post_id 등치 뒤 두 축이 모두 DESC라 btree 역방향
+        # 스캔으로 그대로 커버된다(방향이 섞일 때만 DESC 선언이 필요하다).
+        # 부분 술어는 쿼리의 parent_id IS NULL·is_blinded=false와 일치시킨다. 삭제 루트는
+        # placeholder로 살아남을 수 있어 deleted_at은 술어에 넣지 않는다.
+        # 대가: like_count가 인덱스에 들어가므로 좋아요 UPDATE가 HOT 업데이트 경로를 잃는다
+        # (변경 튜플이 이 행의 **모든** 인덱스에 새 엔트리를 만든다). 인기순 읽기를 위해
+        # 쓰기 쪽에서 치르는 값이다 — 좋아요가 읽기보다 많아지면 재검토 대상.
+        Index(
+            "idx_comments_post_popular",
+            "post_id",
+            "like_count",
+            "id",
+            postgresql_where=(parent_id.is_(None)) & (is_blinded.is_(False)),
+        ),
+        Index(
+            "idx_comments_post_latest",
+            "post_id",
+            "id",
+            postgresql_where=(parent_id.is_(None)) & (is_blinded.is_(False)),
+        ),
     )
 
 

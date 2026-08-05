@@ -55,7 +55,10 @@ def _reply_visible_conditions(reply, current_user_id: UUID | None) -> list:
 
 
 def _apply_id_keyset(stmt, *, sort: str, cursor: UUID | None, size: int):
-    """id 기준 keyset 페이지네이션 공통 — 루트 목록과 대댓글 "더보기"가 공유한다.
+    """id 기준 keyset 페이지네이션 — 대댓글 "더보기" 전용(ADR 0016).
+
+    루트 목록은 인기순(변동값 정렬)을 받으면서 offset+total로 옮겨 갔고, 대댓글만
+    남았다 — parent_id·id 축은 불변이라 커서가 여전히 맞다.
 
     비교 방향과 정렬 방향이 어긋나면 페이지가 조용히 겹치거나 빠진다. 규칙을 한 곳에 둔다.
     size+1로 오버페치해 호출부가 split_page로 has_more를 가른다.
@@ -196,17 +199,31 @@ class CommentsRepository:
         )
 
     @classmethod
-    async def get_root_comments(
+    async def page_root_comments(
         cls,
         post_id: UUID,
+        offset: int,
         size: int,
         *,
         db: AsyncSession,
-        cursor: UUID | None = None,
         sort: str = "latest",
         current_user_id: UUID | None = None,
-    ) -> list[Comment]:
-        """루트 댓글을 keyset로 조회한다(size+1건으로 has_more 판정).
+    ) -> tuple[list[Comment], int]:
+        """루트 댓글 한 페이지와 **전체 건수**를 함께 조회한다(offset 기반, ADR 0016).
+
+        인기순(`like_count DESC`)은 정렬 축이 변동값이라 keyset 커서가 드리프트한다 —
+        댓글은 게시글 1건에 국한된 유한 집합이므로 offset+total로 간다. 대댓글은
+        여전히 커서다(get_replies_page).
+
+        정렬은 어느 축이든 불변인 id를 타이브레이커로 붙여 **전순서**를 만든다 —
+        같은 like_count 안에서 페이지마다 순서가 흔들리면 offset 경계가 새어 나간다.
+
+        total은 **COUNT를 따로 돈다**(admin 피드와 같은 형태). 한 쿼리로 끝내려고
+        `count() over ()`를 얹으면 안 된다 — 빈 PARTITION의 윈도우 집계는 첫 행을 내기 전에
+        매칭 행을 전부 소비하므로 LIMIT이 무력화되고, 정렬도 인덱스로 못 받아 Sort 노드가
+        생긴다(실측: WindowAgg→Sort→Limit). 행마다 작성자 JOIN 2개와 상관 EXISTS가 붙는
+        스캔이라 그 차이가 그대로 비용이다. 지금 형태는 Index Scan Backward로 offset+size에서
+        끊기고, COUNT 쪽은 eager load·ORDER BY 없이 조건만 센다.
 
         삭제된 루트는 표시 가능한 대댓글이 하나라도 있을 때만 placeholder로 살린다
         (EXISTS를 SQL에서 걸어 페이지 크기를 정확히 유지). 대댓글 preview는
@@ -216,22 +233,32 @@ class CommentsRepository:
         reply_exists = exists(1).where(
             reply.parent_id == Comment.id, *_reply_visible_conditions(reply, current_user_id)
         )
-        stmt = (
-            select(Comment)
-            .where(
-                Comment.post_id == post_id,
-                Comment.parent_id.is_(None),
-                Comment.is_blinded.is_(False),
-                or_(Comment.deleted_at.is_(None), reply_exists),
-            )
-            .options(*_comment_author_loads())
-        )
+        conds = [
+            Comment.post_id == post_id,
+            Comment.parent_id.is_(None),
+            Comment.is_blinded.is_(False),
+            or_(Comment.deleted_at.is_(None), reply_exists),
+        ]
         root_not_blocked = author_not_blocked_clause(Comment.author_id, current_user_id)
         if root_not_blocked is not None:
-            stmt = stmt.where(root_not_blocked)
-        stmt = _apply_id_keyset(stmt, sort=sort, cursor=cursor, size=size)
-        result = await db.execute(stmt)
-        return list(result.unique().scalars().all())
+            conds.append(root_not_blocked)
+
+        order_by = (
+            (Comment.like_count.desc(), Comment.id.desc())
+            if sort == "popular"
+            else (Comment.id.desc(),)
+        )
+        page_stmt = (
+            select(Comment)
+            .where(*conds)
+            .options(*_comment_author_loads())
+            .order_by(*order_by)
+            .offset(offset)
+            .limit(size)
+        )
+        total = await db.scalar(select(func.count()).select_from(Comment).where(*conds))
+        rows = (await db.execute(page_stmt)).unique().scalars().all()
+        return list(rows), int(total or 0)
 
     @classmethod
     async def get_reply_previews_for_roots(
@@ -240,7 +267,6 @@ class CommentsRepository:
         *,
         db: AsyncSession,
         limit_per_root: int,
-        sort: str = "latest",
         current_user_id: UUID | None = None,
     ) -> list[tuple[Comment, int]]:
         """루트별 대댓글 preview(최대 limit_per_root건)와 **부모별 총 표시 가능 개수**를 함께 준다.
@@ -252,17 +278,20 @@ class CommentsRepository:
         윈도우 함수로 루트당 상위 N건만 남기고 총 개수를 같은 쿼리에서 얻는다 —
         쿼리 1회, 행 수는 `루트 수 × N`으로 상한이 잡힌다. 가시성 술어는 목록·더보기와
         같은 _reply_visible_conditions를 공유해 규칙이 갈라지지 않는다.
-        정렬 방향은 루트 정렬과 같게 둔다(기존 트리 조립 시맨틱 보존).
+
+        순서는 항상 최신순(id DESC)이다 — 대댓글엔 좋아요 UI가 없어 인기순이 성립하지 않고,
+        루트 목록의 정렬 축(latest|popular)은 어느 쪽이든 대댓글에 적용할 게 없다.
+        "더보기"(get_replies_page)의 기본값도 같은 방향이라 preview와 이어 받는 순서가
+        어긋나지 않는다.
         """
         if not root_ids:
             return []
-        order_col = Comment.id.asc() if sort == "oldest" else Comment.id.desc()
         visible = _reply_visible_conditions(Comment, current_user_id)
         ranked = (
             select(
                 Comment.id.label("cid"),
                 func.row_number()
-                .over(partition_by=Comment.parent_id, order_by=order_col)
+                .over(partition_by=Comment.parent_id, order_by=Comment.id.desc())
                 .label("rn"),
                 # 같은 파티션 스캔에서 총 개수까지 얻는다 — COUNT 쿼리를 따로 돌지 않는다.
                 func.count().over(partition_by=Comment.parent_id).label("reply_total"),
@@ -292,7 +321,9 @@ class CommentsRepository:
     ) -> list[Comment]:
         """한 루트의 대댓글을 keyset로 조회한다(size+1건으로 has_more 판정) — "더보기" 전용.
 
-        루트 목록(get_root_comments)과 같은 keyset 패턴·같은 가시성 술어를 쓴다.
+        가시성 술어는 목록의 preview(get_reply_previews_for_roots)와 공유한다. 루트 목록은
+        offset으로 옮겨 갔고(ADR 0016) keyset은 여기만 남았다 — 축(parent_id·id)이 불변이라
+        커서가 여전히 맞다.
         """
         stmt = (
             select(Comment)

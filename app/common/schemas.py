@@ -56,9 +56,22 @@ class ApiResponse(BaseSchema, Generic[T]):
 
 
 class PaginatedResponse(BaseSchema, Generic[T]):
+    """offset(page/size) 페이지. total을 함께 준다 — 클라이언트가 쪽수를 계산한다."""
+
     items: list[T] = Field(default_factory=list)
     has_more: bool = False
     total: int = 0
+
+    @classmethod
+    def from_page(
+        cls, items: list[T], *, page: int, size: int, total: int
+    ) -> "PaginatedResponse[T]":
+        """has_more를 라우터마다 다시 유도하지 않게 한 곳에서 만든다.
+
+        마지막 페이지가 정확히 꽉 찼을 때 `<`냐 `<=`냐가 갈리기 쉬운 자리다 —
+        `page*size == total`이면 다음 페이지는 비어 있으므로 has_more는 False.
+        """
+        return cls(items=items, has_more=(page * size) < total, total=total)
 
 
 class CursorPage(BaseSchema, Generic[T]):
@@ -71,6 +84,11 @@ class CursorPage(BaseSchema, Generic[T]):
 def split_page(rows: list[T], size: int) -> tuple[list[T], bool]:
     """size+1 오버페치 결과를 (페이지, has_more)로 가른다 — keyset 페이지네이션 공용."""
     return rows[:size], len(rows) > size
+
+
+def offset_of(page: int, size: int) -> int:
+    """1-base 페이지 번호 → OFFSET. split_page의 offset 쪽 짝."""
+    return (page - 1) * size
 
 
 class RootData(BaseSchema):
