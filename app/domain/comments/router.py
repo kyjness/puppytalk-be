@@ -56,7 +56,7 @@ async def get_comments(
     post_id: Annotated[PublicId, Path(..., description="게시글 공개 ID (Base62)")],
     page: int = Query(1, ge=1, description="1-base 페이지 번호"),
     size: int = Query(10, ge=1, le=100, description="페이지 크기"),
-    sort: str | None = Query(None, description="정렬: latest|popular"),
+    sort: str | None = Query(None, description="정렬: popular(기본)|latest"),
     db: AsyncSession = Depends(get_slave_db),
     current_user: CurrentUser | None = Depends(get_current_user_optional),
 ):

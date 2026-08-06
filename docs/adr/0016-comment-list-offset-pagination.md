@@ -29,12 +29,15 @@
 
 **루트 댓글 목록을 offset + `total`(`PaginatedResponse`)로 전환하고, 대댓글은 커서를 유지한다.**
 
-1. **루트 목록** — `GET /posts/{id}/comments?page=&size=&sort=latest|popular`.
+1. **루트 목록** — `GET /posts/{id}/comments?page=&size=&sort=popular|latest`.
    `page_root_comments(offset, size)`가 한 페이지와 전체 건수를 함께 낸다.
    `has_more = (page * size) < total`.
 2. **정렬 축** — 인기순 `like_count DESC, id DESC` / 최신순 `id DESC`. 어느 쪽이든 **불변인
    id를 타이브레이커**로 붙여 전순서를 만든다 — 같은 `like_count` 안에서 순서가 흔들리면
-   offset 경계가 새어 나간다. 기본값은 최신순, 알 수 없는 값도 최신순으로 떨어진다.
+   offset 경계가 새어 나간다. **기본값은 인기순**, 알 수 없는 값도 인기순으로 떨어진다.
+   좋아요가 같거나 아무도 안 눌린 구간에서는 타이브레이커가 그대로 드러나 **최신순이 된다** —
+   즉 인기순은 "반응받은 댓글을 위로, 나머지는 최신순"이다. 갓 달린 댓글이 묻히지 않는다.
+   이 성질은 uuid7 id가 시간순이라는 전제([ADR 0001](0001-identifier-strategy.md))에 기댄다.
 3. **`total`은 COUNT 쿼리를 따로 돈다** — 페이지 쿼리와 2문장이다
    ([ADR 0012](0012-admin-report-feed-pagination.md)의 admin 피드와 같은 형태).
    한 문장으로 줄이려고 `count() over ()`를 얹는 것은 **틀린 최적화**다: 빈 PARTITION의
