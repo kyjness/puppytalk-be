@@ -82,10 +82,13 @@
 
 ## 아키텍처 · 파이프라인
 
+> **바로 보기 → https://kyjness.github.io/puppytalk-be/architecture-flows.html**
+> (GitHub 파일 뷰어는 HTML을 렌더링하지 않고 소스로 보여줍니다. 위 링크로 여세요.)
+
 시스템 구성(목표 토폴로지·실제 배포)과 요청 처리 파이프라인 다이어그램은
 [`docs/architecture-flows.html`](docs/architecture-flows.html) 한 곳으로 모았습니다 —
 그림 11장(아키텍처 2 · 도메인 의존 관계 1 · 공통 경로 2 · 파이프라인 6)과
-장애 시 동작 표가 들어 있습니다. 브라우저로 열면 됩니다.
+장애 시 동작 표가 들어 있습니다.
 
 | 다루는 것 | 내용 |
 |-----------|------|
