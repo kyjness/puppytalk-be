@@ -50,6 +50,11 @@
 | [0010](docs/adr/0010-storage-backend-strategy.md) | 스토리지 = **S3 API 단일 경로** + dev/CI는 MinIO 패리티 | 로컬 디스크 백엔드(코드 분기·prod 불일치) |
 | [0011](docs/adr/0011-representative-dog-view-relationship.md) | 대표견 = 전용 **뷰 관계** + 부분 유니크 인덱스 | 컬렉션 필터 로드(부분 컬렉션 트랩) |
 | [0012](docs/adr/0012-admin-report-feed-pagination.md) | 관리자 신고 피드 = DB-side **UNION ALL** + offset·total 유지 | 커서 강제(0002의 *의도적 예외* — 저트래픽·변동 정렬·total 필요) |
+| [0013](docs/adr/0013-product-behavior-decisions.md) | 제품 동작 3건 — 단일 세션 · WS 토큰 전달 · 차단 시맨틱 | 건별 ADR 분리(아키텍처가 아닌 제품 결정) |
+| [0014](docs/adr/0014-redis-protocol-boundary.md) | Redis 경계 타입 = `RedisLike` **Protocol** | `isinstance(Redis)` 결합(테스트 대역·폴백 구현 차단) |
+| [0015](docs/adr/0015-index-migration-concurrently.md) | 라이브 테이블 인덱스는 **CONCURRENTLY** | 일반 `CREATE INDEX`(쓰기 잠금 → 사실상 다운타임) |
+| [0016](docs/adr/0016-comment-list-offset-pagination.md) | 댓글 루트 목록 = **offset + `total`**(인기순 복원) | keyset 강제(정렬 축 `like_count`가 변동값이라 커서 불성립) |
+| [0017](docs/adr/0017-demo-deployment-topology.md) | 라이브 데모 = **단일 인스턴스 compose** | 관리형 서비스(RDS·ElastiCache·ALB) — 쇼케이스 등급으로 한정 |
 
 > 횡단 관심사 종합은 [`docs/01-architecture.md`](docs/01-architecture.md), 리팩토링 진행·완료
 > 이력은 [`docs/ROADMAP.md`](docs/ROADMAP.md), 버그·최적화 백로그와 각 항목 근거는
@@ -75,82 +80,20 @@
 
 ---
 
-## 아키텍처 다이어그램
+## 아키텍처 · 파이프라인
 
-### 시스템 토폴로지 (운영 봉투 반영)
+시스템 구성(목표 토폴로지·실제 배포)과 요청 처리 파이프라인 다이어그램은
+[`docs/architecture-flows.html`](docs/architecture-flows.html) 한 곳으로 모았습니다 —
+그림 11장(아키텍처 2 · 도메인 의존 관계 1 · 공통 경로 2 · 파이프라인 6)과
+장애 시 동작 표가 들어 있습니다. 브라우저로 열면 됩니다.
 
-앱 인스턴스는 **stateless**로 3~10대 수평 확장하고, **모든 상태는 인스턴스 밖**(PostgreSQL·Redis·S3)에 둔다.
-실시간(WS·SSE)은 Redis Pub/Sub fan-out으로 인스턴스 경계를 넘어 전달된다.
-
-```mermaid
-flowchart TB
-    FE["클라이언트<br/>Web / Mobile"]
-    ALB["ALB · 무중단 배포<br/>(infra repo · Terraform)"]
-
-    subgraph ECS["ECS — 앱 인스턴스 3~10대 (stateless · gunicorn+uvicorn)"]
-        A1["FastAPI 인스턴스<br/>미들웨어 → router → service → repository"]
-    end
-
-    W["Celery Worker<br/>알림 dispatch · 정리 배치"]
-
-    subgraph STATE["인스턴스 밖 공유 상태"]
-        PGW[("PostgreSQL<br/>Writer")]
-        PGR[("PostgreSQL<br/>Reader")]
-        REDIS[("Redis<br/>캐시 · RTR · RateLimit<br/>조회수 버퍼 · Pub/Sub")]
-        S3["S3 / MinIO<br/>이미지"]
-    end
-
-    OBS["관측성<br/>/metrics(Prometheus)<br/>구조화 로그 → CloudWatch"]
-
-    FE -->|"HTTPS /v1/*"| ALB
-    ALB -->|"헬스 /livez · /readyz"| ECS
-    ALB --> ECS
-    ECS -->|CUD| PGW
-    ECS -->|조회| PGR
-    ECS <-->|"캐시·락·Pub/Sub"| REDIS
-    ECS -->|"presigned · put/get"| S3
-    REDIS <-->|broker| W
-    W --> PGW
-    ECS -. scrape · logs .-> OBS
-```
-
-### 요청 레이어링 · 횡단 관심사
-
-```mermaid
-flowchart LR
-    REQ["요청"] --> MW["미들웨어 체인<br/>RequestId · ProxyHeaders · RateLimit<br/>GZip · AccessLog · Metrics · SecurityHeaders"]
-    MW --> RT["Router<br/>(api/v1)"]
-    RT --> SV["Service<br/>도메인 로직 · 트랜잭션 경계"]
-    SV --> RP["Repository<br/>쿼리"]
-    RP --> MD["Model<br/>SQLAlchemy 2.x"]
-    MD --> DB[("PostgreSQL")]
-    SV <-->|"캐시·락·pub/sub · fail-open"| RD[("Redis")]
-    SV --> RESP["ApiResponse<br/>camelCase + requestId"]
-```
-
-### 조회수 write-behind 버퍼링 (ADR 0007 — 대표 차별점)
-
-초당 수백~수천 조회를 매번 DB write하지 않고, Redis에 버퍼링 후 주기적으로 한 번에 반영한다.
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant App as App 인스턴스
-    participant R as Redis
-    participant DB as PostgreSQL
-    C->>App: POST /v1/posts/{id}/view
-    App->>R: SET view:{id}:{viewer} NX EX  (중복 조회 차단)
-    alt 신규 조회
-        App->>R: HINCRBY views:buffer {id} +1
-    end
-    App-->>C: 200 (DB write 없음)
-    Note over App,DB: 주기 flush — 인스턴스 1대만 (분산락 CAS)
-    App->>R: RENAME buffer → drain  (원자 스왑)
-    App->>DB: UPDATE view_count += delta
-    App->>R: 락 해제 (값 비교 CAS)
-```
-
----
+| 다루는 것 | 내용 |
+|-----------|------|
+| 시스템 구성 | 코드가 전제하는 아키텍처(인스턴스 3~10대·상태는 인스턴스 밖) vs 실제 단일 인스턴스 compose 배포 |
+| 도메인 의존 관계 | 도메인 11개의 import 방향 — `auth·users·media`가 기반, `posts ↔ comments·likes`는 양방향 |
+| 공통 경로 | 미들웨어 스택(429가 CORS 안쪽에서 끊기는 이유) · 계층별 책임과 트랜잭션 경계 |
+| 파이프라인 6종 | 인증 · 게시글 작성(멱등) · 조회수 집계 · 실시간 전달 · 이미지 업로드 · 알림 |
+| 장애 시 동작 | 무엇이 죽으면 코드가 무엇을 하고 사용자가 무엇을 느끼는지 |
 
 ## 아키텍처 · 폴더 구조
 
@@ -160,7 +103,7 @@ sequenceDiagram
 
 ```
 app/
-├── main.py            # FastAPI 앱, lifespan(설정 검증·조회수 flush·채팅 Redis 구독), 미들웨어·라우터
+├── main.py            # FastAPI 앱, lifespan(설정 검증·정리 잡·조회수 flush·Pub/Sub 구독), 미들웨어·라우터
 │                      # 헬스/관측성 엔드포인트: /v1/health · /livez · /readyz · /metrics
 ├── api/
 │   ├── v1/            # /v1 prefix — 도메인 라우터 include + chat REST·WS
@@ -169,7 +112,7 @@ app/
 ├── core/
 │   ├── config.py      # 설정 + 환경별 프로덕션 가드
 │   ├── metrics.py     # 도메인 메트릭(rate-limit 429·캐시 hit/miss·조회수 flush)
-│   └── middleware/    # RequestId · ProxyHeaders · RateLimit · GZip · AccessLog · Metrics · SecurityHeaders
+│   └── middleware/    # RequestId · ProxyHeaders · RateLimit · observability(보안헤더·접근로그·메트릭 한 겹)
 ├── db/                # SQLAlchemy Base·엔진·세션 (PG_UUID 등 공용 타입)
 ├── domain/            # admin · auth · chat · comments · dogs · likes · media
 │                      # · notifications · posts · reports · users
@@ -191,10 +134,10 @@ Dockerfile             # uv 멀티스테이지 · 비루트 · Gunicorn+Uvicorn
 |------|----------------|-----------|-------------|
 | 인증 | `/v1/auth/*` | `domain/auth` | JWT Access/Refresh. Refresh는 **HttpOnly 쿠키 + Redis RTR**, 동시 refresh는 **Lua CAS**로 1건만 성공. 로그아웃은 Access `jti` 블랙리스트. bcrypt는 스레드 오프로딩 + pepper ([0003](docs/adr/0003-distributed-rate-limit.md)) |
 | 게시글 | `/v1/posts/*` | `domain/posts` | **커서** 무한 스크롤([0002](docs/adr/0002-cursor-pagination.md)), `q` 검색은 검증 후 **pg_trgm GIN** ILIKE(와일드카드 이스케이프), 해시태그 연동, 생성은 **멱등**([0008](docs/adr/0008-idempotency-keys.md)) |
-| 조회수 | `POST /v1/posts/{id}/view` | `domain/posts` + Redis | `SET NX EX` 중복 방지 → Redis 버퍼 누적 → 백그라운드 **flush(분산락 CAS)** ([0007](docs/adr/0007-view-count-buffering.md)) |
+| 조회수 | `GET /v1/posts/{id}` 내부 | `domain/posts` + Redis | 전용 엔드포인트 없이 상세 조회에 얹는다. `SET NX EX` 중복 방지 → Redis 버퍼 누적 → 백그라운드 **flush(분산락 CAS)**. 응답값은 DB 값 + 미반영분 합산 ([0007](docs/adr/0007-view-count-buffering.md)) |
 | 인기 게시글 | `GET /v1/posts/trending` | `domain/posts` | time-decay 랭킹 + 3단 fallback. **차단 무관 랭킹 풀을 캐시**하고 차단은 요청별 오버레이(사용자별 캐시 폭발 회피) ([0004](docs/adr/0004-cache-strategy.md)) |
 | 인기 해시태그 | `GET /v1/posts/trending-hashtags` | `domain/posts` | 빈도 집계 + Redis `TypeAdapter` 캐시(TTL·락), fail-open DB 폴백. 캐시 로직은 `infra/cache.py` 공용 헬퍼 ([0004](docs/adr/0004-cache-strategy.md)) |
-| 댓글 | `/v1/comments/*` | `domain/comments` | 루트 **keyset** + 대댓글 배치 로드로 트리 조립(인메모리 슬라이스·하드리밋 제거) |
+| 댓글 | `/v1/comments/*` | `domain/comments` | 기본 정렬 **인기순**. 루트 목록은 정렬 축(`like_count`)이 변동값이라 커서가 성립하지 않아 **offset + `total`**([0016](docs/adr/0016-comment-list-offset-pagination.md)), 대댓글은 축이 불변이라 **커서** 유지 + 배치 로드로 트리 조립 |
 | 좋아요 | `/v1/likes/*` | `domain/likes` | `ON CONFLICT ... RETURNING` 멱등, `like_count` 동기화, `post_is_visible` 경량 EXISTS |
 | 유저 | `/v1/users/*` | `domain/users` | 프로필·비밀번호·탈퇴·차단 목록/토글 |
 | 강아지 | `/v1/dogs/*` | `domain/dogs` | 대표견은 전용 뷰 관계 + 부분 유니크 인덱스로 1마리 불변식 보장 ([0011](docs/adr/0011-representative-dog-view-relationship.md)) |
@@ -381,6 +324,7 @@ docker compose --env-file .env.prod -f compose.prod.yml exec backend python -m a
 |------|------|
 | [00 · 운영 봉투와 범위](docs/00-operating-envelope-and-scope.md) | 모든 설계·복잡도 판정의 단일 근거(전제·과제·재건 순서) |
 | [01 · 아키텍처](docs/01-architecture.md) | 횡단 관심사 결정(식별자·API·트랜잭션·캐시·페이지네이션·관측성·인덱스) |
-| [ADR](docs/adr/) | 핵심 설계 결정 16건 — 각 결정의 트레이드오프와 *안 한 것* |
+| [파이프라인 다이어그램](docs/architecture-flows.html) | 요청 처리 공통 경로 + 파이프라인 6종(인증·게시글·조회수·실시간·업로드·알림) + 장애 시 동작 |
+| [ADR](docs/adr/) | 핵심 설계 결정 17건 — 각 결정의 트레이드오프와 *안 한 것* |
 | [ROADMAP](docs/ROADMAP.md) | RUP-lite 리팩토링 진행·완료 이력(도메인 단위 + 커밋) |
 | [backlog](docs/backlog.md) | 버그·최적화 백로그와 각 항목의 근거·수정 방향 |

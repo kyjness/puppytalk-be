@@ -32,7 +32,9 @@ PuppyTalk 백엔드의 주요 설계 결정을 기록한다. 각 ADR은
 > 0006의 얇은 메트릭(`/metrics` RED)·헬스 분리(`/livez`·`/readyz`)는 Transition(Ops)에서 구현됐다
 > — readiness는 DB=hard·Redis=soft(fail-open)로 구체화(0006 구현 노트).
 > 0009는 chat·notifications 재건 단계에서 기구현된 실시간 설계를 소급 근거화했다.
-> 0012는 [0002](0002-cursor-pagination.md)의 cursor 표준에 대한 *의도적 예외*(admin 저트래픽·변동 정렬·total 필요)를 근거화한다.
+> [0002](0002-cursor-pagination.md)의 cursor 표준에는 *의도적 예외*가 **둘** 있다 — 0012(admin 신고 피드:
+> 저트래픽·변동 정렬·total 필요)와 0016(댓글 루트 목록: 인기순의 정렬 축 `like_count`가 변동값이라
+> keyset 불성립). 둘 다 offset + `total`이며, 그 외 목록은 keyset 표준을 따른다.
 
 ## 형식
 각 ADR: **맥락(문제) → 결정 → 트레이드오프 → 고려한 대안 → 일부러 하지 않은 것.**
