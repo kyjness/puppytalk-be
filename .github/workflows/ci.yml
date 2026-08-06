@@ -1,8 +1,15 @@
 name: CI
 
 on:
+  # 통합 브랜치 둘 다 검사한다. develop이 빠져 있으면 PR을 거치지 않고 들어온 코드
+  # (직접 푸시·Dependabot 머지)가 아무 검사도 받지 않는다.
+  # PR과 머지 후로 CI가 두 번 도는 비용은 감수한다 — 공개 저장소라 무료다.
+  #
+  # 이것이 PR을 대신하지는 못한다: push에는 비교할 base가 없어 dependency-review가
+  # 구조적으로 돌 수 없고(아래 잡 참고), 무엇보다 push 검사는 코드가 이미 들어온 뒤라
+  # 사후 탐지지 사전 차단이 아니다.
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
   # 커밋이 없어도 취약점 재고는 갱신된다 — 주 1회 돌려 pip-audit 결과가 썩지 않게 한다.
   schedule:
