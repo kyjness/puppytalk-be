@@ -206,7 +206,7 @@ class CommentsRepository:
         size: int,
         *,
         db: AsyncSession,
-        sort: str = "latest",
+        sort: str = "popular",
         current_user_id: UUID | None = None,
     ) -> tuple[list[Comment], int]:
         """루트 댓글 한 페이지와 **전체 건수**를 함께 조회한다(offset 기반, ADR 0016).

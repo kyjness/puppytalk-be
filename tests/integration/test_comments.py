@@ -180,13 +180,29 @@ async def test_popular_sort_orders_by_like_count(client: AsyncClient):
     assert [it["id"] for it in latest["items"]] == [second, first]
 
 
-async def test_unknown_sort_falls_back_to_latest(client: AsyncClient):
+async def test_default_and_unknown_sort_fall_back_to_popular(client: AsyncClient):
+    # 기본값은 인기순(ADR 0016). 좋아요를 하나 붙여야 최신순과 결과가 갈려 실제로 검증된다.
     headers = await _signup_login(client, "c_sort@example.com", "정렬퍼피")
     post_id = await _create_post(client, headers)
     created = [await _add_comment(client, headers, post_id, f"루트{i}") for i in range(2)]
+    assert (
+        await client.post(f"/v1/likes/comments/{created[0]}", headers=headers)
+    ).status_code == 200
 
-    data = await _list(client, headers, post_id, sort="oldest")
-    assert [it["id"] for it in data["items"]] == [created[1], created[0]]
+    # sort 미지정과 알 수 없는 값 둘 다 인기순으로 떨어진다.
+    for sort in (None, "oldest"):
+        data = await _list(client, headers, post_id, sort=sort)
+        assert [it["id"] for it in data["items"]] == [created[0], created[1]]
+
+
+async def test_popular_sort_breaks_ties_by_newest(client: AsyncClient):
+    # 좋아요가 전부 없으면 타이브레이커(id DESC)가 그대로 드러나 최신순이 된다.
+    headers = await _signup_login(client, "c_tie@example.com", "동점퍼피")
+    post_id = await _create_post(client, headers)
+    created = [await _add_comment(client, headers, post_id, f"동점{i}") for i in range(3)]
+
+    data = await _list(client, headers, post_id, sort="popular")
+    assert [it["id"] for it in data["items"]] == list(reversed(created))
 
 
 # --- 대댓글 preview + 더보기 (#21) ---

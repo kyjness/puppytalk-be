@@ -147,7 +147,8 @@ class CommentService:
         current_user_id: UUID | None = None,
     ) -> tuple[list[CommentResponse], int]:
         """루트 댓글 한 페이지와 전체 건수 — offset 기반(ADR 0016)."""
-        sort_mode = sort if sort in ("latest", "popular") else "latest"
+        # 기본값은 인기순. 동점(좋아요가 같거나 없음)은 `id DESC`로 갈려 최신순이 된다.
+        sort_mode = sort if sort in ("latest", "popular") else "popular"
         async with db.begin():
             await _ensure_post_visible(post_id, db=db, current_user_id=current_user_id)
             roots, total = await CommentsRepository.page_root_comments(

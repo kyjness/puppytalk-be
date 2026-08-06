@@ -38,7 +38,7 @@ from app.core.ids import new_ulid_str
 from app.core.security import hash_password, password_with_pepper
 from app.db import AsyncSessionLocal
 from app.domain.chat.model import ChatMessage, ChatRoom, normalize_dm_user_ids
-from app.domain.comments.model import Comment
+from app.domain.comments.model import Comment, CommentLike
 from app.domain.comments.repository import CommentsRepository
 from app.domain.dogs.model import DogProfile
 from app.domain.likes.model import PostLike
@@ -470,16 +470,20 @@ async def create_engagement(
     rng: random.Random,
 ) -> None:
     """댓글·대댓글·좋아요와 거기서 파생되는 알림. 비정규화 카운트도 함께 맞춘다."""
-    totals = {"comment": 0, "reply": 0, "like": 0, "notification": 0}
+    totals = {"comment": 0, "reply": 0, "like": 0, "comment_like": 0, "notification": 0}
 
     for post in posts:
         author_id = post.user_id
         roots: list[Comment] = []
         reply_count = 0
 
+        # 댓글도 게시글과 같은 규칙을 따른다(모듈 상단 1번) — 삽입 순서대로 시각이 증가해야
+        # uuid7 id 순서와 표시되는 작성일이 일치한다. 글마다 독립 난수를 뿌리면 목록이
+        # "최신순"인데 날짜는 뒤죽박죽으로 보인다(인기순의 동점 타이브레이커도 id다).
+        at = post.created_at
         for _ in range(rng.randint(0, 4)):
             commenter = rng.choice(users)
-            at = post.created_at + timedelta(minutes=rng.randint(5, 600))
+            at = at + timedelta(minutes=rng.randint(5, 600))
             comment = Comment(
                 post_id=post.id,
                 author_id=commenter.id,
@@ -523,6 +527,32 @@ async def create_engagement(
             reply_count = 1
             totals["reply"] += 1
 
+        # 댓글 좋아요 — 댓글 목록의 **기본 정렬이 인기순**(ADR 0016)이라 이게 없으면 데모에서
+        # 인기순과 최신순이 똑같아 보인다. 전부 고르게 뿌리면 그것대로 순위가 안 드러나므로,
+        # 루트의 절반 정도만 좋아요를 받게 두어 "반응받은 댓글이 위로" 가 눈에 보이게 한다.
+        for root in roots:
+            if rng.random() < 0.5:
+                continue
+            comment_likers = rng.sample(users, rng.randint(1, min(5, len(users))))
+            for liker in comment_likers:
+                at = root.created_at + timedelta(minutes=rng.randint(1, 480))
+                db.add(CommentLike(comment_id=root.id, user_id=liker.id, created_at=at))
+                totals["comment_like"] += 1
+                if root.author_id is not None and liker.id != root.author_id and rng.random() < 0.3:
+                    db.add(
+                        Notification(
+                            user_id=root.author_id,
+                            kind=NotificationKind.LIKE_COMMENT.value,
+                            actor_id=liker.id,
+                            post_id=post.id,
+                            comment_id=root.id,
+                            read_at=None if rng.random() < 0.34 else at,
+                            created_at=at,
+                        )
+                    )
+                    totals["notification"] += 1
+            root.like_count = len(comment_likers)
+
         likers = rng.sample(users, rng.randint(0, min(6, len(users))))
         for liker in likers:
             at = post.created_at + timedelta(minutes=rng.randint(1, 900))
@@ -548,7 +578,8 @@ async def create_engagement(
     await db.flush()
     print(
         f"  - 댓글 {totals['comment']}건 · 대댓글 {totals['reply']}건 · "
-        f"좋아요 {totals['like']}건 · 알림 {totals['notification']}건"
+        f"좋아요 {totals['like']}건(댓글 {totals['comment_like']}건) · "
+        f"알림 {totals['notification']}건"
     )
 
 

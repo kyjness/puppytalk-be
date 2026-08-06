@@ -5,8 +5,10 @@ name: CodeQL
 # CI를 막지는 않는다: 결과는 Security 탭에 쌓이고, 심각한 건은 거기서 판단한다.
 
 on:
+  # ci.yml과 같은 이유로 통합 브랜치 둘 다 본다 — PR을 거치지 않고 develop에 들어온 코드가
+  # taint 분석을 통째로 건너뛰지 않도록.
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
   # 코드가 그대로여도 쿼리 팩은 갱신된다 — 주 1회 재분석해 새 규칙이 옛 코드를 훑게 한다.
   schedule:
