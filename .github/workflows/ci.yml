@@ -1,9 +1,19 @@
 name: CI
 
 on:
+  # 통합 브랜치 둘 다 검사한다. develop이 빠져 있으면 PR을 거치지 않고 들어온 코드
+  # (직접 푸시·Dependabot 머지)가 아무 검사도 받지 않는다.
+  # PR과 머지 후로 CI가 두 번 도는 비용은 감수한다 — 공개 저장소라 무료다.
+  #
+  # 이것이 PR을 대신하지는 못한다: push에는 비교할 base가 없어 dependency-review가
+  # 구조적으로 돌 수 없고(아래 잡 참고), 무엇보다 push 검사는 코드가 이미 들어온 뒤라
+  # 사후 탐지지 사전 차단이 아니다.
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
+  # 커밋이 없어도 취약점 재고는 갱신된다 — 주 1회 돌려 pip-audit 결과가 썩지 않게 한다.
+  schedule:
+    - cron: "0 0 * * 1"
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -18,9 +28,9 @@ jobs:
     name: lint · format · type · vulture
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
       - name: Sync (dev)
@@ -58,7 +68,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: ap-northeast-2
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # 공식 minio 이미지는 `server /data` 인자가 필요해 GH service로 못 띄우므로 docker run으로 기동.
       - name: Start MinIO
         run: |
@@ -76,7 +86,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: minioadmin
           AWS_DEFAULT_REGION: ap-northeast-2
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
       - name: Sync (dev)
@@ -84,14 +94,76 @@ jobs:
       - name: Run tests
         run: uv run pytest tests/unit tests/integration -q
 
+  migrations:
+    name: alembic upgrade · downgrade
+    # 테스트는 conftest의 create_all로 스키마를 세운다 — 즉 **마이그레이션은 어디서도
+    # 실행되지 않는다**. 리비전 체인이 끊기거나 CONCURRENTLY를 트랜잭션 안에서 돌리는
+    # 실수를 해도 CI는 초록이고 배포에서 처음 터진다. 그 구멍을 여기서 막는다.
+    #
+    # autogenerate 드리프트 검사는 넣지 않았다 — 이 스키마에서 돌려 보면 unique 제약 vs
+    # unique 인덱스 표현 차이, 인덱스 이름 등으로 오탐이 수십 건 나온다(실측). 걸러내려면
+    # include_object/compare_type 튜닝이 필요한데, 그건 이 잡의 목적(체인이 실제로 도는가)과
+    # 별개의 작업이다.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: puppytalk_mig
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      WRITER_DB_URL: postgresql+psycopg://postgres:postgres@localhost:5432/puppytalk_mig
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - name: Sync (dev)
+        run: uv sync --extra dev --frozen
+      - name: Upgrade to head
+        run: uv run alembic upgrade head
+      - name: Downgrade 1 → upgrade (되돌리기가 실제로 되는지)
+        # 롤백이 안 되는 마이그레이션은 사고 때 알게 된다. 최신 리비전만이라도 왕복시킨다.
+        run: |
+          uv run alembic downgrade -1
+          uv run alembic upgrade head
+
+  dependency-review:
+    name: 의존성 리뷰 (PR 한정 · 새로 들어온 취약점만)
+    # 이 PR이 **새로 들여온** 취약 의존성만 막는다 — 기존 부채에 발이 묶이지 않으면서
+    # 회귀는 확실히 잡는 조합. push에는 비교할 base가 없어 PR 전용.
+    #
+    # 리포의 Dependency graph 설정이 켜져 있어야 동작한다(UI 전용 토글). 꺼지면 이 잡은
+    # "not supported"로 실패한다 — 그때 continue-on-error로 덮지 말고 설정을 다시 켤 것.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+
   security:
     name: pip-audit (informational)
+    # 블로킹하지 않는 이유: 이건 **현재 트리 전체**를 감사한다. pip-audit엔 심각도 필터가
+    # 없어서, 어제까지 초록이던 PR이 오늘 공개된 전이 의존성 CVE 하나로 막힌다
+    # (이미 --ignore-vuln 예외를 하나 달고 있는 것이 그 증거다). 새로 들여오는 취약점은
+    # 위 dependency-review가 막고, 여기는 재고 파악용으로 둔다.
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
       - name: Sync (dev)
@@ -103,19 +175,19 @@ jobs:
     runs-on: ubuntu-latest
     needs: [quality, test]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
       # main push일 때만 GHCR 로그인·push. PR/기타 브랜치는 빌드 검증만.
       - name: Log in to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: docker/login-action@v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build (and push on main)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}

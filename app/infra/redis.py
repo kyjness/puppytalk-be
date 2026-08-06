@@ -104,19 +104,33 @@ def bulk_to_str(value: Any) -> str | None:
     return str(value)
 
 
+def create_redis_client() -> RedisLike | None:
+    """설정에서 클라이언트를 만든다(연결 확인은 호출부). REDIS_URL이 비면 None.
+
+    풀 옵션(max_connections·decode_responses)이 여기에만 있어야 한다 — 앱 lifespan·워커·
+    운영 CLI가 각자 만들면 그중 하나만 옵션이 빠지는 식으로 조용히 갈라진다.
+    """
+    if not settings.REDIS_URL:
+        return None
+    pool = ConnectionPool.from_url(
+        settings.REDIS_URL,
+        max_connections=settings.REDIS_MAX_CONNECTIONS,
+        decode_responses=True,
+    )
+    # RedisLike 주석은 실클라이언트가 Protocol 계약을 만족하는지 타입 수준에서 강제한다.
+    client: RedisLike = Redis(connection_pool=pool)
+    return client
+
+
 async def init_redis(app) -> None:
     app.state.redis = None
     if not settings.REDIS_URL:
         return
     try:
-        pool = ConnectionPool.from_url(
-            settings.REDIS_URL,
-            max_connections=settings.REDIS_MAX_CONNECTIONS,
-            decode_responses=True,
-        )
-        # RedisLike 주석은 실클라이언트가 Protocol 계약을 만족하는지 타입 수준에서 강제한다.
-        client: RedisLike = Redis(connection_pool=pool)
+        client = create_redis_client()
         app.state.redis = client
+        if client is None:
+            return
         await client.ping()
         log.info(
             "Redis connection pool initialized (max_connections=%s).",

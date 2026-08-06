@@ -12,9 +12,12 @@ from sqlalchemy import text
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+# 기본값은 docker-compose.yml·.env.example의 로컬 스택과 같아야 한다 — 여기만 다른 값을
+# 들고 있으면 TEST_DB_URL을 매번 export해야 통합 테스트가 돈다(CI는 잡 env로 넘겨서
+# 티가 안 나고, 로컬에서만 인증 실패로 터진다).
 TEST_DB_URL = os.getenv(
     "TEST_DB_URL",
-    "postgresql+psycopg://postgres:0730@127.0.0.1:5432/puppytalk_test",
+    "postgresql+psycopg://postgres:postgres@127.0.0.1:5432/puppytalk_test",
 )
 
 

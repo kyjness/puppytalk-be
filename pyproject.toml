@@ -82,6 +82,10 @@ run = "python3 -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000"
 celery-worker = "celery -A app.core.celery:celery_app worker -Q default,high_priority -l info --concurrency=2"
 celery-beat = "celery -A app.core.celery:celery_app beat -l info"
 migrate = "python3 -m alembic upgrade head"
+# 관리자 권한 부여·회수(+인증 스냅샷 캐시 무효화). 예: poe grant-admin --email me@example.com
+grant-admin = "python3 -m app.scripts.grant_admin"
+# 공개 데모 계정·콘텐츠 시드(로그인 화면의 "데모 계정으로 둘러보기"가 쓰는 계정).
+seed-demo = "python3 -m app.scripts.seed_demo"
 
 # 전체 스택 로컬 실행 (인프라 docker + 백엔드·프론트 호스트 reload). 자세한 옵션은 dev.sh 참고.
 stack = "bash dev.sh"

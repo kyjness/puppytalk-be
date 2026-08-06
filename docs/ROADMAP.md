@@ -32,6 +32,7 @@
 - [x] **comments / likes** — #11 twin 대표견만 로드 · #6 트리 페이지네이션 · #15 좋아요 카운터 중복
   - [x] #11 twin: 댓글 작성자 대표견만 로드(`_comment_author_loads`, posts와 동형)
   - [x] #6: 루트 keyset + 대댓글 부모별 배치 로드 + `CursorPage`(ADR 0002 결정을 코드로). 인메모리 슬라이스·500 cap·부정확 total 제거. 좋아요 keyset 드리프트 부정당 → 인기순(popular) 정렬 제거
+    - 이후 인기순이 제품 요구로 복원됐다 — 루트 목록만 offset+`total`로 전환([ADR 0016](adr/0016-comment-list-offset-pagination.md)), 대댓글은 커서 유지. "변동 축에 keyset을 얹지 않는다"는 판단은 그대로다
   - [x] #15: 좋아요 카운터를 `CommentsModel`로 일원화(`CommentLikesModel` 중복 제거, posts 패턴 정합)
   - [x] 별건: 게시글 목록 `is_liked` 항상 False 버그 수정(배치 조회)
   - [x] 테스트: 트리 조립 단위(`test_comment_tree`) + keyset·삭제 시맨틱·is_liked·무이중집계 통합(`test_comments`·`test_posts`)
@@ -167,7 +168,26 @@
   - [x] #36 결정 반영·문서화 — 트렌딩 `window_hours` 제거·24h 고정(ADR 0004), 단일 세션·
         WS 토큰 쿼리스트링·차단 비대칭은 ADR 0013 신설로 확정
 
+## 3차 감사 — backlog #37~#43
+
+- [x] **#38** 댓글 블라인드 ↔ 게시글 `comment_count` 정합 — 조건부 UPDATE + RETURNING
+      (`blind_if_visible`·`unblind_if_blinded`)으로 전이를 원자화(중복 블라인드가 카운트를 깎지 않는다)
+- [x] **#39** 트렌딩 해시태그 집계 창 — `window_hours`(기본 24)·`name ASC` tie-breaker·희소 시 전체 기간 1회 폴백
+- [x] **#40** 주기 정리 잡 분산 락 — `PeriodicJob`에 `lock_ttl_seconds`, `run_jobs_once`가 `lock:job:{name}`으로
+      배타 실행. 요청 유발 sweep과 같은 키를 공유해 서로를 배제
+- [x] **#41** 인덱스 마이그레이션 — 라이브 테이블은 `postgresql_concurrently` ([ADR 0015](adr/0015-index-migration-concurrently.md))
+- [x] **#42** 실시간 연결 상한 — `REALTIME_MAX_CONNECTIONS_PER_USER`(기본 5)를 SSE·WS가 공유
+- [x] **#43** 차단 목록 페이지네이션 — `CursorPage[BlockedUserItem]`, 커서 축 `blocked_id`
+- [x] 댓글 목록 기본 정렬 **인기순 복원** — 루트 목록을 offset + `total`로 전환
+      ([ADR 0016](adr/0016-comment-list-offset-pagination.md), `480a2ba0`). [`01`](01-architecture.md) C2에 개정 노트 반영
+- [x] 라이브 데모 배포 — 단일 인스턴스 compose + Caddy ([ADR 0017](adr/0017-demo-deployment-topology.md))
+- [ ] **#37** 실시간 전달 심화 — 큐 기반 소켓별 전달 (P2 · 이연. 연결 상한은 #42로 선반영)
+
 ## 완료 유닛 (커밋)
+
+> 아래 표는 Construction~Transition 초기까지의 기록이다. 이후(2차·3차 감사) 작업은 위 체크리스트가
+> 단위별로 대체한다 — 커밋 해시는 `git log`로 추적한다.
+
 | 단위 | 커밋 |
 |------|------|
 | 설정 pydantic-settings | `919d0cbd` |

@@ -59,11 +59,10 @@ async def get_reported_posts(
     db: AsyncSession = Depends(get_master_db),
 ):
     items, total = await AdminService.get_reported_posts(page=page, size=size, db=db)
-    has_more = (page * size) < total
     return api_response(
         request,
         code=ApiCode.OK,
-        data=PaginatedResponse(items=items, has_more=has_more, total=total),
+        data=PaginatedResponse.from_page(items, page=page, size=size, total=total),
     )
 
 

@@ -1,0 +1,42 @@
+name: CodeQL
+
+# 정적 보안 분석(SQL 인젝션·경로 조작·안전하지 않은 역직렬화 등). 공개 저장소라 무료다.
+# ruff·pyright가 잡는 것과 겹치지 않는다 — 저쪽은 스타일·타입, 이쪽은 데이터 흐름(taint)이다.
+# CI를 막지는 않는다: 결과는 Security 탭에 쌓이고, 심각한 건은 거기서 판단한다.
+
+on:
+  # ci.yml과 같은 이유로 통합 브랜치 둘 다 본다 — PR을 거치지 않고 develop에 들어온 코드가
+  # taint 분석을 통째로 건너뛰지 않도록.
+  push:
+    branches: [main, develop]
+  pull_request:
+  # 코드가 그대로여도 쿼리 팩은 갱신된다 — 주 1회 재분석해 새 규칙이 옛 코드를 훑게 한다.
+  schedule:
+    - cron: "0 1 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        with:
+          languages: python
+          # security-extended: 기본 쿼리셋 + 정밀도가 조금 낮지만 실효 있는 규칙까지.
+          queries: security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        with:
+          category: "/language:python"

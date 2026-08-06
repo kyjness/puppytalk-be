@@ -22,7 +22,19 @@
 
 | 항목 | 현행 | 결정 |
 |------|------|------|
-| **페이지네이션** | posts는 UUIDv7 PK **keyset**(모범), admin·댓글은 인메모리(#5·#6) | **keyset(cursor) 표준으로 통일**. 인메모리 제거. 응답 = `{items, has_more, next_cursor}` — **`total` 제거**(#10, COUNT 비용·의미 약함). 댓글 트리는 "루트 keyset + 대댓글 부모별 로드" |
+| **페이지네이션** | posts는 UUIDv7 PK **keyset**(모범), admin·댓글은 인메모리(#5·#6) | **keyset(cursor) 표준으로 통일**. 인메모리 제거. 응답 = `{items, has_more, next_cursor}` — **`total` 제거**(#10, COUNT 비용·의미 약함). 댓글 트리는 "루트 keyset + 대댓글 부모별 로드" ⚠️ *아래 개정 참조* |
+
+> **개정 — 페이지네이션 (2건, 후속 ADR로 일부 뒤집힘).**
+> 위 "keyset 전면 통일"은 Elaboration 시점의 결정이며, 이후 두 곳에서 **의도적 예외**가 확정됐다.
+> 표준 자체(기본은 keyset·`total` 제거)는 유지되고, 예외는 아래 둘뿐이다.
+>
+> | 대상 | 현재 | 근거 |
+> |------|------|------|
+> | 관리자 신고 피드 | DB-side `UNION ALL` + **offset·`total` 유지** | [ADR 0012](adr/0012-admin-report-feed-pagination.md) — 저트래픽·변동 정렬·`total` 필요 |
+> | **댓글 루트 목록** | **offset + `total`** (기본 정렬 인기순) | [ADR 0016](adr/0016-comment-list-offset-pagination.md) — 정렬 축 `like_count`가 변동값이라 keyset 불성립. 게시글 1건에 국한된 유한 집합이라 deep-offset이 실질 문제가 아님 |
+>
+> 대댓글(`/{comment_id}/replies`)은 정렬 축이 불변이라 **커서를 유지**한다.
+> 즉 위 표의 "루트 keyset + 대댓글 부모별 로드"는 **루트/대댓글이 반대로 뒤집힌 상태**가 현재다.
 | **인덱스** | pg_trgm GIN·부분 인덱스·FK 인덱스 (양호) | 원칙: **"조회 패턴이 인덱스를 결정"**, 추가·제거는 Alembic + EXPLAIN 근거. **`UserBlock` 중복 UniqueConstraint 제거**(#13). chat 미읽음(#16)은 쿼리 수정 우선 |
 | **낙관적 락** | `version`(User·Post만), ORM 수정 경로 | **현행 유지 · 확장 안 함.** "동시 수정 충돌이 실재하는 애그리거트에만, 남발 금지". 조회수는 Core update라 무관 |
 
@@ -61,6 +73,13 @@
 | 0008 | POST 멱등성 — Idempotency-Key + 결과 캐시 | 도메인(posts) | Construction |
 | 0009 | 실시간 전달 — WebSocket·SSE × Redis Pub/Sub | 도메인(chat·notifications) | Construction |
 | 0010 | 스토리지 백엔드 — S3 API 단일 경로 + dev MinIO 패리티(local 폐기) | 도메인(media)·Ops | Construction |
+| 0011 | 대표견 — 전용 뷰 관계 + 부분 유니크 인덱스 | 도메인(dogs) | Construction |
+| 0012 | 관리자 신고 피드 — UNION ALL + offset 유지 (**0002의 예외**) | 도메인(admin) | Construction |
+| 0013 | 제품 동작 — 단일 세션 · WS 토큰 전달 · 차단 시맨틱 | 제품 동작 | Construction |
+| 0014 | Redis 경계 타입 — `RedisLike` Protocol | 횡단 | Construction |
+| 0015 | 인덱스 마이그레이션 — 라이브 테이블은 `CONCURRENTLY` | 횡단·Ops | 3차 감사 |
+| 0016 | 댓글 루트 목록 — offset + `total` (**0002의 예외**) | 도메인(comments) | 3차 감사 |
+| 0017 | 라이브 데모 배포 — 단일 인스턴스 compose | Ops | Transition |
 
 > ADR 형식: **맥락(문제) → 결정 → 트레이드오프 → 고려한 대안 → 일부러 안 한 것.**
 > "안 한 선택"(#0005 CB, #0006 트레이싱)이 오히려 *정당화된 복잡도*의 핵심 전시물.

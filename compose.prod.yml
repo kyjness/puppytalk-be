@@ -1,0 +1,130 @@
+name: puppytalk-prod
+
+# 라이브 데모 배포 스택 — 인스턴스 한 대에서 도는 전부.
+# 로컬(docker-compose.yml)과 다른 점 세 가지:
+#   1) 이미지를 빌드하지 않고 GHCR에서 pull한다(CI가 main 푸시마다 올린다).
+#   2) MinIO가 없다 — 미디어는 실제 S3. presigned POST URL이 S3_ENDPOINT_URL 기준으로
+#      브라우저에게 전달되므로, 내부 전용 엔드포인트를 두면 업로드가 깨진다.
+#   3) 외부로 열리는 포트는 caddy(80·443)뿐. db·redis·backend는 컴포즈 네트워크 안에만 있다.
+#
+# 실행(서버에서):
+#   docker compose --env-file .env.prod -f compose.prod.yml up -d
+#   ※ --env-file 은 ${VAR} 치환용, 각 서비스의 env_file 은 컨테이너 환경 변수용. 둘 다 필요하다.
+
+x-logging: &logging
+  # 디스크가 60GB뿐이라 로그 회전 상한을 둔다 — 무한 증가하면 며칠 만에 디스크를 채운다.
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-app: &app
+  image: ${BACKEND_IMAGE:-ghcr.io/kyjness/puppytalk:latest}
+  restart: unless-stopped
+  env_file: .env.prod
+  logging: *logging
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: puppytalk-prod-caddy
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - "80:80" # ACME HTTP-01 챌린지 + HTTPS 리다이렉트
+      - "443:443"
+    environment:
+      # API_DOMAIN=:80 으로 두면 TLS 없이 평문 80 — 로컬 스모크용.
+      API_DOMAIN: ${API_DOMAIN:-api.puppytalk.shop}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # 발급받은 인증서. 날리면 Let's Encrypt 발급 한도에 걸린다
+      - caddy_config:/config
+    depends_on:
+      - backend
+
+  backend:
+    <<: *app
+    container_name: puppytalk-prod-backend
+    # 마이그레이션은 여기서만 돌린다 — worker와 동시에 upgrade하면 alembic 버전 테이블에서 경합한다.
+    # 워커 2개는 2GB 인스턴스 기준(하나당 ~200MB).
+    command: >
+      sh -c "alembic upgrade head &&
+             exec gunicorn app.main:app -w 2 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000"
+    expose:
+      - "8000"
+
+  worker:
+    <<: *app
+    container_name: puppytalk-prod-worker
+    # 큐 2종은 app/core/celery.py 의 task_queues·task_routes 와 일치해야 한다.
+    command: >
+      celery -A app.core.celery:celery_app worker
+      -Q default,high_priority --concurrency=2 --loglevel=info
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started # 마이그레이션이 먼저 돌도록
+
+  db:
+    image: postgres:15-alpine
+    container_name: puppytalk-prod-db
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: puppytalk-prod-redis
+    restart: unless-stopped
+    logging: *logging
+    # appendonly: 재시작해도 조회수 버퍼·멱등성 키가 남는다.
+    # maxmemory: 2GB 인스턴스에서 Redis가 무한히 자라 호스트를 OOM으로 끌어내리지 않게 상한.
+    #   정책은 allkeys-lru — 조회수 버퍼처럼 TTL 없는 키가 있어 volatile-* 를 쓰면 상한에
+    #   닿는 순간 쓰기가 에러로 떨어진다. 앱은 Redis 실패를 fail-open으로 흡수하므로(ADR 0005),
+    #   에러보다 오래된 키를 버리는 쪽이 낫다.
+    command: >
+      redis-server --appendonly yes
+      --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  default:
+    name: puppytalk-prod
+    ipam:
+      config:
+        # 고정 서브넷 — .env.prod 의 TRUSTED_PROXY_IPS 와 같은 값이어야 한다.
+        # 이게 어긋나면 Caddy가 붙인 X-Forwarded-For를 앱이 신뢰하지 않아
+        # 모든 요청이 프록시 IP 하나로 수렴하고, rate limit이 사이트 전체를 429로 조인다.
+        - subnet: 172.30.0.0/24

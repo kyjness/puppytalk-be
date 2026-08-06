@@ -1,10 +1,13 @@
 # 빌드 컨텍스트 축소·캐시 안정화. README.md는 builder가 COPY하므로 제외하지 않는다.
+# 운영 CLI(app/scripts/)는 app/ 안에 있어 자동으로 포함된다 — 배포 후 컨테이너에서
+# `python -m app.scripts.seed_demo`·`grant_admin`을 돌린다. 루트 scripts/ 에는 호스트에서
+# 도는 backup_db.sh만 남아 이미지에 넣을 이유가 없다.
+scripts
 .git
 .github
 .venv
 tests
 docs
-scripts
 dev.sh
 upload
 
