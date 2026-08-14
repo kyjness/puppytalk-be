@@ -27,7 +27,9 @@ Rate limit이 필요하다: 로그인 brute-force, 회원가입 이미지 업로
    직접 검사한다. 정책은 미들웨어와 같은 단일 진입점 `check_fixed_window`를 공유하되,
    남용 방어 경로라 fail-open이 아니라 **메모리 폴백**(로그인·업로드와 동급). 추가 방어:
    거부 후 retry_after 동안 Redis 왕복 없이 로컬 즉시 거부(스팸의 공유 Redis 부하 증폭
-   차단), 연속 거부 누계 30회면 1008 종료. 거부 계측은 억제 창 포함 전부
+   차단), 연속 거부 누계 30회면 4002 종료(레이트리밋 전용 코드 — 1008은 인증 실패
+   전용이라 뭉치면 클라이언트가 스로틀을 재로그인 사유로 오인한다. 코드 계약은
+   [ADR 0009](0009-realtime-delivery.md) 참조). 거부 계측은 억제 창 포함 전부
    `count_rejection`으로 `RATE_LIMIT_REJECTIONS{limit="chat"}`에 잡힌다.
 5. **미디어 presign 한도 재편**(2차 감사 #24·#31, direct 업로드 제거와 함께) —
    - **비인증(signup)**: 한도 대상 경로를 `signup/presign`·`signup/confirm`으로 이전.

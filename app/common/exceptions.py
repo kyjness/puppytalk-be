@@ -156,7 +156,24 @@ class NotFoundException(BaseProjectException):
     code = ApiCode.NOT_FOUND
 
 
+# --- WebSocket close code 어휘 (ADR 0009) ---
+# 1008은 인증·권한 실패 전용이고, 용량 사유는 4000~4999 애플리케이션 대역으로 분리한다.
+# 사유마다 클라이언트의 복구 동작이 다르기 때문이다 — 1008=재인증, 4001=재연결 포기,
+# 4002=백오프 재연결. 한 코드로 뭉치면 클라이언트가 연결 상한·레이트리밋에 걸린 것뿐인데도
+# 로그인 세션을 폐기한다(실제로 그랬다). 새 WS 표면도 이 상수를 써야 어휘가 갈라지지 않는다.
+WS_CLOSE_CONNECTION_LIMIT = 4001  # 유저당 동시 연결 상한 초과 — 재연결해도 같은 결과
+WS_CLOSE_RATE_LIMIT = 4002  # 레이트리밋 초과 — 백오프 후 재연결하면 회복
+
+
 def ws_close_code(exc: BaseProjectException) -> int:
     """WebSocket 표면의 예외 → close code. 선언된 status_code에서 파생한다 —
-    4xx는 1008(정책 위반), 5xx는 1011(내부 오류). 예외별 매핑을 따로 두지 않는다."""
-    return 1011 if exc.status_code >= 500 else 1008
+    429는 4002(용량), 그 외 4xx는 1008(정책 위반), 5xx는 1011(내부 오류).
+
+    429를 1008에서 갈라내는 이유는 위 상수 주석과 같다 — 여기서 1008로 뭉치면
+    클라이언트가 스로틀을 인증 실패로 오인해 세션을 폐기한다.
+    """
+    if exc.status_code >= 500:
+        return 1011
+    if exc.status_code == 429:
+        return WS_CLOSE_RATE_LIMIT
+    return 1008

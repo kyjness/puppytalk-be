@@ -26,6 +26,8 @@ from app.common import (
     api_response,
 )
 from app.common.exceptions import (
+    WS_CLOSE_CONNECTION_LIMIT,
+    WS_CLOSE_RATE_LIMIT,
     BaseProjectException,
     UnauthorizedException,
     UserNotFoundException,
@@ -142,7 +144,7 @@ async def list_room_messages(
 
 # --- WebSocket ---
 
-# 한도 초과 후에도 계속 밀어붙이는 클라이언트는 끊는다(1008) — 한도 초과 스팸이
+# 한도 초과 후에도 계속 밀어붙이는 클라이언트는 끊는다 — 한도 초과 스팸이
 # 프레임당 응답 생성·Redis 왕복으로 남는 것조차 막는 마지막 단계.
 _REJECT_CLOSE_THRESHOLD = 30
 
@@ -196,8 +198,10 @@ async def chat_dm_websocket(websocket: WebSocket) -> None:
 
     await websocket.accept()
     if not await chat_connection_manager.connect(user_id, websocket):
-        # 1008 = policy violation. 클라이언트가 무한 재연결하지 않도록 사유를 실어 보낸다.
-        await websocket.close(code=1008, reason="Too many concurrent connections")
+        # 재연결해도 상한은 그대로다 — 클라이언트가 무한 재시도하지 않도록 전용 코드로 알린다.
+        await websocket.close(
+            code=WS_CLOSE_CONNECTION_LIMIT, reason="Too many concurrent connections"
+        )
         return
     redis = get_websocket_redis(websocket)
     gate = LocalRejectionGate(f"chat:ws:{user_id}", close_threshold=_REJECT_CLOSE_THRESHOLD)
@@ -214,7 +218,7 @@ async def chat_dm_websocket(websocket: WebSocket) -> None:
             )
             if not allowed:
                 if should_close:
-                    await websocket.close(code=1008, reason="Rate limit exceeded")
+                    await websocket.close(code=WS_CLOSE_RATE_LIMIT, reason="Rate limit exceeded")
                     return
                 await _send_ws_error(
                     websocket,

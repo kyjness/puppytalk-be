@@ -161,6 +161,44 @@ async def test_status_and_block_between_checks_both_directions():
     assert src.count("blocker_id == other_id") == 1
 
 
+# --- WebSocket 종료 코드 계약 ---
+
+
+async def test_ws_close_codes_separate_capacity_from_auth():
+    """용량 사유는 1008에서 갈라져 있어야 한다 — 한 코드로 뭉치면 클라이언트가 연결 상한·
+    레이트리밋을 인증 실패로 오인해 로그인 세션을 폐기한다. 어휘는 ws_close_code 옆
+    (app/common/exceptions.py) 한 곳에 산다."""
+    from app.common.exceptions import (
+        WS_CLOSE_CONNECTION_LIMIT,
+        WS_CLOSE_RATE_LIMIT,
+        TooManyRequestsException,
+        UnauthorizedException,
+        ws_close_code,
+    )
+
+    assert ws_close_code(UnauthorizedException()) == 1008  # 인증 실패는 그대로
+    # 429 예외가 WS 표면에 닿아도 1008이 아니라 용량 코드로 — 스로틀=재로그인 오인 방지.
+    assert ws_close_code(TooManyRequestsException()) == WS_CLOSE_RATE_LIMIT
+    assert WS_CLOSE_CONNECTION_LIMIT == 4001
+    assert WS_CLOSE_RATE_LIMIT == 4002
+    # 4000~4999는 애플리케이션 전용 대역 — 표준 코드와 겹치면 브라우저가 가로챈다.
+    for code in (WS_CLOSE_CONNECTION_LIMIT, WS_CLOSE_RATE_LIMIT):
+        assert 4000 <= code <= 4999
+    assert len({1008, WS_CLOSE_CONNECTION_LIMIT, WS_CLOSE_RATE_LIMIT}) == 3
+
+
+async def test_ws_router_uses_dedicated_close_codes():
+    """라우터가 실제로 전용 상수를 쓰는지 — 상수만 정의하고 1008을 남겨두면 무의미하다."""
+    import inspect
+
+    from app.domain.chat import router as chat_router
+
+    src = inspect.getsource(chat_router.chat_dm_websocket)
+    assert "WS_CLOSE_CONNECTION_LIMIT" in src
+    assert "WS_CLOSE_RATE_LIMIT" in src
+    assert "code=1008" not in src
+
+
 # --- 멤버십 가드 (+커서 행 접기) ---
 
 
@@ -243,8 +281,9 @@ async def test_send_personal_message_disconnects_stalled_socket(monkeypatch):
     await manager.connect(uid, ws)
     await manager.send_personal_message(uid, "x")  # 예외 없이 타임아웃 → 등록 해제 + 종료
     assert manager._by_user == {}
-    # 등록만 지우면 클라이언트가 수신만 조용히 잃는다 — 실제로 닫혀야 재연결이 뜬다
-    assert stalled.closed_with == 1011
+    # 등록만 지우면 클라이언트가 수신만 조용히 잃는다 — 실제로 닫혀야 재연결이 뜬다.
+    # 1013(Try Again Later): 정체 소켓 정리는 서버 오류(1011)가 아니라 재접속 유도다.
+    assert stalled.closed_with == 1013
 
 
 class _DummyWs:

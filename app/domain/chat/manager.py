@@ -75,10 +75,13 @@ class ConnectionManager:
     async def _drop(self, user_id: UUID, ws: WebSocket) -> None:
         """등록 해제 + 연결 종료. 등록만 지우면 클라이언트는 살아 있는 줄 아는 소켓으로
         계속 보내면서 수신만 조용히 잃는다(재연결 로직도 안 뜬다) — 반드시 닫아서
-        클라이언트 측 재연결을 유도한다. 닫기 자체도 정체될 수 있어 짧게 자른다."""
+        클라이언트 측 재연결을 유도한다. 닫기 자체도 정체될 수 있어 짧게 자른다.
+
+        1013(Try Again Later) — 정체·사망 소켓 정리는 서버 오류가 아니라 "재접속해라"이므로
+        1011(내부 오류)을 쓰지 않는다(close code 계약은 ADR 0009)."""
         await self.disconnect(user_id, ws)
         try:
-            await asyncio.wait_for(ws.close(code=1011), timeout=1.0)
+            await asyncio.wait_for(ws.close(code=1013), timeout=1.0)
         except Exception as e:
             log.debug("chat ws close skip user=%s: %s", user_id, e)
 
