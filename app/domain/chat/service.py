@@ -25,6 +25,7 @@ from app.domain.chat.schema import (
     ChatMessageBroadcast,
     ChatMessageItem,
     ChatMessageSend,
+    ChatPageDirection,
     ChatRoomListItem,
     ChatRoomPeerInfoData,
     ChatRoomsListData,
@@ -232,22 +233,46 @@ class ChatService:
         user_id: UUID,
         cursor_message_id: UUID | None,
         limit: int,
+        direction: ChatPageDirection = "before",
     ) -> tuple[list[ChatMessageItem], bool]:
+        """커서 기준 한 페이지. 응답은 방향과 무관하게 **항상 최신순(DESC)**이다.
+
+        `before`(기본)는 위로 거슬러 오르는 무한 스크롤용. `after`는 재연결 재동기용 —
+        "내가 가진 마지막 메시지 이후"를 오래된 것부터 이어 받아야 끊긴 구간을 빠짐없이
+        메운다(최신 N건만 다시 읽으면 그 사이 N건을 넘게 쌓였을 때 중간이 빈다).
+
+        커서 파생 규칙(응답이 항상 최신순이므로 방향마다 다르다):
+        `before` 다음 페이지 = `items[-1].id`(가장 과거), `after` 다음 페이지 = `items[0].id`.
+        """
         async with db.begin():
+            # authz 먼저 — 요청 형식 검사(아래 after+cursor)가 앞서면 비멤버가 403 대신
+            # 400을 받아 표면이 갈라진다.
             cursor_row = await cls._room_membership_guard(
                 db, room_id=room_id, user_id=user_id, cursor_message_id=cursor_message_id
             )
+            if direction == "after" and cursor_row is None:
+                # 이을 지점이 없으면 'after'는 의미가 없다 — 조용히 최신 페이지를 주면
+                # 호출자가 구멍을 못 본다.
+                raise InvalidRequestException(message="direction=after 에는 cursor 가 필요합니다.")
             stmt = select(ChatMessage).where(ChatMessage.room_id == room_id)
+            ascending = direction == "after"
             if cursor_row is not None:
-                stmt = stmt.where(
-                    tuple_(ChatMessage.created_at, ChatMessage.id) < tuple_(*cursor_row)
-                )
-            stmt = stmt.order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc()).limit(
-                limit + 1
+                key = tuple_(ChatMessage.created_at, ChatMessage.id)
+                bound = tuple_(*cursor_row)
+                stmt = stmt.where(key > bound if ascending else key < bound)
+            # 두 방향 모두 커서에 **인접한** 쪽부터 limit+1건을 집는다 — 그래야 페이지가
+            # 연속되고 has_more가 "이 방향으로 더 있다"를 뜻한다.
+            order = (
+                (ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                if ascending
+                else (ChatMessage.created_at.desc(), ChatMessage.id.desc())
             )
+            stmt = stmt.order_by(*order).limit(limit + 1)
             mres = await db.execute(stmt)
             rows = list(mres.scalars().all())
         page_rows, has_more = split_page(rows, limit)
+        if ascending:
+            page_rows = list(reversed(page_rows))  # 응답 계약은 항상 최신순
         return [ChatMessageItem.model_validate(m) for m in page_rows], has_more
 
     @classmethod

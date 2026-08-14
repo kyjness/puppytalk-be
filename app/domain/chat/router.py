@@ -41,6 +41,7 @@ from app.domain.chat.payload import parse_incoming_message, validation_error_det
 from app.domain.chat.schema import (
     ChatDirectRoomData,
     ChatMessageItem,
+    ChatPageDirection,
     ChatRoomPeerInfoData,
     ChatRoomsListData,
     ChatWsErrorPayload,
@@ -114,6 +115,37 @@ async def mark_room_read(
     return api_response(request, code=ApiCode.OK)
 
 
+# 방향 파라미터 선언은 한 벌만 — 엔드포인트와 아래 세션 의존성이 같은 쿼리 파라미터를
+# 읽는데(FastAPI가 이름으로 병합), 선언이 다르면 병합 시 어느 한쪽 설명이 유실된다.
+_DirectionParam = Annotated[
+    ChatPageDirection,
+    Query(
+        description=(
+            "before=커서보다 과거(무한 스크롤), after=커서 이후(재연결 재동기, cursor 필수). "
+            "응답 items는 방향과 무관하게 항상 최신순 — 다음 커서는 before면 items[-1].id, "
+            "after면 items[0].id 를 쓴다."
+        ),
+    ),
+]
+
+
+async def _get_messages_db(
+    direction: _DirectionParam = "before",
+    master: AsyncSession = Depends(get_master_db),
+    reader: AsyncSession = Depends(get_slave_db),
+) -> AsyncSession:
+    """방향별 세션 선택. `after`(재연결 재동기)는 **master**를 읽는다 — 재동기의 계약은
+    "has_more=False = 다 따라잡음"인데, reader를 읽으면 복제 지연만큼의 최신 메시지가
+    빠진 채 has_more=False가 나가 메우려던 구멍이 그대로 남는다(양쪽 다 이어진 줄 안다).
+    `before`(무한 스크롤)는 과거 조회라 지연을 감내해도 되므로 reader.
+
+    세션을 직접 만들지 않고 기존 의존성 둘을 받아 고른다 — 세션 수명·오버라이드 정책이
+    한 곳에 남는다(직접 만들면 통합 테스트의 세션 오버라이드를 우회한다). AsyncSession은
+    첫 쿼리 전까지 커넥션을 잡지 않으므로 안 쓰는 쪽은 풀을 건드리지 않는다.
+    """
+    return master if direction == "after" else reader
+
+
 @router.get(
     "/rooms/{room_id}/messages",
     status_code=200,
@@ -125,12 +157,11 @@ async def list_room_messages(
     user: CurrentUser = Depends(get_current_user),
     cursor: Annotated[
         OptionalPublicId,
-        Query(
-            description="무한 스크롤: 직전 응답의 마지막 메시지 id(공개 ID). 미지정 시 최신부터."
-        ),
+        Query(description="커서 메시지 id(공개 ID). 미지정 시 최신부터."),
     ] = None,
     limit: int = Query(30, ge=1, le=100, description="한 번에 가져올 최대 개수"),
-    db: AsyncSession = Depends(get_slave_db),
+    direction: _DirectionParam = "before",
+    db: AsyncSession = Depends(_get_messages_db),
 ):
     items, has_more = await ChatService.list_room_messages(
         db,
@@ -138,6 +169,7 @@ async def list_room_messages(
         user_id=user.id,
         cursor_message_id=cursor,
         limit=limit,
+        direction=direction,
     )
     return api_response(request, code=ApiCode.OK, data=CursorPage(items=items, has_more=has_more))
 

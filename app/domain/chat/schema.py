@@ -40,6 +40,10 @@ class ChatWsErrorPayload(BaseSchema):
     message: str = Field(default="", description="사용자/디버그용 짧은 설명")
 
 
+# 메시지 페이지 방향. `before`=커서보다 과거(무한 스크롤), `after`=커서 이후(재연결 재동기).
+ChatPageDirection = Literal["before", "after"]
+
+
 class ChatMessageItem(BaseSchema):
     id: PublicId
     room_id: PublicId

@@ -105,6 +105,11 @@
 **치른 비용**
 - **at-most-once**: Pub/Sub는 fire-and-forget이라 수신자가 오프라인이거나 워커가 publish 순간
   재시작 중이면 그 실시간 이벤트는 유실된다 — DB가 진실이고 클라가 GET으로 재동기하므로 수용.
+  채팅의 재동기는 소켓 재연결 시 `GET …/messages?direction=after&cursor=<마지막 확정 id>`로
+  끊긴 구간을 오래된 쪽부터 이어 받는다(최신 N건 재조회는 N건 초과 유실 시 중간이 빈다).
+  이 경로는 **master를 읽는다** — 복제 지연이 has_more=False를 거짓으로 만들면 메우려던
+  구멍이 그대로 남기 때문(무한 스크롤 `before`는 reader 유지). 응답은 방향과 무관하게
+  항상 최신순이라 다음 커서는 before=`items[-1].id`, after=`items[0].id`.
 - **단일 채널의 워커별 필터링**: 모든 워커가 모든 envelope를 수신해 `target_user_ids`로
   거른다(워커 수 × 메시지 수). 운영 봉투 내에서는 수용하되, 초고fanout 시 채널 샤딩이 탈출구다.
 - **느린 SSE 클라이언트의 이벤트 드롭**: 로컬 큐(100)가 차면 신규 이벤트를 버린다 —

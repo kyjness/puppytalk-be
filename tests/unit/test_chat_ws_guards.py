@@ -17,6 +17,7 @@ from app.domain.chat.service import ChatService
 from app.domain.users.model import UsersRepository
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.unit.fakes import FakeDB
 from tests.unit.fakes import FakeRedis as SharedFakeRedis
 
 pytestmark = pytest.mark.asyncio
@@ -251,6 +252,103 @@ async def test_room_guard_returns_cursor_tuple_or_rejects_stray_cursor():
             room_id=uuid.uuid4(),
             user_id=me,
             cursor_message_id=cur_id,
+        )
+
+
+# --- 메시지 페이지 방향 (before=무한 스크롤 / after=재연결 재동기) ---
+
+
+class _ListDb(FakeDB):
+    """멤버십 가드 행(1번째 execute) → 메시지 행(2번째 execute) 순으로 돌려주는 가짜 세션."""
+
+    def __init__(self, guard_row, message_rows) -> None:
+        self._guard_row = guard_row
+        self._rows = message_rows
+        self.statements: list = []
+
+    async def execute(self, stmt, *args, **kwargs):
+        self.statements.append(stmt)
+        if len(self.statements) == 1:
+            return SimpleNamespace(one_or_none=lambda: self._guard_row)
+        rows = list(self._rows)
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
+
+
+def _list_fixture(count: int):
+    """(db, room_id, me, cursor_id) — created_at 오름차순 메시지 count건."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.domain.chat.model import ChatMessage
+
+    room, me, other = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    cursor_id, cursor_at = uuid.uuid4(), datetime(2026, 1, 1, tzinfo=UTC)
+    guard = SimpleNamespace(user1_id=me, user2_id=other, created_at=cursor_at, id=cursor_id)
+    rows = [
+        ChatMessage(
+            id=uuid.uuid4(),
+            room_id=room,
+            sender_id=other,
+            content=f"m{i}",
+            is_read=False,
+            created_at=cursor_at + timedelta(minutes=i + 1),
+        )
+        for i in range(count)
+    ]
+    return _ListDb(guard, rows), room, me, cursor_id
+
+
+async def test_list_messages_after_walks_forward_and_still_answers_newest_first():
+    """재동기는 커서 **이후**를 오래된 쪽부터 이어 받아야 구간이 연속된다.
+    최신 N건만 다시 읽으면 끊긴 사이 N건을 넘게 쌓였을 때 중간이 빈 채 앞뒤만 맞아떨어진다."""
+    db, room, me, cursor_id = _list_fixture(3)  # limit=2 → +1건으로 has_more 감지
+
+    items, has_more = await ChatService.list_room_messages(
+        cast(AsyncSession, db),
+        room_id=room,
+        user_id=me,
+        cursor_message_id=cursor_id,
+        limit=2,
+        direction="after",
+    )
+
+    assert has_more is True
+    stamps = [i.created_at for i in items]
+    assert stamps == sorted(stamps, reverse=True)  # 응답 계약은 방향과 무관하게 최신순
+
+    sql = str(db.statements[1])
+    assert "created_at ASC" in sql  # 커서에 인접한(오래된) 쪽부터 집어야 연속된다
+    assert ") > (" in sql
+
+
+async def test_list_messages_before_still_pages_backwards():
+    db, room, me, cursor_id = _list_fixture(1)
+
+    await ChatService.list_room_messages(
+        cast(AsyncSession, db),
+        room_id=room,
+        user_id=me,
+        cursor_message_id=cursor_id,
+        limit=2,
+    )
+
+    sql = str(db.statements[1])
+    assert "created_at DESC" in sql
+    assert ") < (" in sql
+
+
+async def test_list_messages_after_requires_cursor():
+    """이을 지점이 없으면 'after'는 의미가 없다 — 조용히 최신 페이지를 주면 구멍을 못 본다."""
+    from app.common.exceptions import InvalidRequestException
+
+    db, room, me, _ = _list_fixture(1)
+    with pytest.raises(InvalidRequestException):
+        await ChatService.list_room_messages(
+            cast(AsyncSession, db),
+            room_id=room,
+            user_id=me,
+            cursor_message_id=None,
+            limit=2,
+            direction="after",
         )
 
 
