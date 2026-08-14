@@ -26,6 +26,8 @@ from app.common import (
     api_response,
 )
 from app.common.exceptions import (
+    WS_CLOSE_CONNECTION_LIMIT,
+    WS_CLOSE_RATE_LIMIT,
     BaseProjectException,
     UnauthorizedException,
     UserNotFoundException,
@@ -39,6 +41,7 @@ from app.domain.chat.payload import parse_incoming_message, validation_error_det
 from app.domain.chat.schema import (
     ChatDirectRoomData,
     ChatMessageItem,
+    ChatPageDirection,
     ChatRoomPeerInfoData,
     ChatRoomsListData,
     ChatWsErrorPayload,
@@ -112,6 +115,37 @@ async def mark_room_read(
     return api_response(request, code=ApiCode.OK)
 
 
+# 방향 파라미터 선언은 한 벌만 — 엔드포인트와 아래 세션 의존성이 같은 쿼리 파라미터를
+# 읽는데(FastAPI가 이름으로 병합), 선언이 다르면 병합 시 어느 한쪽 설명이 유실된다.
+_DirectionParam = Annotated[
+    ChatPageDirection,
+    Query(
+        description=(
+            "before=커서보다 과거(무한 스크롤), after=커서 이후(재연결 재동기, cursor 필수). "
+            "응답 items는 방향과 무관하게 항상 최신순 — 다음 커서는 before면 items[-1].id, "
+            "after면 items[0].id 를 쓴다."
+        ),
+    ),
+]
+
+
+async def _get_messages_db(
+    direction: _DirectionParam = "before",
+    master: AsyncSession = Depends(get_master_db),
+    reader: AsyncSession = Depends(get_slave_db),
+) -> AsyncSession:
+    """방향별 세션 선택. `after`(재연결 재동기)는 **master**를 읽는다 — 재동기의 계약은
+    "has_more=False = 다 따라잡음"인데, reader를 읽으면 복제 지연만큼의 최신 메시지가
+    빠진 채 has_more=False가 나가 메우려던 구멍이 그대로 남는다(양쪽 다 이어진 줄 안다).
+    `before`(무한 스크롤)는 과거 조회라 지연을 감내해도 되므로 reader.
+
+    세션을 직접 만들지 않고 기존 의존성 둘을 받아 고른다 — 세션 수명·오버라이드 정책이
+    한 곳에 남는다(직접 만들면 통합 테스트의 세션 오버라이드를 우회한다). AsyncSession은
+    첫 쿼리 전까지 커넥션을 잡지 않으므로 안 쓰는 쪽은 풀을 건드리지 않는다.
+    """
+    return master if direction == "after" else reader
+
+
 @router.get(
     "/rooms/{room_id}/messages",
     status_code=200,
@@ -123,12 +157,11 @@ async def list_room_messages(
     user: CurrentUser = Depends(get_current_user),
     cursor: Annotated[
         OptionalPublicId,
-        Query(
-            description="무한 스크롤: 직전 응답의 마지막 메시지 id(공개 ID). 미지정 시 최신부터."
-        ),
+        Query(description="커서 메시지 id(공개 ID). 미지정 시 최신부터."),
     ] = None,
     limit: int = Query(30, ge=1, le=100, description="한 번에 가져올 최대 개수"),
-    db: AsyncSession = Depends(get_slave_db),
+    direction: _DirectionParam = "before",
+    db: AsyncSession = Depends(_get_messages_db),
 ):
     items, has_more = await ChatService.list_room_messages(
         db,
@@ -136,13 +169,14 @@ async def list_room_messages(
         user_id=user.id,
         cursor_message_id=cursor,
         limit=limit,
+        direction=direction,
     )
     return api_response(request, code=ApiCode.OK, data=CursorPage(items=items, has_more=has_more))
 
 
 # --- WebSocket ---
 
-# 한도 초과 후에도 계속 밀어붙이는 클라이언트는 끊는다(1008) — 한도 초과 스팸이
+# 한도 초과 후에도 계속 밀어붙이는 클라이언트는 끊는다 — 한도 초과 스팸이
 # 프레임당 응답 생성·Redis 왕복으로 남는 것조차 막는 마지막 단계.
 _REJECT_CLOSE_THRESHOLD = 30
 
@@ -196,11 +230,20 @@ async def chat_dm_websocket(websocket: WebSocket) -> None:
 
     await websocket.accept()
     if not await chat_connection_manager.connect(user_id, websocket):
-        # 1008 = policy violation. 클라이언트가 무한 재연결하지 않도록 사유를 실어 보낸다.
-        await websocket.close(code=1008, reason="Too many concurrent connections")
+        # 재연결해도 상한은 그대로다 — 클라이언트가 무한 재시도하지 않도록 전용 코드로 알린다.
+        await websocket.close(
+            code=WS_CLOSE_CONNECTION_LIMIT, reason="Too many concurrent connections"
+        )
         return
     redis = get_websocket_redis(websocket)
     gate = LocalRejectionGate(f"chat:ws:{user_id}", close_threshold=_REJECT_CLOSE_THRESHOLD)
+    # peer_id → room_id. 근거는 ChatService.assert_can_dm 참조. 연결과 함께 사라진다.
+    room_cache: dict[UUID, UUID] = {}
+    # 레이트리밋은 메시지 속도만 막고 상대 수는 못 막는다 — 허용 속도로 상대를 바꿔가며
+    # 보내면 소켓 하나가 하루 수만 엔트리를 쌓는다. DM은 상대별 반복 트래픽이라 작은
+    # 상한으로도 히트율 손실이 없다. 초과 시 가장 오래 전에 캐시된 것부터 버린다(dict는
+    # 삽입 순서 보존).
+    room_cache_max = 64
     try:
         while True:
             raw = await websocket.receive_text()
@@ -214,7 +257,7 @@ async def chat_dm_websocket(websocket: WebSocket) -> None:
             )
             if not allowed:
                 if should_close:
-                    await websocket.close(code=1008, reason="Rate limit exceeded")
+                    await websocket.close(code=WS_CLOSE_RATE_LIMIT, reason="Rate limit exceeded")
                     return
                 await _send_ws_error(
                     websocket,
@@ -234,7 +277,10 @@ async def chat_dm_websocket(websocket: WebSocket) -> None:
                         sender_id=user_id,
                         payload=parsed,
                         redis=redis,
+                        room_cache=room_cache,
                     )
+                while len(room_cache) > room_cache_max:
+                    room_cache.pop(next(iter(room_cache)))
             except UserNotFoundException as e:
                 await _send_ws_error(
                     websocket, "peer_not_found", e.message or "상대방을 찾을 수 없습니다."
