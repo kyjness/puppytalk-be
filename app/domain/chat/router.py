@@ -237,6 +237,13 @@ async def chat_dm_websocket(websocket: WebSocket) -> None:
         return
     redis = get_websocket_redis(websocket)
     gate = LocalRejectionGate(f"chat:ws:{user_id}", close_threshold=_REJECT_CLOSE_THRESHOLD)
+    # peer_id → room_id. 근거는 ChatService.assert_can_dm 참조. 연결과 함께 사라진다.
+    room_cache: dict[UUID, UUID] = {}
+    # 레이트리밋은 메시지 속도만 막고 상대 수는 못 막는다 — 허용 속도로 상대를 바꿔가며
+    # 보내면 소켓 하나가 하루 수만 엔트리를 쌓는다. DM은 상대별 반복 트래픽이라 작은
+    # 상한으로도 히트율 손실이 없다. 초과 시 가장 오래 전에 캐시된 것부터 버린다(dict는
+    # 삽입 순서 보존).
+    room_cache_max = 64
     try:
         while True:
             raw = await websocket.receive_text()
@@ -270,7 +277,10 @@ async def chat_dm_websocket(websocket: WebSocket) -> None:
                         sender_id=user_id,
                         payload=parsed,
                         redis=redis,
+                        room_cache=room_cache,
                     )
+                while len(room_cache) > room_cache_max:
+                    room_cache.pop(next(iter(room_cache)))
             except UserNotFoundException as e:
                 await _send_ws_error(
                     websocket, "peer_not_found", e.message or "상대방을 찾을 수 없습니다."

@@ -138,6 +138,7 @@ async def test_send_dm_rejects_blocked_relation_before_room_creation(monkeypatch
             sender_id=sender,
             payload=ChatMessageSend(peer_user_id=peer, content="hi"),
             redis=None,
+            room_cache={},
         )
     # 누가 차단했는지 방향을 노출하지 않는 중립 문구
     assert "차단" not in (exc.value.message or "")
@@ -160,6 +161,125 @@ async def test_status_and_block_between_checks_both_directions():
     assert src.count("or_") >= 1
     assert src.count("blocker_id == user_id") == 1
     assert src.count("blocker_id == other_id") == 1
+
+
+# --- 전송 경로 방 캐시 (room_cache) ---
+
+
+def _patch_open_pair(monkeypatch, calls: list[tuple]):
+    """차단·탈퇴 없는 정상 상대. 검사 호출 횟수를 세려고 calls에 기록한다."""
+
+    async def fake_status_and_block(user_id, other_id, *, db):
+        calls.append((user_id, other_id))
+        return SimpleNamespace(status="ACTIVE", blocked=False)
+
+    monkeypatch.setattr(UsersRepository, "get_status_and_block_between", fake_status_and_block)
+
+
+class _SendPathDb(FakeDB):
+    """방 upsert(execute) 횟수를 세는 가짜 세션. flush/add는 메시지 저장 경로."""
+
+    def __init__(self, room_id, *, fail_flush: bool = False) -> None:
+        self._room_id = room_id
+        self._fail_flush = fail_flush
+        self.executes = 0
+        self.added: list = []
+
+    async def execute(self, *args, **kwargs):
+        self.executes += 1
+        return SimpleNamespace(scalar_one=lambda: self._room_id)
+
+    def add(self, obj) -> None:
+        self.added.append(obj)
+
+    async def flush(self) -> None:
+        if self._fail_flush:
+            raise RuntimeError("flush 실패(트랜잭션 롤백 시뮬레이션)")
+
+
+async def test_room_cache_skips_room_upsert_on_repeat_send(monkeypatch):
+    """방 id는 유저 쌍당 불변 — 같은 소켓에서 두 번째 메시지부터는 방 upsert 왕복이 없다."""
+    sender, peer, room_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    _patch_open_pair(monkeypatch, [])
+    monkeypatch.setattr(ChatService, "_fanout_dm", classmethod(lambda cls, *a, **k: _noop()))
+
+    db = _SendPathDb(room_id)
+    cache: dict = {}
+    for _ in range(3):
+        await ChatService.send_dm_from_ws(
+            cast(AsyncSession, db),
+            sender_id=sender,
+            payload=ChatMessageSend(peer_user_id=peer, content="hi"),
+            redis=None,
+            room_cache=cache,
+        )
+
+    assert cache == {peer: room_id}
+    assert db.executes == 1  # 첫 전송에서만 upsert
+    assert len(db.added) == 3  # 메시지는 매번 저장
+    assert all(m.room_id == room_id for m in db.added)
+
+
+async def test_room_cache_still_checks_block_on_every_send(monkeypatch):
+    """캐시가 있어도 차단·탈퇴 검사는 매 전송마다 — 대화 도중 차단이 즉시 막혀야 한다."""
+    sender, peer, room_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    calls: list[tuple] = []
+    _patch_open_pair(monkeypatch, calls)
+    monkeypatch.setattr(ChatService, "_fanout_dm", classmethod(lambda cls, *a, **k: _noop()))
+
+    db = _SendPathDb(room_id)
+    cache: dict = {}
+    payload = ChatMessageSend(peer_user_id=peer, content="hi")
+    await ChatService.send_dm_from_ws(
+        cast(AsyncSession, db), sender_id=sender, payload=payload, redis=None, room_cache=cache
+    )
+    await ChatService.send_dm_from_ws(
+        cast(AsyncSession, db), sender_id=sender, payload=payload, redis=None, room_cache=cache
+    )
+    assert len(calls) == 2
+
+    # 대화 도중 차단되면 캐시 히트 경로에서도 거부된다.
+    _patch_blocked_pair(monkeypatch, sender, peer)
+    with pytest.raises(ForbiddenException):
+        await ChatService.send_dm_from_ws(
+            cast(AsyncSession, db), sender_id=sender, payload=payload, redis=None, room_cache=cache
+        )
+
+
+async def test_room_cache_not_poisoned_by_rolled_back_transaction(monkeypatch):
+    """캐시 기록은 커밋 성공 뒤에만 — 방 upsert 후 트랜잭션이 실패(메시지 flush 오류 등)하면
+    방 INSERT도 롤백되는데, 트랜잭션 안에서 캐시했다면 커밋된 적 없는 room_id가 남아
+    이후 그 상대에게 보내는 모든 메시지가 FK 위반으로 실패한다(소켓 루프는 예외를 삼키고
+    계속 돌므로 재연결 전까지 자가 치유가 없다)."""
+    sender, peer, room_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    _patch_open_pair(monkeypatch, [])
+
+    cache: dict = {}
+    with pytest.raises(RuntimeError):
+        await ChatService.send_dm_from_ws(
+            cast(AsyncSession, _SendPathDb(room_id, fail_flush=True)),
+            sender_id=sender,
+            payload=ChatMessageSend(peer_user_id=peer, content="hi"),
+            redis=None,
+            room_cache=cache,
+        )
+    assert cache == {}  # 실패한 전송은 캐시에 아무것도 남기지 않는다
+
+    # 같은 소켓의 다음 전송은 upsert부터 다시 — 정상 경로로 회복된다.
+    db = _SendPathDb(room_id)
+    await ChatService.send_dm_from_ws(
+        cast(AsyncSession, db),
+        sender_id=sender,
+        payload=ChatMessageSend(peer_user_id=peer, content="hi"),
+        redis=None,
+        room_cache=cache,
+    )
+    assert cache == {peer: room_id}
+    assert db.executes == 1
+
+
+async def _noop() -> None:
+    return None
 
 
 # --- WebSocket 종료 코드 계약 ---

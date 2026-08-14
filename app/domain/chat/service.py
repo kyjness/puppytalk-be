@@ -107,18 +107,21 @@ class ChatService:
             return await cls.get_or_create_room(db, user_id=user_id, peer_id=peer_id)
 
     @classmethod
-    async def get_or_create_room(
+    async def assert_can_dm(
         cls,
         db: AsyncSession,
         *,
         user_id: UUID,
         peer_id: UUID,
-    ) -> UUID:
-        """방 upsert 후 room id 반환.
+    ) -> None:
+        """자기 자신·상대 존재/활성·차단 검사. 차단 문구는 누가 차단했는지 노출하지 않는
+        중립 표현.
 
-        자기 자신·상대 존재/활성·차단 검사를 전부 이 지점에 둔다 — WS 전송·REST 방 열기 등
-        어떤 진입점이든 여기를 지나므로 경로별로 검사를 기억할 필요가 없다. 차단 문구는
-        누가 차단했는지 노출하지 않는 중립 표현.
+        방 upsert와 분리해 둔 이유는 **캐시 가능성이 다르기 때문**이다 — 방 id는
+        `uq_chat_rooms_user_pair` 아래 유저 쌍당 불변이라 소켓 세션 동안 캐시해도 되지만,
+        이 검사는 대화 도중의 차단·탈퇴를 즉시 반영해야 하므로 매 전송마다 다시 해야 한다.
+        유저 FK가 ON DELETE CASCADE라 탈퇴하면 방도 사라지는데, 이 검사가 먼저 걸러 주므로
+        캐시된 stale room_id로 INSERT를 시도하는 경로까지 함께 막힌다.
         """
         if peer_id == user_id:
             raise SelfDmException()
@@ -127,6 +130,28 @@ class ChatService:
             raise UserNotFoundException(message="상대방을 찾을 수 없습니다.")
         if peer.blocked:
             raise ForbiddenException(message="메시지를 보낼 수 없는 상대입니다.")
+
+    @classmethod
+    async def get_or_create_room(
+        cls,
+        db: AsyncSession,
+        *,
+        user_id: UUID,
+        peer_id: UUID,
+    ) -> UUID:
+        """사전 검사(`assert_can_dm`) + 방 upsert 후 room id 반환 — REST 방 열기 진입점."""
+        await cls.assert_can_dm(db, user_id=user_id, peer_id=peer_id)
+        return await cls._upsert_room(db, user_id=user_id, peer_id=peer_id)
+
+    @classmethod
+    async def _upsert_room(
+        cls,
+        db: AsyncSession,
+        *,
+        user_id: UUID,
+        peer_id: UUID,
+    ) -> UUID:
+        """순수 방 upsert. 검사는 호출자 몫 — 전송 경로가 검사와 upsert를 분리해 쓴다."""
         u1, u2 = normalize_dm_user_ids(user_id, peer_id)
         now = utc_now()
         res = await db.execute(
@@ -147,11 +172,24 @@ class ChatService:
         sender_id: UUID,
         payload: ChatMessageSend,
         redis: RedisLike | None,
+        room_cache: dict[UUID, UUID],
     ) -> None:
+        """`room_cache`는 소켓 1개가 소유하는 peer_id → room_id 맵(연결과 함께 소멸).
+
+        캐시 히트면 방 upsert 왕복이 빠진다 — 그 upsert는 이미 존재하는 방의 `updated_at`만
+        갱신하는 master 쓰기인데, 목록 정렬은 최근 메시지 시각을 쓰므로(`list_recent_rooms`)
+        결과를 읽는 곳이 없다. 순전히 `RETURNING id`를 받으려고 매번 쓰던 셈이다.
+        캐시해도 되는 근거와 `assert_can_dm`을 매번 도는 이유는 `assert_can_dm` 참조.
+        """
         peer_id = payload.peer_user_id
+        cached_room_id = room_cache.get(peer_id)
         async with db.begin():
-            # 자기 자신·상대·차단 검사는 get_or_create_room 안에서 수행된다(모든 진입점 공통).
-            room_id = await cls.get_or_create_room(db, user_id=sender_id, peer_id=peer_id)
+            # 검사는 캐시 적중 여부와 무관하게 무조건 — hit/miss가 다른 검사 경로를 타면
+            # 나중에 추가되는 가드가 두 번째 메시지부터 조용히 빠진다.
+            await cls.assert_can_dm(db, user_id=sender_id, peer_id=peer_id)
+            room_id = cached_room_id
+            if room_id is None:
+                room_id = await cls._upsert_room(db, user_id=sender_id, peer_id=peer_id)
             msg = ChatMessage(
                 id=new_uuid7(),
                 room_id=room_id,
@@ -166,6 +204,11 @@ class ChatService:
                 ChatMessageBroadcast.model_validate(msg).model_dump(mode="json", by_alias=True),
                 ensure_ascii=False,
             )
+        # 캐시 기록은 커밋 성공 뒤에만 — 트랜잭션 안에서 기록하면 upsert 후 롤백(메시지
+        # flush 실패·데드락 등)이 커밋된 적 없는 room_id를 소켓 수명 내내 남겨, 이후 그
+        # 상대에게 보내는 모든 메시지가 FK 위반으로 실패한다(루프는 예외를 삼키고 계속 돈다).
+        if cached_room_id is None:
+            room_cache[peer_id] = room_id
         await cls._fanout_dm(redis, peer_id=peer_id, sender_id=sender_id, wire=wire)
 
     @classmethod

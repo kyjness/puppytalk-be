@@ -43,6 +43,10 @@ class ChatRoom(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now
     )
+    # 주의: "마지막 활동 시각"이 아니다 — 방 생성·REST 방 열기(upsert) 때만 갱신되고,
+    # WS 전송 경로는 소켓 캐시 히트 시 upsert를 건너뛴다. 최근 활동은 메시지에서
+    # 파생한다(list_recent_rooms의 last_created_at 정렬). 이 컬럼을 활동 지표로 읽는
+    # 조회를 추가하지 말 것.
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now
     )
