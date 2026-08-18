@@ -50,16 +50,16 @@ async def create_post(
     user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_master_db),
 ):
-    cached, idemp_fp = await post_create_idempotency_before(request, user.id, x_idempotency_key)
+    cached, idemp = await post_create_idempotency_before(request, user.id, x_idempotency_key)
     if cached is not None:
         return cached
     try:
         post_id = await PostService.create_post(user.id, post_data, db=db)
         out = api_response(request, code=ApiCode.OK, data=PostIdData(id=post_id))
-        await post_create_idempotency_after_success(request, idemp_fp, out)
+        await post_create_idempotency_after_success(request, idemp, out)
         return out
     except Exception:
-        await post_create_idempotency_after_failure(request, idemp_fp)
+        await post_create_idempotency_after_failure(request, idemp)
         raise
 
 

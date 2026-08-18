@@ -4,6 +4,9 @@
 실행된다 — 승격 후 거부는 DB 행 없는 영구 객체를 남겨 sweeper(DB 행 기준)·pending/ lifecycle
 어느 쪽도 못 지운다. head~promote 사이 재업로드(TOCTOU)로 우회된 경우엔 승격본을 보상 삭제한다.
 미업로드/소진된 키의 404는 500이 아니라 400으로 매핑된다.
+
+같은 불변식이 삭제 경로에도 걸린다 — `delete_image`는 스토리지를 먼저 지우고 DB 행을
+나중에 지운다. 순서가 반대면 스토리지 삭제 실패 시 추적 수단(행)이 사라져 회수가 불가능하다.
 """
 
 import uuid
@@ -13,6 +16,8 @@ import pytest
 from app.common.exceptions import InvalidImageFileException
 from app.domain.media import service as media_service_mod
 from app.domain.media.service import MediaService
+
+from tests.unit.fakes import FakeDB, as_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -204,3 +209,118 @@ async def test_presign_rate_limited_per_user(monkeypatch):
     assert exc.value.status_code == 429
     assert issued == ["a.png"]  # 한도 초과 시 presign 미발급
     assert ok is not None
+
+
+# --- 삭제 경로: 스토리지 실패 시 DB 행을 남긴다 ---
+
+
+def _patch_delete_repo(monkeypatch, *, image_id, user_id, storage) -> list[Any]:
+    """`delete_image`가 보는 리포지터리·스토리지를 갈아끼우고 삭제된 id 싱크를 돌려준다.
+
+    두 테스트의 차이는 `storage`가 던지는가뿐이라 나머지는 전부 여기서 공유한다.
+    """
+    deleted_ids: list[Any] = []
+
+    class _Image:
+        id = image_id
+        uploader_id = user_id
+        file_key = "media/some/key.png"
+
+    class _Repo:
+        @staticmethod
+        async def get_image_by_id(iid, db):
+            return _Image()
+
+        @staticmethod
+        async def delete_image_if_owned(iid, uid, *, db):
+            deleted_ids.append(iid)
+            return True
+
+    monkeypatch.setattr(media_service_mod, "MediaRepository", _Repo)
+    monkeypatch.setattr(media_service_mod, "storage_delete", storage)
+    return deleted_ids
+
+
+async def test_delete_image_keeps_db_row_when_storage_delete_fails(monkeypatch):
+    """스토리지 삭제가 실패하면 DB 행을 지우면 안 된다.
+
+    행이 유일한 추적 수단이라(고아 sweeper는 `images` 행 기준, `pending/` lifecycle은
+    `media/`를 안 덮는다) 행을 먼저 지우면 아무도 못 찾는 객체가 영구히 남는다.
+    행이 남으면 사용자 재시도·sweeper 회수가 모두 가능하다.
+    """
+    image_id, user_id = uuid.uuid4(), uuid.uuid4()
+
+    def boom(_key):
+        raise RuntimeError("S3 down")
+
+    deleted_ids = _patch_delete_repo(monkeypatch, image_id=image_id, user_id=user_id, storage=boom)
+
+    with pytest.raises(RuntimeError):
+        await MediaService.delete_image(image_id, user_id, as_session(FakeDB()))
+
+    assert deleted_ids == [], "스토리지 삭제 실패 후 DB 행이 지워지면 객체를 영영 회수할 수 없다"
+
+
+async def test_delete_image_removes_db_row_after_storage_succeeds(monkeypatch):
+    """정상 경로 회귀 — 스토리지 삭제가 성공하면 행도 지워진다."""
+    image_id, user_id = uuid.uuid4(), uuid.uuid4()
+    deleted_keys: list[str] = []
+
+    deleted_ids = _patch_delete_repo(
+        monkeypatch, image_id=image_id, user_id=user_id, storage=deleted_keys.append
+    )
+
+    await MediaService.delete_image(image_id, user_id, as_session(FakeDB()))
+
+    assert deleted_keys == ["media/some/key.png"]
+    assert deleted_ids == [image_id]
+
+
+async def test_signup_confirm_rollback_keeps_db_row_when_storage_delete_fails(monkeypatch):
+    """signup confirm 롤백도 스토리지 실패 시 DB 행을 남겨야 한다.
+
+    `create_temp_image`는 커밋되므로 실제 행이 존재한다. 행을 먼저 지우고 스토리지 삭제가
+    실패하면 회수 수단이 사라진다 — temp image는 어디에도 연결되지 않아 행만 남아 있으면
+    고아 sweeper가 24시간 뒤 정리한다.
+    """
+    from app.domain.media.schema import ConfirmSignupUploadRequest
+
+    image_id = uuid.uuid4()
+    deleted_ids: list[Any] = []
+
+    class _Image:
+        id = image_id
+        file_url = "http://example.test/media/x.png"
+
+    class _Repo:
+        @staticmethod
+        async def create_temp_image(**_kwargs):
+            return _Image()
+
+        @staticmethod
+        async def delete_images_by_ids(ids, db):
+            deleted_ids.extend(ids)
+            return len(ids)
+
+    async def fake_confirm(key, *, purpose, expected_size):
+        return "media/dest/x.png", _Image.file_url, "image/png", 100
+
+    async def fail_token(image_id_, redis):
+        raise RuntimeError("redis down")  # 롤백 유발
+
+    def boom(_key):
+        raise RuntimeError("S3 down")
+
+    monkeypatch.setattr(MediaService, "_confirm_pending_key", fake_confirm)
+    monkeypatch.setattr(MediaService, "issue_upload_token", fail_token)
+    monkeypatch.setattr(media_service_mod, "MediaRepository", _Repo)
+    monkeypatch.setattr(media_service_mod, "storage_delete", boom)
+
+    with pytest.raises(RuntimeError):
+        await MediaService.confirm_presigned_signup_upload(
+            ConfirmSignupUploadRequest(file_key=_valid_pending_key(), size=100),
+            as_session(FakeDB()),
+            None,
+        )
+
+    assert deleted_ids == [], "스토리지 삭제 실패 후 행을 지우면 고아를 영영 회수할 수 없다"

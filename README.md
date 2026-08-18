@@ -328,6 +328,7 @@ docker compose --env-file .env.prod -f compose.prod.yml exec backend python -m a
 | [00 · 운영 봉투와 범위](docs/00-operating-envelope-and-scope.md) | 모든 설계·복잡도 판정의 단일 근거(전제·과제·재건 순서) |
 | [01 · 아키텍처](docs/01-architecture.md) | 횡단 관심사 결정(식별자·API·트랜잭션·캐시·페이지네이션·관측성·인덱스) |
 | [파이프라인 다이어그램](docs/architecture-flows.html) | 요청 처리 공통 경로 + 파이프라인 6종(인증·게시글·조회수·실시간·업로드·알림) + 장애 시 동작 |
-| [ADR](docs/adr/) | 핵심 설계 결정 17건 — 각 결정의 트레이드오프와 *안 한 것* |
+| [ADR](docs/adr/) | 핵심 설계 결정 18건 — 각 결정의 트레이드오프와 *안 한 것* |
 | [ROADMAP](docs/ROADMAP.md) | RUP-lite 리팩토링 진행·완료 이력(도메인 단위 + 커밋) |
 | [backlog](docs/backlog.md) | 버그·최적화 백로그와 각 항목의 근거·수정 방향 |
+| [CONVENTIONS](CONVENTIONS.md) | git 워크플로 규약 — 브랜치·커밋 메시지·PR 작성 기준 |

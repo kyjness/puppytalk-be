@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 _root = Path(__file__).resolve().parent.parent.parent
@@ -96,6 +96,12 @@ class Settings(BaseSettings):
     CELERY_TASK_IDEMPOTENCY_TTL_SECONDS: int = 86400
     # SSE 알림 pubsub이 연결을 길게 점유하므로 기본 풀 크기를 넉넉히 둠.
     REDIS_MAX_CONNECTIONS: int = 128
+    # Fail-open(ADR 0005)은 예외를 받아야 발동한다 — 타임아웃이 없으면 Redis가 "죽은" 게 아니라
+    # "먹통"일 때(분단·SG 차단·페일오버) 예외가 영영 오지 않아 전 요청이 매달린다.
+    # 동일 AZ RTT는 1ms 미만이고 rate limit Lua는 왕복 1회라 1초는 오탐이 사실상 불가능한 여유값.
+    # 연결 수립은 TCP(+TLS) 핸드셰이크가 있어 더 넉넉히 둔다.
+    REDIS_SOCKET_TIMEOUT: float = 1.0
+    REDIS_SOCKET_CONNECT_TIMEOUT: float = 2.0
     # POST /posts 멱등성: 성공 응답 캐시 TTL, in-flight 잠금 TTL(초)
     IDEMPOTENCY_POST_CREATE_TTL_SECONDS: int = 3600
     IDEMPOTENCY_POST_CREATE_LOCK_TTL_SECONDS: int = 120
@@ -170,6 +176,18 @@ class Settings(BaseSettings):
     def _parse_csv(cls, v: object) -> object:
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
+        return v
+
+    @field_validator("REDIS_SOCKET_TIMEOUT", "REDIS_SOCKET_CONNECT_TIMEOUT", mode="after")
+    @classmethod
+    def _positive_timeout(cls, v: float, info: ValidationInfo) -> float:
+        # 0은 "없음"이 아니라 **즉시 타임아웃**이다 — redis-py는 None이 아닌 값을 전부
+        # async_timeout으로 감싼다. 0이 들어오면 부팅 ping이 실패해 앱이 영구 fail-open으로 뜬다.
+        # 끄는 옵션은 두지 않는다(ADR 0005: 타임아웃은 fail-open의 전제).
+        if v <= 0:
+            raise ValueError(
+                f"{info.field_name}은 0보다 커야 한다 (0은 '없음'이 아니라 즉시 타임아웃)"
+            )
         return v
 
     @field_validator("ENVIRONMENT", mode="after")

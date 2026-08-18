@@ -1,7 +1,7 @@
 # ADR 0010 — 스토리지 백엔드 전략: S3 API 단일 경로 + dev MinIO 패리티
 
 - **상태**: 채택됨 (Accepted) · **구현 완료(Transition/Ops)** — 아래 구현 노트
-- **관련 코드**: `app/infra/storage.py`(`STORAGE_BACKEND` 분기 · presigned 계열
+- **관련 코드**: `app/infra/storage.py`(S3 클라이언트·addressing style · presigned 계열
   `issue_presigned_post`/`promote_pending_object`/`require_s3_direct_upload`),
   `app/domain/media/service.py`, `app/domain/media/router.py`
 
@@ -98,3 +98,13 @@
   `docker-compose.yml`의 minio-init가 `mc ilm rule add --expire-days 1 --prefix
   media/pending/`로 배선. 앱 코드는 관여하지 않는다(저장소 수명주기는 저장소 계층 책임 —
   목록 순회 잡은 봉투 대비 과잉).
+- **`media/` 고아도 회수 수단이 필요하다(미해결 · infra 요건)**: 삭제 순서를 "스토리지 먼저,
+  DB 행 나중"으로 맞춰(`MediaService.delete_image`·signup confirm 롤백) 스토리지 삭제가
+  실패해도 행이 남아 sweeper가 회수하도록 했다. 그러나 **행이 존재한 적 없는 경로**는
+  이 방법으로 못 덮는다 — 승격 후 검증 실패(`_confirm_pending_key`)와 confirm DB 실패
+  (`confirm_presigned_upload`)는 롤백 시점에 DB 행이 없어, 보상 삭제가 실패하면 `media/`
+  아래에 **아무도 못 찾는 객체**가 남는다(행 기준 sweeper는 원리적으로 못 본다).
+  `pending/`과 달리 `media/`는 "오래되면 잔존물"이라는 판별식이 없어 단순 만료를 걸 수 없으므로,
+  회수는 **DB 키 집합과 대조하는 목록 기반 GC**여야 한다 — 저빈도(주 1회 등) infra 잡으로 두고
+  앱은 관여하지 않는다(위 불릿과 같은 책임 분리). 현재는 미배선이며, 보상 삭제 실패는
+  `logger.warning`으로만 남는다. 잔존량은 그 로그로 관측한다.
