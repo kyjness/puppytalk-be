@@ -46,6 +46,10 @@ class _FakePubSub:
     async def unsubscribe(self, *channels: str) -> None:
         pass
 
+    async def ping(self) -> None:
+        # 워치독이 유휴 시 부른다 — 이 가짜는 응답(pong)을 돌려주지 않는다.
+        pass
+
     async def get_message(self, *, ignore_subscribe_messages: bool, timeout: float):
         if self._script.messages:
             return self._script.messages.pop(0)
@@ -54,6 +58,9 @@ class _FakePubSub:
             raise ConnectionError("connection lost")
         if self._script.stop_after:
             self._stop_event.set()
+        await asyncio.sleep(
+            0
+        )  # 실제 폴처럼 이벤트 루프에 양보 — 안 하면 리스너 루프가 루프를 독점한다
         return None
 
     async def aclose(self) -> None:
@@ -248,3 +255,33 @@ async def test_handler_error_does_not_drop_connection(monkeypatch):
     )
     assert _FakeRedis.connect_count == 1  # 핸들러 예외로 연결을 버리지 않는다
     assert received == ["ok"]
+
+
+async def test_watchdog_raises_when_subscribed_socket_goes_silent(monkeypatch):
+    """구독은 됐는데 그 뒤로 **아무것도 안 오는** 연결은 유한 시간 안에 예외로 끝나야 한다.
+
+    redis-py의 `get_message(timeout=…)`는 명시 타임아웃이 소켓 타임아웃을 덮어쓰고 None을
+    반환하므로, 연결 성립 후 먹통(페일오버·SG 변경)이 되면 소켓 타임아웃으로는 예외가 영영
+    안 난다. 그래서 리스너가 스스로 PING을 보내고 pong이 없으면 끊는다 — 그 예외가 있어야
+    바깥의 백오프 재연결이 돈다.
+    """
+    # 폴은 매번 None, stop_event는 아무도 안 세운다 — 워치독만이 이 루프를 끝낼 수 있다.
+    stop_event = _setup(monkeypatch, [_Script()])
+    monkeypatch.setattr(pubsub_mod, "_MESSAGE_POLL_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(pubsub_mod, "_WATCHDOG_IDLE_SEC", 0.05)
+    monkeypatch.setattr(pubsub_mod, "_WATCHDOG_PONG_SEC", 0.05)
+
+    task = asyncio.ensure_future(
+        pubsub_mod._listen_once(
+            redis_url="redis://test",
+            handlers={"ch": _noop_handler},
+            stop_event=stop_event,
+            on_healthy=lambda: None,
+        )
+    )
+    done, _ = await asyncio.wait({task}, timeout=3.0)
+    if task not in done:
+        task.cancel()
+        pytest.fail("구독 소켓이 조용해졌는데 리스너가 끝나지 않는다 — 재연결이 영영 없다")
+    with pytest.raises(ConnectionError):
+        task.result()

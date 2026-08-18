@@ -20,7 +20,6 @@ from uuid import UUID, uuid4
 
 from redis.asyncio import Redis
 
-from app.core.config import settings
 from app.infra.redis import RedisLike, redis_connection_kwargs
 
 log = logging.getLogger(__name__)
@@ -35,26 +34,23 @@ _RECONNECT_BACKOFF_MAX_SEC = 30.0
 _HEALTHY_UPTIME_SEC = 5.0
 
 
-def _subscriber_socket_timeout() -> float:
-    """구독 소켓의 읽기 타임아웃.
-
-    앱 기본값(1s)을 그대로 쓰면 폴 간격과 맞물려 매초 TimeoutError가 나고 멀쩡한 연결이
-    끊긴다 — 폴 타임아웃보다 확실히 커야 한다. 다만 그건 **하한**이지 고정값이 아니다:
-    운영자가 교차 AZ 지연 때문에 `REDIS_SOCKET_TIMEOUT`을 올리면 구독 소켓도 같이 올라가야
-    한다(하드코딩하면 그 노브가 셋 중 둘만 덮는다).
-
-    무한 대기는 어느 쪽이든 막아야 한다 — 아래 재연결 백오프는 **예외를 받아야** 도는데,
-    타임아웃이 없으면 먹통 Redis에서 ping·subscribe가 영영 반환하지 않아 이 인스턴스의
-    실시간 전달이 프로세스 재시작 전까지 조용히 죽는다.
-    """
-    return max(settings.REDIS_SOCKET_TIMEOUT, _MESSAGE_POLL_TIMEOUT_SEC * 5)
+# 구독 소켓 워치독. 소켓 타임아웃은 이 소켓의 **폴 루프에서는 뜨지 않는다** — redis-py의
+# `get_message(timeout=…)`는 명시 타임아웃이 소켓 타임아웃을 덮어쓰고 None을 반환한다.
+# 그래서 연결 성립 후 먹통(페일오버·SG 변경으로 패킷만 조용히 사라짐)이 되면 소켓 타임아웃
+# 으로는 예외가 영영 안 나고 재연결도 없다. 리스너가 스스로 PING을 보내고 pong이 없으면
+# 끊는다 — 그 예외가 있어야 아래 백오프 재연결이 돈다. 정상 트래픽에서는 메시지 자체가
+# 수신이라 PING이 나가지 않는다.
+_WATCHDOG_IDLE_SEC = 10.0  # 마지막 수신 뒤 이만큼 조용하면 구독 소켓으로 PING
+_WATCHDOG_PONG_SEC = 5.0  # PING 뒤 이만큼 아무 수신(pong 포함)이 없으면 죽은 것으로 판정
 
 
 def make_subscriber_client(redis_url: str) -> Any:
-    """구독 전용 연결 1개. 공유 풀을 쓰지 않는 이유는 이 모듈 상단 참조."""
-    return Redis.from_url(
-        redis_url, **redis_connection_kwargs(socket_timeout=_subscriber_socket_timeout())
-    )
+    """구독 전용 연결 1개(공유 풀을 쓰지 않는 이유는 모듈 상단).
+
+    소켓 타임아웃은 앱 공용값 그대로 — 여기서 그 값이 덮는 것은 ping·subscribe·재연결처럼
+    **응답을 기다리는 명령**뿐이고, 폴 루프의 유한성은 위 워치독이 맡는다.
+    """
+    return Redis.from_url(redis_url, **redis_connection_kwargs())
 
 
 # envelope origin — 리스너가 자기 발행분을 식별해 건너뛴다.
@@ -169,17 +165,27 @@ async def _listen_once(
         log.info("user fanout pubsub subscribed channels=%s", sorted(handlers))
         connected_at = time.monotonic()
         healthy_signaled = False
+        last_rx = connected_at
+        pinged_at: float | None = None
         while not stop_event.is_set():
             msg = await pubsub.get_message(
                 ignore_subscribe_messages=True,
                 timeout=_MESSAGE_POLL_TIMEOUT_SEC,
             )
-            if not healthy_signaled and time.monotonic() - connected_at >= _HEALTHY_UPTIME_SEC:
+            now = time.monotonic()
+            if not healthy_signaled and now - connected_at >= _HEALTHY_UPTIME_SEC:
                 on_healthy()
                 healthy_signaled = True
-            if msg is None:
-                continue
-            await _dispatch_message(msg, handlers)
+            if msg is not None:
+                last_rx, pinged_at = now, None  # pong도 수신이다 — _dispatch가 type으로 거른다
+                await _dispatch_message(msg, handlers)
+            elif pinged_at is None and now - last_rx > _WATCHDOG_IDLE_SEC:
+                await pubsub.ping()  # 구독 소켓 자체로 — 공유 풀의 ping은 이 소켓을 증명 못 한다
+                pinged_at = now
+            elif pinged_at is not None and now - pinged_at > _WATCHDOG_PONG_SEC:
+                raise ConnectionError(
+                    f"subscriber watchdog: no traffic for {now - last_rx:.1f}s, no pong"
+                )
     finally:
         if pubsub is not None:
             try:

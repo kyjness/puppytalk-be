@@ -73,6 +73,14 @@ celery_app.conf.update(
         "interval_max": 0.5,
     },
     result_expires=settings.CELERY_RESULT_EXPIRES_SECONDS,
+    # 결과를 읽는 곳이 없다. ignore_result가 아니면 `.delay()`가 발행 시 **결과 백엔드를
+    # pubsub.subscribe** 하고(`send_task` → `backend.on_task_call`), 그 클라이언트는 위
+    # broker_transport_options 밖이라 Celery 기본값(socket_timeout=120s, connect 무제한)을
+    # 쓴다 — 먹통 Redis에서 요청이 인라인 폴백에 닿기 전에 그만큼 매달린다.
+    task_ignore_result=True,
+    # 그래도 결과 백엔드 클라이언트는 만들어지므로 방어로 공용 타임아웃을 따르게 한다.
+    redis_socket_timeout=settings.REDIS_SOCKET_TIMEOUT,
+    redis_socket_connect_timeout=settings.REDIS_SOCKET_CONNECT_TIMEOUT,
 )
 
 celery_app.autodiscover_tasks(["app.worker.tasks"])

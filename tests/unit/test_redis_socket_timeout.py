@@ -26,6 +26,8 @@ from app.core.rate_limit import check_fixed_window
 from app.infra.cache import get_or_compute_json
 from app.infra.redis import RedisLike, create_redis_client
 from pydantic import TypeAdapter
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 pytestmark = pytest.mark.asyncio
 
@@ -160,18 +162,22 @@ async def test_pubsub_listener_raises_in_bounded_time_when_redis_is_unresponsive
     타임아웃이 없으면 접속·구독 단계에서 매달려 그 예외가 영영 오지 않는다. 그러면
     이 인스턴스의 크로스 인스턴스 실시간 전달이 프로세스 재시작까지 조용히 죽는다 —
     재연결 기계가 있는데도 돌지 않는, 코드만 봐서는 안 보이는 실패다.
+
+    여기서 보는 건 **접속·구독 단계**(응답을 기다리는 명령)다. 구독 성립 후의 먹통은
+    소켓 타임아웃이 못 잡고(폴의 명시 타임아웃이 덮어쓴다) 워치독이 잡는다 —
+    test_pubsub_reconnect.py::test_watchdog_raises_when_subscribed_socket_goes_silent.
     """
     from app.infra import pubsub as pubsub_mod
 
     async def _noop(_user_id: UUID, _payload: str) -> None:
         return None
 
-    # 구독 타임아웃은 `max(설정, 폴 간격 * 5)`라 **둘 다** 낮춰야 실제로 짧아진다.
     monkeypatch.setattr(settings, "REDIS_SOCKET_TIMEOUT", _TEST_SOCKET_TIMEOUT)
-    monkeypatch.setattr(pubsub_mod, "_MESSAGE_POLL_TIMEOUT_SEC", _TEST_SOCKET_TIMEOUT / 2)
 
     async with _blackhole_redis() as url:
-        try:
+        # 아무 Exception이나 받으면 잘못된 kwarg의 TypeError도 "계약 이행"으로 통과한다 —
+        # 연결 계층 예외(redis 타임아웃/연결 오류)만 인정한다.
+        with pytest.raises((RedisTimeoutError, RedisConnectionError)):
             await _within_budget(
                 pubsub_mod._listen_once(
                     redis_url=url,
@@ -181,9 +187,6 @@ async def test_pubsub_listener_raises_in_bounded_time_when_redis_is_unresponsive
                 ),
                 "예외가 오지 않았다 — 백오프 재연결이 발동하지 못한다",
             )
-        except Exception:
-            return  # 계약대로 연결 계층 예외가 올라왔다
-        pytest.fail("먹통 Redis인데 _listen_once가 정상 종료했다")
 
 
 # --- 배선 그물 ---
@@ -228,6 +231,5 @@ async def test_every_redis_client_carries_socket_timeouts(
     assert client is not None
 
     kwargs = client.connection_pool.connection_kwargs
-    # 구독 소켓만 폴 간격 하한이 걸려 값이 크다 — "설정 이상"이면 계약을 지킨 것이다.
-    assert kwargs["socket_timeout"] >= settings.REDIS_SOCKET_TIMEOUT
+    assert kwargs["socket_timeout"] == settings.REDIS_SOCKET_TIMEOUT
     assert kwargs["socket_connect_timeout"] == settings.REDIS_SOCKET_CONNECT_TIMEOUT

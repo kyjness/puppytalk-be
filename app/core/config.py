@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 _root = Path(__file__).resolve().parent.parent.parent
@@ -176,6 +176,18 @@ class Settings(BaseSettings):
     def _parse_csv(cls, v: object) -> object:
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
+        return v
+
+    @field_validator("REDIS_SOCKET_TIMEOUT", "REDIS_SOCKET_CONNECT_TIMEOUT", mode="after")
+    @classmethod
+    def _positive_timeout(cls, v: float, info: ValidationInfo) -> float:
+        # 0은 "없음"이 아니라 **즉시 타임아웃**이다 — redis-py는 None이 아닌 값을 전부
+        # async_timeout으로 감싼다. 0이 들어오면 부팅 ping이 실패해 앱이 영구 fail-open으로 뜬다.
+        # 끄는 옵션은 두지 않는다(ADR 0005: 타임아웃은 fail-open의 전제).
+        if v <= 0:
+            raise ValueError(
+                f"{info.field_name}은 0보다 커야 한다 (0은 '없음'이 아니라 즉시 타임아웃)"
+            )
         return v
 
     @field_validator("ENVIRONMENT", mode="after")

@@ -1,6 +1,7 @@
 # 미디어 비즈니스 로직. 순수 데이터 반환·커스텀 예외. HTTP·ApiResponse 없음. Full-Async.
 
 
+import asyncio
 import logging
 import secrets
 from collections.abc import Awaitable, Callable
@@ -92,6 +93,12 @@ async def _keyset_cleanup(
         if len(rows) < batch_size:
             break
     return total_deleted
+
+
+# delete_image의 행 삭제 재시도 — 스토리지 삭제 뒤라 여기서 포기하면 없는 객체를 가리키는
+# 행이 남는다. 순간 끊김만 겨냥한다(DB가 진짜 죽었으면 어차피 요청 전체가 실패한다).
+_DELETE_ROW_ATTEMPTS = 3
+_DELETE_ROW_RETRY_DELAY_SEC = 0.1
 
 
 class MediaService:
@@ -271,6 +278,11 @@ class MediaService:
         `pending/` lifecycle은 `media/` 접두사를 덮지 않는다(ADR 0010). 이 순서면 실패 시
         행이 남아 사용자 재시도와 sweeper 회수가 모두 가능하다 — confirm 경로가 검증을
         promote 앞에 두는 것과 같은 이유다.
+
+        **알려진 갭**: 요청 안에서 두 시스템(S3·DB)을 건드리므로 반대 케이스 — 스토리지는
+        지웠는데 행 삭제가 실패 — 도 존재한다. 그때 행은 없는 객체를 가리키며 남는다(재시도
+        DELETE는 멱등이라 정리된다). 순간 끊김은 아래 재시도가 덮고, 근본 해소는 소프트 삭제 +
+        스위퍼 수거로의 재설계다(backlog #44) — 요청은 DB 하나만 건드리고 스토리지는 뒤에서.
         """
         async with db.begin():
             image = await MediaRepository.get_image_by_id(image_id, db=db)
@@ -281,8 +293,26 @@ class MediaService:
         if file_key:
             await run_in_threadpool(storage_delete, file_key)
 
-        async with db.begin():
-            await MediaRepository.delete_image_if_owned(image_id, user_id, db=db)
+        # 스토리지는 이미 지워졌으므로 행 삭제는 최대한 붙잡는다 — DB 순간 끊김에 한해.
+        for attempt in range(1, _DELETE_ROW_ATTEMPTS + 1):
+            try:
+                async with db.begin():
+                    removed = await MediaRepository.delete_image_if_owned(image_id, user_id, db=db)
+                if not removed:
+                    logger.warning(
+                        "delete_image: 행이 이미 없음(동시 삭제·소유 변경) image_id=%s", image_id
+                    )
+                return
+            except Exception:
+                if attempt == _DELETE_ROW_ATTEMPTS:
+                    logger.error(
+                        "delete_image: 스토리지는 지웠는데 행 삭제 실패 — 행이 없는 객체를 "
+                        "가리킴(재시도 DELETE로 정리됨) image_id=%s file_key=%s",
+                        image_id,
+                        file_key,
+                    )
+                    raise
+                await asyncio.sleep(_DELETE_ROW_RETRY_DELAY_SEC * attempt)
 
     @classmethod
     async def sweep_unused_images(cls, db: AsyncSession) -> int:

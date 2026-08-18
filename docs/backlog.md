@@ -813,6 +813,28 @@ WS 메시지 한도는 이미 연 연결의 트래픽만 막지 연결 수는 �
 > 차단 시점(`created_at`) 정렬은 복합 커서 인코딩이 필요한데 이 목록에 그 복잡도는 정당화되지
 > 않는다. 응답 계약·정렬 축이 바뀌어 FE 동반 수정 대상.
 
+### 44. 이미지 삭제 — 요청 안에서 S3·DB를 둘 다 건드린다 — P1
+
+**파일**: `app/domain/media/service.py`(`delete_image`), `app/domain/media/model.py`, 마이그레이션 1건
+
+`DELETE /media/{id}`가 요청 안에서 스토리지 삭제와 DB 행 삭제를 **순서대로 둘 다** 수행한다.
+두 시스템은 트랜잭션으로 묶이지 않으므로 어느 순서든 "앞은 됐는데 뒤가 실패"가 존재한다:
+
+| 순서 | 실패 지점 | 남는 상태 | 회복 |
+|---|---|---|---|
+| 행 → 스토리지 (이전) | 스토리지 삭제 실패 | 아무도 못 찾는 객체 | **불가** (sweeper는 행 기준) |
+| 스토리지 → 행 (현재) | 행 삭제 실패 | 없는 객체를 가리키는 행 | 사용자 재시도 DELETE (멱등) |
+
+현재 순서가 낫지만 여전히 사용자에게 재시도를 떠넘긴다. 임시로 행 삭제 재시도(3회)를 넣었다.
+
+**수정 방향(업계 표준 — 요청 안에서 두 시스템을 건드리지 않는다)**: `images.deleted_at`
+컬럼 추가 → `delete_image`는 소유 확인 후 **소프트 삭제만**(DB 쓰기 하나, 즉시 200) →
+조회 쿼리에 `deleted_at IS NULL` → 기존 주기 스위퍼(`sweep_unused_images`)가 `deleted_at`
+행의 스토리지 삭제 후 행 삭제(실패하면 다음 회차 재시도). 스토리지 실패가 사용자에게 보이지
+않고, 행이 없는 객체·객체가 없는 행 둘 다 스위퍼가 수렴시킨다. ADR 0010에 결정 기록,
+마이그레이션은 [ADR 0015](adr/0015-index-migration-concurrently.md) 규약(부분 인덱스
+`WHERE deleted_at IS NOT NULL`은 CONCURRENTLY).
+
 ---
 
 ## 요약표
@@ -861,3 +883,4 @@ WS 메시지 한도는 이미 연 연결의 트래픽만 막지 연결 수는 �
 | **P1** | 41 | 인덱스 마이그레이션 비-CONCURRENTLY(배포 중 쓰기 차단) | `migrations/*`, ADR 0015 |
 | **P2** | 43 | 차단 목록 페이지네이션 부재 | `app/domain/users/model.py`, `service.py`, `router.py` |
 | **P3** | 42 | SSE·WS 유저당 연결 수 상한 부재 | `notifications/stream.py`, `chat/manager.py` |
+| **P1** | 44 | 이미지 삭제가 요청 안에서 S3·DB를 둘 다 건드림(소프트 삭제+스위퍼로) | `app/domain/media/service.py`, 마이그레이션 |

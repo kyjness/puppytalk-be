@@ -115,3 +115,34 @@ async def test_no_header_skips_idempotency_entirely():
     cached, h = await post_create_idempotency_before(_req(redis), uuid.uuid4(), None)
     assert cached is None and h is None
     assert redis.kv == {}
+
+
+class _SetThenTimeoutRedis(FakeRedis):
+    """SET NX가 서버에는 적용됐는데 응답만 늦어 클라이언트가 타임아웃을 받는 상황."""
+
+    async def set(self, key, val, nx=False, ex=None):
+        await super().set(key, val, nx=nx, ex=ex)
+        raise TimeoutError("reply exceeded socket_timeout")
+
+
+async def test_lock_set_but_reply_timed_out_is_still_released():
+    """락은 서버에 잡혔는데 응답만 늦어 예외가 난 경우에도 **끝나면 풀려야 한다.**
+
+    소켓 타임아웃 도입으로 새로 열린 경로다. 예외를 fail-open으로 처리하면서 토큰을 버리면
+    아무도 그 락을 못 풀어 TTL(120s) 동안 같은 키의 재시도가 전부 409가 된다 — 옛
+    무조건 DEL은 이 경우를 자가치유했다. 토큰을 쥐고 있으면 CAS 해제는 안전하다(내 토큰일
+    때만 지운다).
+    """
+    redis = _SetThenTimeoutRedis()
+    req = _req(redis)
+    uid = uuid.uuid4()
+
+    cached, h = await post_create_idempotency_before(req, uid, _KEY)
+    assert cached is None and h is not None
+    assert _lock_key(h.fingerprint) in redis.kv, "전제: 서버에는 락이 잡혀 있다"
+
+    await post_create_idempotency_after_failure(req, h)
+
+    assert _lock_key(h.fingerprint) not in redis.kv, (
+        "응답만 늦은 락을 안 풀면 TTL 동안 같은 키가 전부 409다"
+    )

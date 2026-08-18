@@ -17,7 +17,7 @@ from app.common.responses import get_request_id
 from app.common.schemas import ApiResponse
 from app.core.config import settings
 from app.domain.posts.schemas import PostIdData
-from app.infra.lock import release_lock, try_acquire_lock
+from app.infra.lock import new_lock_token, release_lock, try_acquire_lock
 from app.infra.redis import RedisLike, bulk_to_str, get_app_redis
 
 log = logging.getLogger(__name__)
@@ -35,8 +35,10 @@ class IdempotencyHandle(NamedTuple):
     """before 훅이 after 훅에 넘기는 상관 정보.
 
     검증·해시·락 획득이 before 한 곳에서만 일어나도록 결과를 통째로 실어 나른다.
-    `lock_token`은 **락을 실제로 잡았을 때만** 채워진다 — Redis 부재·fail-open 구간에서는
-    None이고, 그때 해제를 시도하면 남의 락을 지울 수 있다.
+    `lock_token`은 **락을 잡았거나 잡았을 수도 있을 때** 채워진다 — 획득 명령이 예외로
+    끝났어도(응답만 늦은 타임아웃) 서버에는 잡혔을 수 있으므로 토큰을 버리지 않는다. 해제는
+    CAS라 내 토큰일 때만 지우니 "아마도 잡힘"을 풀어도 남의 락은 건드리지 않는다.
+    Redis 부재·캐시 히트처럼 획득을 **시도조차 안 한** 경우에만 None이다.
     """
 
     fingerprint: str
@@ -94,6 +96,9 @@ async def post_create_idempotency_before(
     if rcli is None:
         return None, IdempotencyHandle(fp, None)
 
+    # 토큰은 try 밖에서 만든다 — SET이 서버에 적용됐는데 응답만 늦어 예외가 나면, 이 토큰으로
+    # after 훅이 CAS 해제를 시도한다. 안 그러면 TTL 동안 같은 키의 재시도가 전부 409다.
+    token = new_lock_token()
     # fail-open try는 Redis I/O만 감싼다 — 의도된 409는 try 밖에서 던져 삼켜질 표면 자체를 없앤다.
     try:
         payload = bulk_to_str(await rcli.get(_result_redis_key(fp)))
@@ -115,14 +120,17 @@ async def post_create_idempotency_before(
 
         # 공용 락 프리미티브(app/infra/lock.py) — 랜덤 토큰 발급 + CAS 해제. 직접 SET NX 하고
         # DEL 로 풀면 락 TTL이 만료된 뒤 뒤늦게 끝난 요청이 **다음 요청의 락**을 지운다.
-        token = await try_acquire_lock(
-            rcli, _lock_redis_key(fp), settings.IDEMPOTENCY_POST_CREATE_LOCK_TTL_SECONDS
+        acquired = await try_acquire_lock(
+            rcli,
+            _lock_redis_key(fp),
+            settings.IDEMPOTENCY_POST_CREATE_LOCK_TTL_SECONDS,
+            token=token,
         )
     except Exception as e:
         log.warning("멱등성 Redis 오류(Fail-open): %s", e)
-        return None, IdempotencyHandle(fp, None)
+        return None, IdempotencyHandle(fp, token)  # "아마도 잡힘" — 해제는 CAS라 안전
 
-    if token is None:
+    if acquired is None:
         raise ConcurrentUpdateException(_IDEMP_CONFLICT_MESSAGE)
     return None, IdempotencyHandle(fp, token)
 
@@ -140,7 +148,7 @@ async def _store_success_result(rcli: RedisLike, fp: str, response_obj: Any) -> 
 
 
 async def _release_if_held(rcli: RedisLike, handle: IdempotencyHandle) -> None:
-    """내가 잡은 락일 때만 CAS로 해제. 토큰이 없으면(fail-open 구간) 아무것도 하지 않는다."""
+    """내가 잡은(또는 잡았을 수 있는) 락만 CAS로 해제. 토큰이 없으면 시도조차 안 한 것이다."""
     if handle.lock_token is None:
         return
     await release_lock(rcli, _lock_redis_key(handle.fingerprint), handle.lock_token)

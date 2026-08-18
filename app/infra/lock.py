@@ -18,9 +18,20 @@ RELEASE_LOCK_LUA = (
 _RELEASE_LOCK_SHA = hashlib.sha1(RELEASE_LOCK_LUA.encode()).hexdigest()
 
 
-async def try_acquire_lock(redis: RedisLike, key: str, ttl_seconds: int) -> str | None:
-    """획득 성공 시 해제용 토큰, 이미 점유 중이면 None. Redis 오류는 전파."""
-    token = secrets.token_urlsafe(24)
+def new_lock_token() -> str:
+    return secrets.token_urlsafe(24)
+
+
+async def try_acquire_lock(
+    redis: RedisLike, key: str, ttl_seconds: int, *, token: str | None = None
+) -> str | None:
+    """획득 성공 시 해제용 토큰, 이미 점유 중이면 None. Redis 오류는 전파.
+
+    `token`을 호출부가 미리 만들어 넘기면, SET이 서버에는 적용됐는데 **응답만 늦어**
+    예외가 난 경우에도 호출부가 토큰을 쥐고 있어 CAS 해제를 시도할 수 있다(내 토큰일 때만
+    지우므로 안전하다). 안 넘기면 여기서 만든다.
+    """
+    token = new_lock_token() if token is None else token
     acquired = bool(await redis.set(key, token, nx=True, ex=ttl_seconds))
     return token if acquired else None
 

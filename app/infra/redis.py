@@ -127,13 +127,19 @@ def redis_connection_kwargs(*, socket_timeout: float | None = None) -> dict[str,
     }
 
 
-def create_redis_client() -> RedisLike | None:
-    """설정에서 앱 공용 풀 클라이언트를 만든다(연결 확인은 호출부). REDIS_URL이 비면 None."""
+def create_redis_client(*, max_connections: int | None = None) -> RedisLike | None:
+    """설정에서 풀 클라이언트를 만든다(연결 확인은 호출부). REDIS_URL이 비면 None.
+
+    풀 크기만 호출부가 정한다 — 앱 lifespan은 설정값(SSE pubsub이 길게 점유), 워커는 작게.
+    풀 옵션(`ConnectionPool.from_url` 인자)의 출처는 여기 하나다.
+    """
     if not settings.REDIS_URL:
         return None
     pool = ConnectionPool.from_url(
         settings.REDIS_URL,
-        max_connections=settings.REDIS_MAX_CONNECTIONS,
+        max_connections=(
+            settings.REDIS_MAX_CONNECTIONS if max_connections is None else max_connections
+        ),
         **redis_connection_kwargs(),
     )
     # RedisLike 주석은 실클라이언트가 Protocol 계약을 만족하는지 타입 수준에서 강제한다.

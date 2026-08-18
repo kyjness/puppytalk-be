@@ -257,10 +257,15 @@ class _FakePubSub:
     async def unsubscribe(self, *channels: str) -> None:
         pass
 
+    async def ping(self) -> None:
+        # 워치독이 유휴 시 부른다 — 이 가짜는 응답(pong)을 돌려주지 않는다.
+        pass
+
     async def get_message(self, *, ignore_subscribe_messages: bool, timeout: float):
         if self._messages:
             return self._messages.pop(0)
         self._stop_event.set()
+        await asyncio.sleep(0)  # 실제 폴처럼 이벤트 루프에 양보
         return None
 
     async def aclose(self) -> None:

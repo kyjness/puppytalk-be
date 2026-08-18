@@ -27,8 +27,16 @@
    구체값은 `REDIS_SOCKET_TIMEOUT`(1s)·`REDIS_SOCKET_CONNECT_TIMEOUT`(2s)이고, 설정 창구는
    `app/infra/redis.py::redis_connection_kwargs` **하나**다 — 클라이언트 생성부가 셋이라
    (앱 풀·구독 소켓·워커) 각자 쓰면 그중 하나만 옵션이 빠지는 식으로 조용히 갈라진다.
-   구독 소켓(`app/infra/pubsub.py`)만은 유휴가 정상이라 **폴 간격의 5배를 하한**으로 두지만,
-   그 이상은 같은 설정을 따른다(운영자가 값을 올리면 구독 소켓도 같이 올라간다).
+   Celery 브로커·결과 백엔드는 `app/core/celery.py`에서 따로 설정하며 결과는 읽지 않으므로
+   `task_ignore_result`로 발행 시 결과 백엔드 구독 자체를 없앤다.
+   **소켓 타임아웃이 못 덮는 곳이 하나 있다** — 구독 소켓의 폴 루프. redis-py의
+   `get_message(timeout=…)`는 명시 타임아웃이 소켓 타임아웃을 덮어쓰고 `None`을 반환하므로,
+   구독 성립 후 먹통이 되면 예외가 영영 안 난다. 그래서 리스너는 **앱 수준 워치독**(유휴 시
+   PING, pong 부재 시 끊고 재연결)으로 유한성을 확보한다(`app/infra/pubsub.py`).
+   같은 이유로 DB readiness 프로브도 `asyncio.wait_for` 한 번으로는 부족하다 — psycopg가 첫
+   취소를 잡아 재대기하므로 이중 취소로 끝낸다(`app/db/connection.py::_bounded`).
+   교훈은 하나다: **"타임아웃을 걸었다"와 "실제로 유한하다"는 다르고, 가짜 의존성 테스트는
+   그 차이를 못 본다** — 드라이버가 실제로 어떻게 대기·취소하는지를 확인해야 한다.
    S3는 **presigned POST라 업로드가 서버를 경유하지 않고**(`app/infra/storage.py`), 서버가 직접
    호출하는 삭제 경로는 `run_in_threadpool`로 이벤트 루프와 분리돼 있어 별도 경계가 필요 없다.
 3. **Circuit Breaker 미채택** — 아래 Non-goals 참조.
