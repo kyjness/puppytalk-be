@@ -14,7 +14,7 @@ from app.core.ids import parse_public_id_value
 from app.db import get_connection
 from app.domain.notifications.model import Notification
 from app.domain.notifications.schema import NotificationEvent, build_sns_payload
-from app.infra.redis import RedisLike
+from app.infra.redis import RedisLike, redis_connection_kwargs
 from app.infra.sns import deliver_once
 
 log = logging.getLogger(__name__)
@@ -34,11 +34,7 @@ def _get_redis() -> RedisLike | None:
         # 타임아웃 없이 두면 먹통 Redis에서 멱등성 조회가 반환하지 않아 워커 슬롯이
         # 소진된다 — 여기 fail-open도 예외를 받아야 발동한다(ADR 0005).
         _redis_client = Redis.from_url(
-            settings.REDIS_URL,
-            decode_responses=True,
-            max_connections=4,
-            socket_timeout=settings.REDIS_SOCKET_TIMEOUT,
-            socket_connect_timeout=settings.REDIS_SOCKET_CONNECT_TIMEOUT,
+            settings.REDIS_URL, max_connections=4, **redis_connection_kwargs()
         )
     return _redis_client
 

@@ -21,16 +21,11 @@ from uuid import UUID, uuid4
 from redis.asyncio import Redis
 
 from app.core.config import settings
-from app.infra.redis import RedisLike
+from app.infra.redis import RedisLike, redis_connection_kwargs
 
 log = logging.getLogger(__name__)
 
 _MESSAGE_POLL_TIMEOUT_SEC = 1.0
-# 구독 소켓은 유휴가 정상이라 앱 기본값(1s)을 그대로 쓰면 폴 간격과 맞물려 매초 TimeoutError가
-# 나고 멀쩡한 연결이 끊긴다 — 폴 타임아웃보다 확실히 커야 한다. 그래도 무한 대기는 막아야 한다:
-# 아래 재연결 백오프는 **예외를 받아야** 도는데, 타임아웃이 없으면 먹통 Redis에서 ping·subscribe가
-# 영영 반환하지 않아 이 인스턴스의 실시간 전달이 재시작 전까지 조용히 죽는다.
-_SOCKET_TIMEOUT_SEC = _MESSAGE_POLL_TIMEOUT_SEC * 5
 
 # 리스너가 죽으면 해당 인스턴스의 크로스 인스턴스 실시간 전달이 프로세스 재시작까지
 # 전멸한다(멀티 인스턴스·99.9% 전제에서 미수용) — 연결 실패·수신 오류는 백오프 재연결.
@@ -38,6 +33,29 @@ _RECONNECT_BACKOFF_INITIAL_SEC = 0.5
 _RECONNECT_BACKOFF_MAX_SEC = 30.0
 # 백오프 리셋 기준: 연결이 이 시간 이상 생존해야 '건강'으로 본다(아래 _listen_once 참조).
 _HEALTHY_UPTIME_SEC = 5.0
+
+
+def _subscriber_socket_timeout() -> float:
+    """구독 소켓의 읽기 타임아웃.
+
+    앱 기본값(1s)을 그대로 쓰면 폴 간격과 맞물려 매초 TimeoutError가 나고 멀쩡한 연결이
+    끊긴다 — 폴 타임아웃보다 확실히 커야 한다. 다만 그건 **하한**이지 고정값이 아니다:
+    운영자가 교차 AZ 지연 때문에 `REDIS_SOCKET_TIMEOUT`을 올리면 구독 소켓도 같이 올라가야
+    한다(하드코딩하면 그 노브가 셋 중 둘만 덮는다).
+
+    무한 대기는 어느 쪽이든 막아야 한다 — 아래 재연결 백오프는 **예외를 받아야** 도는데,
+    타임아웃이 없으면 먹통 Redis에서 ping·subscribe가 영영 반환하지 않아 이 인스턴스의
+    실시간 전달이 프로세스 재시작 전까지 조용히 죽는다.
+    """
+    return max(settings.REDIS_SOCKET_TIMEOUT, _MESSAGE_POLL_TIMEOUT_SEC * 5)
+
+
+def make_subscriber_client(redis_url: str) -> Any:
+    """구독 전용 연결 1개. 공유 풀을 쓰지 않는 이유는 이 모듈 상단 참조."""
+    return Redis.from_url(
+        redis_url, **redis_connection_kwargs(socket_timeout=_subscriber_socket_timeout())
+    )
+
 
 # envelope origin — 리스너가 자기 발행분을 식별해 건너뛴다.
 # import 시점 상수로 두면 preload-then-fork(gunicorn --preload)에서 전 워커가 같은 값을
@@ -144,12 +162,7 @@ async def _listen_once(
     client: Any = None
     pubsub: Any = None
     try:
-        client = Redis.from_url(
-            redis_url,
-            decode_responses=True,
-            socket_timeout=_SOCKET_TIMEOUT_SEC,
-            socket_connect_timeout=settings.REDIS_SOCKET_CONNECT_TIMEOUT,
-        )
+        client = make_subscriber_client(redis_url)
         await client.ping()
         pubsub = client.pubsub()
         await pubsub.subscribe(*handlers)

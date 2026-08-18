@@ -10,12 +10,14 @@ Redis가 **죽은 것**(프로세스 down → connection refused)과 **먹통인
 
 단언은 구현 상수(`socket_timeout == 1.0`)가 아니라 **사용자 층위**에 둔다 — 값을 못박으면
 그 값 자체가 계약이 되어 튜닝할 때마다 테스트를 고쳐야 하고, 정작 "무한 대기하지 않는다"는
-본래 계약은 검증되지 않는다.
+본래 계약은 검증되지 않는다. 같은 이유로 테스트는 프로덕션 기본값(1s·5s)을 그대로
+기다리지 않고 **자기 타임아웃을 주입한다** — 기다림은 스위트 시간일 뿐 계약이 아니다.
 """
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
+from typing import Any, TypeVar
 from uuid import UUID
 
 import pytest
@@ -29,7 +31,22 @@ pytestmark = pytest.mark.asyncio
 
 # "유한한가"만 본다. 정확한 소요 시간을 단언하면 타임아웃 값을 얼리게 되므로 넉넉히 잡는다
 # (재연결 재시도가 끼어도 통과할 만큼). 수정 전 코드는 무한 대기라 어떤 값을 줘도 실패한다.
+# 통과 경로에서는 지불되지 않는다 — 아래 _TEST_SOCKET_TIMEOUT 참조.
 _BUDGET_SEC = 10.0
+
+# 테스트가 실제로 기다리는 시간. 프로덕션 기본값(1s)을 그대로 쓰면 이 파일 하나가
+# 단위 스위트에 수 초를 얹는데, 그 초는 아무것도 증명하지 않는다.
+_TEST_SOCKET_TIMEOUT = 0.1
+
+_T = TypeVar("_T")
+
+
+async def _within_budget(awaitable: Awaitable[_T], why: str) -> _T:
+    """예산 안에 끝나지 않으면 "행"이 아니라 **읽히는 실패**로 떨어뜨린다."""
+    try:
+        return await asyncio.wait_for(awaitable, timeout=_BUDGET_SEC)
+    except TimeoutError:
+        pytest.fail(f"{_BUDGET_SEC}s 안에 {why} — Redis 소켓 타임아웃 부재.")
 
 
 @contextlib.asynccontextmanager
@@ -66,6 +83,7 @@ async def _blackhole_redis() -> AsyncIterator[str]:
 async def _client_to_blackhole(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[RedisLike]:
     async with _blackhole_redis() as url:
         monkeypatch.setattr(settings, "REDIS_URL", url)
+        monkeypatch.setattr(settings, "REDIS_SOCKET_TIMEOUT", _TEST_SOCKET_TIMEOUT)
         client = create_redis_client()
         assert client is not None
         try:
@@ -75,50 +93,30 @@ async def _client_to_blackhole(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator
                 await asyncio.wait_for(client.aclose(), timeout=2.0)
 
 
-async def test_rate_limit_fails_open_in_bounded_time_when_redis_is_unresponsive(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "fail_open, key, max_count",
+    [(True, "global:blackhole", 10), (False, "login:blackhole", 5)],
+    ids=["fail_open", "memory_fallback"],
+)
+async def test_rate_limit_stays_bounded_when_redis_is_unresponsive(
+    monkeypatch: pytest.MonkeyPatch, fail_open: bool, key: str, max_count: int
 ) -> None:
-    """전역 한도(fail_open=True)는 먹통 Redis에서 **유한 시간 안에 통과**해야 한다.
+    """rate limit은 먹통 Redis에서 **유한 시간 안에** 통과해야 한다.
 
-    이 경로는 ASGI 미들웨어라 요청이 핸들러에 닿기 전에 지난다 — 여기서 매달리면
-    Redis 하나 때문에 전 요청이 멈추고, 이는 ADR 0005가 막으려는 바로 그 상황이다.
+    - `fail_open=True`(전역 한도): 그냥 통과. ASGI 미들웨어라 요청이 핸들러에 닿기 전에
+      지나므로, 여기서 매달리면 Redis 하나 때문에 전 요청이 멈춘다(ADR 0005).
+    - `fail_open=False`(남용 방어): 인메모리 폴백으로 넘어간다. ADR 0003이 "Redis가
+      죽었다고 로그인이 막히면 안 된다"고 약속한 지점이다.
+
+    둘 다 폴백이 `except`로 발동하므로 타임아웃이 없으면 한 줄도 실행되지 않는다.
     """
     async with _client_to_blackhole(monkeypatch) as client:
-        try:
-            allowed, _ = await asyncio.wait_for(
-                check_fixed_window(
-                    client, "global:blackhole", window_sec=60, max_count=10, fail_open=True
-                ),
-                timeout=_BUDGET_SEC,
-            )
-        except TimeoutError:
-            pytest.fail(
-                f"{_BUDGET_SEC}s 안에 fail-open이 발동하지 않았다 — Redis 소켓 타임아웃 부재. "
-                "먹통 Redis에서 모든 요청이 미들웨어에서 멈춘다."
-            )
-        assert allowed is True
-
-
-async def test_memory_fallback_engages_in_bounded_time_when_redis_is_unresponsive(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """남용 방어 경로(fail_open=False)는 먹통 Redis에서 **인메모리 폴백**으로 넘어가야 한다.
-
-    ADR 0003이 "Redis가 죽었다고 로그인이 막히면 안 된다"고 약속한 지점이다.
-    폴백은 예외를 받아야 발동하므로, 타임아웃이 없으면 로그인이 통째로 멈춘다.
-    """
-    async with _client_to_blackhole(monkeypatch) as client:
-        try:
-            allowed, _ = await asyncio.wait_for(
-                check_fixed_window(
-                    client, "login:blackhole", window_sec=60, max_count=5, fail_open=False
-                ),
-                timeout=_BUDGET_SEC,
-            )
-        except TimeoutError:
-            pytest.fail(
-                f"{_BUDGET_SEC}s 안에 메모리 폴백이 발동하지 않았다 — Redis 소켓 타임아웃 부재."
-            )
+        allowed, _ = await _within_budget(
+            check_fixed_window(
+                client, key, window_sec=60, max_count=max_count, fail_open=fail_open
+            ),
+            "폴백이 발동하지 않았다 — 먹통 Redis에서 요청이 미들웨어에 갇힌다",
+        )
         assert allowed is True  # 첫 요청이므로 로컬 윈도에서도 통과
 
 
@@ -137,58 +135,51 @@ async def test_cache_falls_back_to_loader_in_bounded_time_when_redis_is_unrespon
         return [1, 2, 3]
 
     async with _client_to_blackhole(monkeypatch) as client:
-        try:
-            result = await asyncio.wait_for(
-                get_or_compute_json(
-                    redis=client,
-                    key="test:blackhole",
-                    lock_key="test:blackhole:lock",
-                    ttl_seconds=60,
-                    adapter=TypeAdapter(list[int]),
-                    loader=_loader,
-                    cache_name="blackhole_test",
-                ),
-                timeout=_BUDGET_SEC,
-            )
-        except TimeoutError:
-            pytest.fail(
-                f"{_BUDGET_SEC}s 안에 loader 폴백이 일어나지 않았다 — Redis 소켓 타임아웃 부재."
-            )
+        result = await _within_budget(
+            get_or_compute_json(
+                redis=client,
+                key="test:blackhole",
+                lock_key="test:blackhole:lock",
+                ttl_seconds=60,
+                adapter=TypeAdapter(list[int]),
+                loader=_loader,
+                cache_name="blackhole_test",
+            ),
+            "loader 폴백이 일어나지 않았다",
+        )
         assert result == [1, 2, 3]
         assert loaded == [1], "폴백이 loader를 정확히 한 번 호출해야 한다"
 
 
-async def test_pubsub_listener_raises_in_bounded_time_when_redis_is_unresponsive() -> None:
+async def test_pubsub_listener_raises_in_bounded_time_when_redis_is_unresponsive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """구독 리스너는 먹통 Redis에서 **예외를 던져** 백오프 재연결로 넘어가야 한다.
 
     `_listen_once`의 계약은 "연결·수신 계층 예외는 밖으로 던져 재연결을 유도한다"인데,
     타임아웃이 없으면 접속·구독 단계에서 매달려 그 예외가 영영 오지 않는다. 그러면
     이 인스턴스의 크로스 인스턴스 실시간 전달이 프로세스 재시작까지 조용히 죽는다 —
     재연결 기계가 있는데도 돌지 않는, 코드만 봐서는 안 보이는 실패다.
-
-    구독 소켓은 유휴가 정상이라 폴 간격(1s)보다 큰 타임아웃을 쓴다. 그래서 예산도
-    앱 경로보다 넉넉히 잡는다.
     """
     from app.infra import pubsub as pubsub_mod
 
     async def _noop(_user_id: UUID, _payload: str) -> None:
         return None
 
+    # 구독 타임아웃은 `max(설정, 폴 간격 * 5)`라 **둘 다** 낮춰야 실제로 짧아진다.
+    monkeypatch.setattr(settings, "REDIS_SOCKET_TIMEOUT", _TEST_SOCKET_TIMEOUT)
+    monkeypatch.setattr(pubsub_mod, "_MESSAGE_POLL_TIMEOUT_SEC", _TEST_SOCKET_TIMEOUT / 2)
+
     async with _blackhole_redis() as url:
         try:
-            await asyncio.wait_for(
+            await _within_budget(
                 pubsub_mod._listen_once(
                     redis_url=url,
                     handlers={"test-channel": _noop},
                     stop_event=asyncio.Event(),
                     on_healthy=lambda: None,
                 ),
-                timeout=_BUDGET_SEC,
-            )
-        except TimeoutError:
-            pytest.fail(
-                f"{_BUDGET_SEC}s 안에 예외가 오지 않았다 — 구독 소켓 타임아웃 부재. "
-                "백오프 재연결이 발동하지 못한다."
+                "예외가 오지 않았다 — 백오프 재연결이 발동하지 못한다",
             )
         except Exception:
             return  # 계약대로 연결 계층 예외가 올라왔다
@@ -196,29 +187,47 @@ async def test_pubsub_listener_raises_in_bounded_time_when_redis_is_unresponsive
 
 
 # --- 배선 그물 ---
-# 위 동작 테스트가 본 계약이고, 아래는 클라이언트 생성부가 여럿이라 그중 하나만 옵션이
-# 빠지는 것을 막는 값싼 보조 검사다.
+# 위 동작 테스트가 본 계약이고, 아래는 클라이언트 생성부가 셋이라 그중 하나만 옵션이
+# 빠지는 것을 막는 값싼 보조 검사다. 셋 다 `redis_connection_kwargs()`를 거쳐야 한다.
 
 
-async def test_app_redis_client_carries_socket_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "REDIS_URL", "redis://127.0.0.1:6379/0")
-    client = create_redis_client()
-    assert client is not None
-    kwargs = client.connection_pool.connection_kwargs  # type: ignore[attr-defined]
-    assert kwargs["socket_timeout"] == settings.REDIS_SOCKET_TIMEOUT
-    assert kwargs["socket_connect_timeout"] == settings.REDIS_SOCKET_CONNECT_TIMEOUT
+def _app_client() -> Any:
+    return create_redis_client()
 
 
-async def test_worker_redis_client_carries_socket_timeouts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """워커도 같은 계약을 받아야 한다 — 먹통 Redis에서 멱등성 조회가 워커 슬롯을 소진한다."""
+def _worker_client(monkeypatch: pytest.MonkeyPatch) -> Any:
     from app.worker.jobs import notification_delivery as worker_mod
 
-    monkeypatch.setattr(settings, "REDIS_URL", "redis://127.0.0.1:6379/0")
     monkeypatch.setattr(worker_mod, "_redis_client", None)  # 프로세스 캐시 우회
-    client = worker_mod._get_redis()
+    return worker_mod._get_redis()
+
+
+def _subscriber_client() -> Any:
+    from app.infra import pubsub as pubsub_mod
+
+    return pubsub_mod.make_subscriber_client(settings.REDIS_URL)
+
+
+@pytest.mark.parametrize(
+    "make", ["app", "worker", "subscriber"], ids=["app", "worker", "subscriber"]
+)
+async def test_every_redis_client_carries_socket_timeouts(
+    monkeypatch: pytest.MonkeyPatch, make: str
+) -> None:
+    """앱 풀·워커·구독 소켓 셋 다 타임아웃을 실어야 한다.
+
+    워커가 빠지면 먹통 Redis에서 멱등성 조회가 워커 슬롯을 소진하고, 구독 소켓이 빠지면
+    그 인스턴스의 실시간 전달이 재시작까지 죽는다 — 셋의 실패 결과가 각각 다르다.
+    """
+    monkeypatch.setattr(settings, "REDIS_URL", "redis://127.0.0.1:6379/0")
+    client = {
+        "app": _app_client,
+        "worker": lambda: _worker_client(monkeypatch),
+        "subscriber": _subscriber_client,
+    }[make]()
     assert client is not None
-    kwargs = client.connection_pool.connection_kwargs  # type: ignore[attr-defined]
-    assert kwargs["socket_timeout"] == settings.REDIS_SOCKET_TIMEOUT
+
+    kwargs = client.connection_pool.connection_kwargs
+    # 구독 소켓만 폴 간격 하한이 걸려 값이 크다 — "설정 이상"이면 계약을 지킨 것이다.
+    assert kwargs["socket_timeout"] >= settings.REDIS_SOCKET_TIMEOUT
     assert kwargs["socket_connect_timeout"] == settings.REDIS_SOCKET_CONNECT_TIMEOUT

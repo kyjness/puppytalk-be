@@ -213,10 +213,9 @@ class MediaService:
             )
         except Exception:
             try:
-                # 스토리지 먼저, DB 행 나중 — `delete_image`와 같은 이유다. 행을 먼저 지우면
-                # 스토리지 삭제 실패 시 추적 수단이 사라져 고아 객체를 영영 회수할 수 없다.
-                # 이 순서면 행이 남아 고아 sweeper가 24시간 뒤 회수한다(temp image는 어디에도
-                # 연결되지 않으므로 sweeper 대상이다).
+                # 스토리지 먼저, DB 행 나중 — 근거는 `delete_image` docstring.
+                # 여기서만 참인 것: temp image는 어디에도 연결되지 않아 행만 남으면
+                # 고아 sweeper가 24시간 뒤 회수한다.
                 await run_in_threadpool(storage_delete, dest_key)
                 if image is not None:
                     async with db.begin():
@@ -283,7 +282,7 @@ class MediaService:
             await run_in_threadpool(storage_delete, file_key)
 
         async with db.begin():
-            await MediaRepository.delete_images_by_ids([image_id], db=db)
+            await MediaRepository.delete_image_if_owned(image_id, user_id, db=db)
 
     @classmethod
     async def sweep_unused_images(cls, db: AsyncSession) -> int:

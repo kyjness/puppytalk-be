@@ -24,9 +24,11 @@
    예외 자체가 발생하지 않아 fail-open 코드가 **한 줄도 실행되지 않는다.**
    Redis는 rate limit 미들웨어·인증 캐시가 매 요청 경유하므로, 이 경우 의존 하나의 이상이
    곧 전체 장애가 된다 — 이 ADR이 막으려는 바로 그 결과다.
-   구체값은 `REDIS_SOCKET_TIMEOUT`(1s)·`REDIS_SOCKET_CONNECT_TIMEOUT`(2s), 설정 창구는
-   `app/infra/redis.py::create_redis_client`. 구독 소켓(`app/infra/pubsub.py`)만은 유휴가
-   정상이라 메시지 폴 간격보다 큰 값을 따로 쓴다.
+   구체값은 `REDIS_SOCKET_TIMEOUT`(1s)·`REDIS_SOCKET_CONNECT_TIMEOUT`(2s)이고, 설정 창구는
+   `app/infra/redis.py::redis_connection_kwargs` **하나**다 — 클라이언트 생성부가 셋이라
+   (앱 풀·구독 소켓·워커) 각자 쓰면 그중 하나만 옵션이 빠지는 식으로 조용히 갈라진다.
+   구독 소켓(`app/infra/pubsub.py`)만은 유휴가 정상이라 **폴 간격의 5배를 하한**으로 두지만,
+   그 이상은 같은 설정을 따른다(운영자가 값을 올리면 구독 소켓도 같이 올라간다).
    S3는 **presigned POST라 업로드가 서버를 경유하지 않고**(`app/infra/storage.py`), 서버가 직접
    호출하는 삭제 경로는 `run_in_threadpool`로 이벤트 루프와 분리돼 있어 별도 경계가 필요 없다.
 3. **Circuit Breaker 미채택** — 아래 Non-goals 참조.

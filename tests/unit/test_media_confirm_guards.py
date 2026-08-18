@@ -214,15 +214,11 @@ async def test_presign_rate_limited_per_user(monkeypatch):
 # --- 삭제 경로: 스토리지 실패 시 DB 행을 남긴다 ---
 
 
-async def test_delete_image_keeps_db_row_when_storage_delete_fails(monkeypatch):
-    """스토리지 삭제가 실패하면 DB 행을 지우면 안 된다.
+def _patch_delete_repo(monkeypatch, *, image_id, user_id, storage) -> list[Any]:
+    """`delete_image`가 보는 리포지터리·스토리지를 갈아끼우고 삭제된 id 싱크를 돌려준다.
 
-    행이 유일한 추적 수단이라(고아 sweeper는 `images` 행 기준, `pending/` lifecycle은
-    `media/`를 안 덮는다) 행을 먼저 지우면 아무도 못 찾는 객체가 영구히 남는다.
-    행이 남으면 사용자 재시도·sweeper 회수가 모두 가능하다.
+    두 테스트의 차이는 `storage`가 던지는가뿐이라 나머지는 전부 여기서 공유한다.
     """
-    image_id = uuid.uuid4()
-    user_id = uuid.uuid4()
     deleted_ids: list[Any] = []
 
     class _Image:
@@ -236,15 +232,28 @@ async def test_delete_image_keeps_db_row_when_storage_delete_fails(monkeypatch):
             return _Image()
 
         @staticmethod
-        async def delete_images_by_ids(ids, db):
-            deleted_ids.extend(ids)
-            return len(ids)
+        async def delete_image_if_owned(iid, uid, *, db):
+            deleted_ids.append(iid)
+            return True
+
+    monkeypatch.setattr(media_service_mod, "MediaRepository", _Repo)
+    monkeypatch.setattr(media_service_mod, "storage_delete", storage)
+    return deleted_ids
+
+
+async def test_delete_image_keeps_db_row_when_storage_delete_fails(monkeypatch):
+    """스토리지 삭제가 실패하면 DB 행을 지우면 안 된다.
+
+    행이 유일한 추적 수단이라(고아 sweeper는 `images` 행 기준, `pending/` lifecycle은
+    `media/`를 안 덮는다) 행을 먼저 지우면 아무도 못 찾는 객체가 영구히 남는다.
+    행이 남으면 사용자 재시도·sweeper 회수가 모두 가능하다.
+    """
+    image_id, user_id = uuid.uuid4(), uuid.uuid4()
 
     def boom(_key):
         raise RuntimeError("S3 down")
 
-    monkeypatch.setattr(media_service_mod, "MediaRepository", _Repo)
-    monkeypatch.setattr(media_service_mod, "storage_delete", boom)
+    deleted_ids = _patch_delete_repo(monkeypatch, image_id=image_id, user_id=user_id, storage=boom)
 
     with pytest.raises(RuntimeError):
         await MediaService.delete_image(image_id, user_id, as_session(FakeDB()))
@@ -254,28 +263,12 @@ async def test_delete_image_keeps_db_row_when_storage_delete_fails(monkeypatch):
 
 async def test_delete_image_removes_db_row_after_storage_succeeds(monkeypatch):
     """정상 경로 회귀 — 스토리지 삭제가 성공하면 행도 지워진다."""
-    image_id = uuid.uuid4()
-    user_id = uuid.uuid4()
-    deleted_ids: list[Any] = []
+    image_id, user_id = uuid.uuid4(), uuid.uuid4()
     deleted_keys: list[str] = []
 
-    class _Image:
-        id = image_id
-        uploader_id = user_id
-        file_key = "media/some/key.png"
-
-    class _Repo:
-        @staticmethod
-        async def get_image_by_id(iid, db):
-            return _Image()
-
-        @staticmethod
-        async def delete_images_by_ids(ids, db):
-            deleted_ids.extend(ids)
-            return len(ids)
-
-    monkeypatch.setattr(media_service_mod, "MediaRepository", _Repo)
-    monkeypatch.setattr(media_service_mod, "storage_delete", deleted_keys.append)
+    deleted_ids = _patch_delete_repo(
+        monkeypatch, image_id=image_id, user_id=user_id, storage=deleted_keys.append
+    )
 
     await MediaService.delete_image(image_id, user_id, as_session(FakeDB()))
 

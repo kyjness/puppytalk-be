@@ -104,24 +104,37 @@ def bulk_to_str(value: Any) -> str | None:
     return str(value)
 
 
-def create_redis_client() -> RedisLike | None:
-    """설정에서 클라이언트를 만든다(연결 확인은 호출부). REDIS_URL이 비면 None.
+def redis_connection_kwargs(*, socket_timeout: float | None = None) -> dict[str, Any]:
+    """모든 Redis 클라이언트가 공유하는 연결 옵션.
 
-    풀 옵션(max_connections·decode_responses·타임아웃)이 여기에만 있어야 한다 — 앱 lifespan·
-    워커·운영 CLI가 각자 만들면 그중 하나만 옵션이 빠지는 식으로 조용히 갈라진다.
+    생성부가 셋이라(앱 풀·구독 소켓·워커) 각자 손으로 쓰면 그중 하나만 옵션이 빠지는 식으로
+    조용히 갈라진다 — 실제로 한 번 그렇게 됐다. 여기가 유일한 출처다.
 
     소켓 타임아웃은 성능 튜닝이 아니라 **fail-open 계약의 전제**다(ADR 0005). 앱의 모든
     fail-open은 `except`로 발동하는데, 타임아웃이 없으면 Redis가 먹통일 때 예외 자체가
     발생하지 않아 rate limit 미들웨어·인증 캐시에서 전 요청이 무한 대기한다.
+
+    `socket_timeout`만 호출부가 덮는다 — 구독 소켓은 유휴가 정상이라 더 길어야 한다
+    (`app/infra/pubsub.py::_subscriber_socket_timeout`).
     """
+    return {
+        "decode_responses": True,
+        # `or`가 아니라 `is None` — 0을 조용히 기본값으로 바꿔치기하지 않는다.
+        "socket_timeout": (
+            settings.REDIS_SOCKET_TIMEOUT if socket_timeout is None else socket_timeout
+        ),
+        "socket_connect_timeout": settings.REDIS_SOCKET_CONNECT_TIMEOUT,
+    }
+
+
+def create_redis_client() -> RedisLike | None:
+    """설정에서 앱 공용 풀 클라이언트를 만든다(연결 확인은 호출부). REDIS_URL이 비면 None."""
     if not settings.REDIS_URL:
         return None
     pool = ConnectionPool.from_url(
         settings.REDIS_URL,
         max_connections=settings.REDIS_MAX_CONNECTIONS,
-        decode_responses=True,
-        socket_timeout=settings.REDIS_SOCKET_TIMEOUT,
-        socket_connect_timeout=settings.REDIS_SOCKET_CONNECT_TIMEOUT,
+        **redis_connection_kwargs(),
     )
     # RedisLike 주석은 실클라이언트가 Protocol 계약을 만족하는지 타입 수준에서 강제한다.
     client: RedisLike = Redis(connection_pool=pool)
