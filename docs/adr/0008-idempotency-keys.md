@@ -6,9 +6,9 @@
   단, 결과 캐시가 주던 **성공 응답 재생은 없다** — confirm 성공 후 응답이 유실되면 재시도는
   400으로 실패하고 클라이언트는 presign부터 다시 시작해야 한다(업로드 1건 재시도 비용 수용,
   글 중복 생성 같은 데이터 훼손이 없어 트레이드오프로 허용).
-- **관련 코드**: `app/api/dependencies/client.py`(`idempotency_before`/`idempotency_after_success`/
-  `idempotency_after_failure` 코어 + 도메인 래퍼), `app/domain/posts/routers/post_router.py`
-  (`POST /posts`)
+- **관련 코드**: `app/domain/posts/idempotency.py`(`post_create_idempotency_before`/
+  `_after_success`/`_after_failure`), `app/domain/posts/router.py`(`POST /posts`),
+  `app/infra/lock.py`(in-flight 락 — 랜덤 토큰 + CAS 해제)
 
 ## 맥락 (Context)
 
@@ -29,6 +29,12 @@
    충돌하거나 캐시를 열람하지 못한다.
 3. **두 Redis 키** — 결과 캐시 `idemp:{ns}:res:{fp}`(성공 응답, TTL)와 in-flight 락
    `idemp:{ns}:lock:{fp}`(`SET NX`, 짧은 TTL).
+   락은 **공용 프리미티브**(`app/infra/lock.py`)를 쓴다 — 획득 시 랜덤 토큰을 발급하고
+   해제는 값 비교 **CAS**다. 직접 `SET NX` 후 `DEL`로 풀면 락 TTL이 만료된 뒤 뒤늦게 끝난
+   요청이 *다음* 요청의 락을 지워, 같은 키로 두 건이 동시에 생성된다
+   ([ADR 0007](0007-view-count-buffering.md)이 조회수 flush에서 같은 이유로 단순 delete를
+   기각한 것과 같은 판단). 토큰은 before → after 훅으로 `IdempotencyHandle`에 실려 전달되며,
+   fail-open 구간에서는 None이라 해제를 시도하지 않는다.
 4. **흐름** — *before*: 결과 캐시 히트면 저장된 응답을 그대로 재생(단, `requestId`는 현재 요청 값으로
    갱신) → 없으면 `SET NX`로 락 시도, 이미 점유면 **409**(같은 키가 처리 중). *after_success*: 결과
    저장 + 락 해제. *after_failure*: 락만 해제(재시도 허용).

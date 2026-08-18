@@ -1,7 +1,7 @@
 # ADR 0010 — 스토리지 백엔드 전략: S3 API 단일 경로 + dev MinIO 패리티
 
 - **상태**: 채택됨 (Accepted) · **구현 완료(Transition/Ops)** — 아래 구현 노트
-- **관련 코드**: `app/infra/storage.py`(`STORAGE_BACKEND` 분기 · presigned 계열
+- **관련 코드**: `app/infra/storage.py`(S3 클라이언트·addressing style · presigned 계열
   `issue_presigned_post`/`promote_pending_object`/`require_s3_direct_upload`),
   `app/domain/media/service.py`, `app/domain/media/router.py`
 

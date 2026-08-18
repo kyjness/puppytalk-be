@@ -5,7 +5,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import UUID
 
 from fastapi import Request
@@ -17,6 +17,7 @@ from app.common.responses import get_request_id
 from app.common.schemas import ApiResponse
 from app.core.config import settings
 from app.domain.posts.schemas import PostIdData
+from app.infra.lock import release_lock, try_acquire_lock
 from app.infra.redis import RedisLike, bulk_to_str, get_app_redis
 
 log = logging.getLogger(__name__)
@@ -28,6 +29,18 @@ _IDEMP_CONFLICT_MESSAGE = "동일 멱등성 키로 게시글 생성이 진행 �
 
 _IDEMP_KEY_MIN = 8
 _IDEMP_KEY_MAX = 128
+
+
+class IdempotencyHandle(NamedTuple):
+    """before 훅이 after 훅에 넘기는 상관 정보.
+
+    검증·해시·락 획득이 before 한 곳에서만 일어나도록 결과를 통째로 실어 나른다.
+    `lock_token`은 **락을 실제로 잡았을 때만** 채워진다 — Redis 부재·fail-open 구간에서는
+    None이고, 그때 해제를 시도하면 남의 락을 지울 수 있다.
+    """
+
+    fingerprint: str
+    lock_token: str | None
 
 
 def _normalize_idempotency_key(raw: str | None) -> str | None:
@@ -64,11 +77,11 @@ def _merge_request_id_into_cached_body(body: dict[str, Any], request: Request) -
 
 async def post_create_idempotency_before(
     request: Request, user_id: UUID, raw_key: str | None
-) -> tuple[JSONResponse | None, str | None]:
+) -> tuple[JSONResponse | None, IdempotencyHandle | None]:
     """결과 캐시 히트면 저장된 성공 응답 재생(requestId만 갱신), 미스면 in-flight 락 선점.
 
     같은 키가 처리 중이면 409, Redis 오류는 멱등성 없이 진행(fail-open, ADR 0005).
-    반환 (캐시된 응답, fingerprint) — after 훅은 이 fingerprint를 그대로 받는다.
+    반환 (캐시된 응답, 핸들) — after 훅은 이 핸들을 그대로 받는다.
     훅마다 raw 헤더를 재검증·재해시하면 검증 규칙이 두 벌로 드리프트해, before는 락을
     잡았는데 after가 키를 무효 판정해 해제를 건너뛰는(락 TTL 동안 재시도 전부 409)
     표면이 생긴다 — 검증·해시는 여기 한 번뿐이다."""
@@ -79,7 +92,7 @@ async def post_create_idempotency_before(
     fp = _idempotency_fingerprint(user_id, norm)
     rcli = get_app_redis(request.app)
     if rcli is None:
-        return None, fp
+        return None, IdempotencyHandle(fp, None)
 
     # fail-open try는 Redis I/O만 감싼다 — 의도된 409는 try 밖에서 던져 삼켜질 표면 자체를 없앤다.
     try:
@@ -98,21 +111,20 @@ async def post_create_idempotency_before(
                 return JSONResponse(
                     status_code=_IDEMP_SUCCESS_STATUS,
                     content=_merge_request_id_into_cached_body(body, request),
-                ), fp
+                ), IdempotencyHandle(fp, None)
 
-        got_lock = await rcli.set(
-            _lock_redis_key(fp),
-            "1",
-            nx=True,
-            ex=settings.IDEMPOTENCY_POST_CREATE_LOCK_TTL_SECONDS,
+        # 공용 락 프리미티브(app/infra/lock.py) — 랜덤 토큰 발급 + CAS 해제. 직접 SET NX 하고
+        # DEL 로 풀면 락 TTL이 만료된 뒤 뒤늦게 끝난 요청이 **다음 요청의 락**을 지운다.
+        token = await try_acquire_lock(
+            rcli, _lock_redis_key(fp), settings.IDEMPOTENCY_POST_CREATE_LOCK_TTL_SECONDS
         )
     except Exception as e:
         log.warning("멱등성 Redis 오류(Fail-open): %s", e)
-        return None, fp
+        return None, IdempotencyHandle(fp, None)
 
-    if not got_lock:
+    if token is None:
         raise ConcurrentUpdateException(_IDEMP_CONFLICT_MESSAGE)
-    return None, fp
+    return None, IdempotencyHandle(fp, token)
 
 
 async def _store_success_result(rcli: RedisLike, fp: str, response_obj: Any) -> None:
@@ -127,19 +139,19 @@ async def _store_success_result(rcli: RedisLike, fp: str, response_obj: Any) -> 
         log.warning("멱등성 성공 캐시 저장 실패: %s", e)
 
 
-async def _release_lock(rcli: RedisLike, fp: str) -> None:
-    try:
-        await rcli.delete(_lock_redis_key(fp))
-    except Exception as e:
-        log.warning("멱등성 잠금 해제 실패: %s", e)
+async def _release_if_held(rcli: RedisLike, handle: IdempotencyHandle) -> None:
+    """내가 잡은 락일 때만 CAS로 해제. 토큰이 없으면(fail-open 구간) 아무것도 하지 않는다."""
+    if handle.lock_token is None:
+        return
+    await release_lock(rcli, _lock_redis_key(handle.fingerprint), handle.lock_token)
 
 
 async def post_create_idempotency_after_success(
     request: Request,
-    fp: str | None,
+    handle: IdempotencyHandle | None,
     response_obj: Any,
 ) -> None:
-    if fp is None:
+    if handle is None:
         return
 
     rcli = get_app_redis(request.app)
@@ -147,18 +159,21 @@ async def post_create_idempotency_after_success(
         return
 
     # 결과 저장과 락 해제는 서로 의존이 없고 각자 실패를 삼킨다 — 병렬로(지연이 합이 아니라 max).
-    await asyncio.gather(_store_success_result(rcli, fp, response_obj), _release_lock(rcli, fp))
+    await asyncio.gather(
+        _store_success_result(rcli, handle.fingerprint, response_obj),
+        _release_if_held(rcli, handle),
+    )
 
 
 async def post_create_idempotency_after_failure(
     request: Request,
-    fp: str | None,
+    handle: IdempotencyHandle | None,
 ) -> None:
-    if fp is None:
+    if handle is None:
         return
 
     rcli = get_app_redis(request.app)
     if rcli is None:
         return
 
-    await _release_lock(rcli, fp)
+    await _release_if_held(rcli, handle)

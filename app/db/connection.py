@@ -10,12 +10,23 @@ from app.db.engine import reader_engine, writer_engine
 logger = logging.getLogger(__name__)
 
 
+async def _ping(engine) -> None:
+    """엔진 하나에 SELECT 1. 유한 시간 안에 끝나야 한다.
+
+    `DB_PING_TIMEOUT`은 `app/db/engine.py`에서 `connect_timeout`으로도 쓰이지만 그건
+    **연결 수립**만 덮는다 — 풀에 이미 있는 커넥션을 재사용하면 적용되지 않으므로,
+    DB가 *접속은 되는데 응답만 멎은* 상태에서 쿼리가 무한 대기한다. 그러면 `/readyz`가
+    503 대신 매달리고(프로브 타임아웃으로 원인이 가려진다) 호출마다 커넥션을 붙잡아
+    풀을 잠식한다. 여기서 상한을 걸어 실패를 **빠르고 명확하게** 만든다.
+    """
+    async with engine.connect() as conn:
+        await asyncio.wait_for(conn.execute(text("SELECT 1")), timeout=settings.DB_PING_TIMEOUT)
+
+
 async def _try_connect() -> tuple[bool, Exception | None]:
     try:
-        async with writer_engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        async with reader_engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
+        await _ping(writer_engine)
+        await _ping(reader_engine)
         return True, None
     except Exception as e:
         return False, e
