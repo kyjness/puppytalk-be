@@ -31,10 +31,14 @@ class NotificationDeliverySkip(Exception):
 def _get_redis() -> RedisLike | None:
     global _redis_client
     if _redis_client is None and settings.REDIS_URL:
+        # 타임아웃 없이 두면 먹통 Redis에서 멱등성 조회가 반환하지 않아 워커 슬롯이
+        # 소진된다 — 여기 fail-open도 예외를 받아야 발동한다(ADR 0005).
         _redis_client = Redis.from_url(
             settings.REDIS_URL,
             decode_responses=True,
             max_connections=4,
+            socket_timeout=settings.REDIS_SOCKET_TIMEOUT,
+            socket_connect_timeout=settings.REDIS_SOCKET_CONNECT_TIMEOUT,
         )
     return _redis_client
 

@@ -109,11 +109,6 @@ class MediaRepository:
         return ok
 
     @classmethod
-    async def delete_image_record(cls, image: Image, db: AsyncSession) -> None:
-        await db.delete(image)
-        await db.flush()
-
-    @classmethod
     async def delete_images_by_ids(cls, image_ids: list[UUID], db: AsyncSession) -> int:
         if not image_ids:
             return 0

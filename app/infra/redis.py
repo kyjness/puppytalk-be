@@ -107,8 +107,12 @@ def bulk_to_str(value: Any) -> str | None:
 def create_redis_client() -> RedisLike | None:
     """설정에서 클라이언트를 만든다(연결 확인은 호출부). REDIS_URL이 비면 None.
 
-    풀 옵션(max_connections·decode_responses)이 여기에만 있어야 한다 — 앱 lifespan·워커·
-    운영 CLI가 각자 만들면 그중 하나만 옵션이 빠지는 식으로 조용히 갈라진다.
+    풀 옵션(max_connections·decode_responses·타임아웃)이 여기에만 있어야 한다 — 앱 lifespan·
+    워커·운영 CLI가 각자 만들면 그중 하나만 옵션이 빠지는 식으로 조용히 갈라진다.
+
+    소켓 타임아웃은 성능 튜닝이 아니라 **fail-open 계약의 전제**다(ADR 0005). 앱의 모든
+    fail-open은 `except`로 발동하는데, 타임아웃이 없으면 Redis가 먹통일 때 예외 자체가
+    발생하지 않아 rate limit 미들웨어·인증 캐시에서 전 요청이 무한 대기한다.
     """
     if not settings.REDIS_URL:
         return None
@@ -116,6 +120,8 @@ def create_redis_client() -> RedisLike | None:
         settings.REDIS_URL,
         max_connections=settings.REDIS_MAX_CONNECTIONS,
         decode_responses=True,
+        socket_timeout=settings.REDIS_SOCKET_TIMEOUT,
+        socket_connect_timeout=settings.REDIS_SOCKET_CONNECT_TIMEOUT,
     )
     # RedisLike 주석은 실클라이언트가 Protocol 계약을 만족하는지 타입 수준에서 강제한다.
     client: RedisLike = Redis(connection_pool=pool)

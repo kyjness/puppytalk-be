@@ -20,11 +20,17 @@ from uuid import UUID, uuid4
 
 from redis.asyncio import Redis
 
+from app.core.config import settings
 from app.infra.redis import RedisLike
 
 log = logging.getLogger(__name__)
 
 _MESSAGE_POLL_TIMEOUT_SEC = 1.0
+# 구독 소켓은 유휴가 정상이라 앱 기본값(1s)을 그대로 쓰면 폴 간격과 맞물려 매초 TimeoutError가
+# 나고 멀쩡한 연결이 끊긴다 — 폴 타임아웃보다 확실히 커야 한다. 그래도 무한 대기는 막아야 한다:
+# 아래 재연결 백오프는 **예외를 받아야** 도는데, 타임아웃이 없으면 먹통 Redis에서 ping·subscribe가
+# 영영 반환하지 않아 이 인스턴스의 실시간 전달이 재시작 전까지 조용히 죽는다.
+_SOCKET_TIMEOUT_SEC = _MESSAGE_POLL_TIMEOUT_SEC * 5
 
 # 리스너가 죽으면 해당 인스턴스의 크로스 인스턴스 실시간 전달이 프로세스 재시작까지
 # 전멸한다(멀티 인스턴스·99.9% 전제에서 미수용) — 연결 실패·수신 오류는 백오프 재연결.
@@ -138,7 +144,12 @@ async def _listen_once(
     client: Any = None
     pubsub: Any = None
     try:
-        client = Redis.from_url(redis_url, decode_responses=True)
+        client = Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_timeout=_SOCKET_TIMEOUT_SEC,
+            socket_connect_timeout=settings.REDIS_SOCKET_CONNECT_TIMEOUT,
+        )
         await client.ping()
         pubsub = client.pubsub()
         await pubsub.subscribe(*handlers)

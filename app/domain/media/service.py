@@ -213,10 +213,14 @@ class MediaService:
             )
         except Exception:
             try:
+                # 스토리지 먼저, DB 행 나중 — `delete_image`와 같은 이유다. 행을 먼저 지우면
+                # 스토리지 삭제 실패 시 추적 수단이 사라져 고아 객체를 영영 회수할 수 없다.
+                # 이 순서면 행이 남아 고아 sweeper가 24시간 뒤 회수한다(temp image는 어디에도
+                # 연결되지 않으므로 sweeper 대상이다).
+                await run_in_threadpool(storage_delete, dest_key)
                 if image is not None:
                     async with db.begin():
                         await MediaRepository.delete_images_by_ids([image.id], db=db)
-                await run_in_threadpool(storage_delete, dest_key)
             except Exception as rollback_e:
                 logger.warning(
                     "Rollback storage delete failed after confirm_presigned_signup_upload "
@@ -261,15 +265,25 @@ class MediaService:
 
     @classmethod
     async def delete_image(cls, image_id: UUID, user_id: UUID, db: AsyncSession) -> None:
-        file_key = None
+        """스토리지 먼저, DB 행 나중 — sweeper(`_keyset_cleanup`)와 같은 순서다.
+
+        행을 먼저 지우고 커밋하면 스토리지 삭제가 실패했을 때 **아무도 찾을 수 없는**
+        객체가 영구히 남는다: 고아 sweeper는 `images` 행 기준이라 행이 없으면 못 보고,
+        `pending/` lifecycle은 `media/` 접두사를 덮지 않는다(ADR 0010). 이 순서면 실패 시
+        행이 남아 사용자 재시도와 sweeper 회수가 모두 가능하다 — confirm 경로가 검증을
+        promote 앞에 두는 것과 같은 이유다.
+        """
         async with db.begin():
             image = await MediaRepository.get_image_by_id(image_id, db=db)
             if not image or image.uploader_id != user_id:
                 raise ImageNotFoundException()
             file_key = image.file_key
-            await MediaRepository.delete_image_record(image, db=db)
+
         if file_key:
             await run_in_threadpool(storage_delete, file_key)
+
+        async with db.begin():
+            await MediaRepository.delete_images_by_ids([image_id], db=db)
 
     @classmethod
     async def sweep_unused_images(cls, db: AsyncSession) -> int:

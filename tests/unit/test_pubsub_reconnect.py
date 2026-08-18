@@ -69,7 +69,10 @@ class _FakeRedis:
         self._script = script
 
     @classmethod
-    def from_url(cls, url: str, decode_responses: bool = False) -> "_FakeRedis":
+    def from_url(cls, url: str, **kwargs: object) -> "_FakeRedis":
+        # 소켓 타임아웃 등 연결 옵션은 이 가짜의 관심사가 아니다(실제 소켓이 없다).
+        # 옵션이 늘 때마다 시그니처를 좇지 않도록 통째로 받는다 — 타임아웃이 실제로
+        # 거는지는 test_redis_socket_timeout.py가 실소켓으로 검증한다.
         cls.connect_count += 1
         return cls(cls.scripts.pop(0))
 

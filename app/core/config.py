@@ -96,6 +96,12 @@ class Settings(BaseSettings):
     CELERY_TASK_IDEMPOTENCY_TTL_SECONDS: int = 86400
     # SSE 알림 pubsub이 연결을 길게 점유하므로 기본 풀 크기를 넉넉히 둠.
     REDIS_MAX_CONNECTIONS: int = 128
+    # Fail-open(ADR 0005)은 예외를 받아야 발동한다 — 타임아웃이 없으면 Redis가 "죽은" 게 아니라
+    # "먹통"일 때(분단·SG 차단·페일오버) 예외가 영영 오지 않아 전 요청이 매달린다.
+    # 동일 AZ RTT는 1ms 미만이고 rate limit Lua는 왕복 1회라 1초는 오탐이 사실상 불가능한 여유값.
+    # 연결 수립은 TCP(+TLS) 핸드셰이크가 있어 더 넉넉히 둔다.
+    REDIS_SOCKET_TIMEOUT: float = 1.0
+    REDIS_SOCKET_CONNECT_TIMEOUT: float = 2.0
     # POST /posts 멱등성: 성공 응답 캐시 TTL, in-flight 잠금 TTL(초)
     IDEMPOTENCY_POST_CREATE_TTL_SECONDS: int = 3600
     IDEMPOTENCY_POST_CREATE_LOCK_TTL_SECONDS: int = 120

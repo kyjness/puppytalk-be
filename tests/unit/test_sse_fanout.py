@@ -277,7 +277,10 @@ class _FakeListenerRedis:
         type(self).last = self
 
     @classmethod
-    def from_url(cls, url: str, decode_responses: bool = False) -> "_FakeListenerRedis":
+    def from_url(cls, url: str, **kwargs: object) -> "_FakeListenerRedis":
+        # 연결 옵션(소켓 타임아웃 등)은 실소켓이 없는 이 가짜의 관심사가 아니다 —
+        # 시그니처를 좇지 않도록 통째로 받는다. 옵션이 빠지면 여기가 TypeError로 죽고
+        # 리스너의 백오프 재연결이 무한 반복해 테스트가 행에 걸린다(원인 추적이 어렵다).
         return cls()
 
     async def ping(self) -> bool:
