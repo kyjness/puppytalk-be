@@ -1,5 +1,7 @@
 """chat 통합: 인박스 미읽음 집계(#16)·방 접근 멤버십 가드(#19). 라이브 PG 필요(없으면 collect)."""
 
+from datetime import timedelta
+
 import pytest
 from app.core.ids import uuid_to_base62
 from app.db.base_class import utc_now
@@ -100,3 +102,75 @@ async def test_room_access_guarded_by_membership(client: AsyncClient, db_session
 
     assert (await client.get(f"/v1/chat/rooms/{pub}", headers=c)).status_code == 403
     assert (await client.get(f"/v1/chat/rooms/{pub}/messages", headers=c)).status_code == 403
+
+
+async def test_messages_after_direction_walks_forward_without_gaps(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """재연결 재동기(direction=after)를 라이브 PG로 검증한다.
+
+    복합 커서 `(created_at, id) > (…)` + ASC 정렬은 실제 DB에서만 확인되는 부분이고,
+    이 경로의 계약은 "끊긴 구간을 빠짐없이 잇는다"라 페이지 경계에서 한 건이라도
+    빠지거나 겹치면 안 된다.
+    """
+    a = await _auth(client, "gap_a@example.com", "갭A")
+    await _auth(client, "gap_b@example.com", "갭B")
+    aid = await _uid(db_session, "gap_a@example.com")
+    bid = await _uid(db_session, "gap_b@example.com")
+
+    room = await _make_room(db_session, aid, bid)
+    base = utc_now()
+    # m0(= 내가 가진 마지막 메시지) 이후로 5건이 쌓인 상태.
+    msgs = [
+        ChatMessage(
+            room_id=room.id,
+            sender_id=bid,
+            content=f"m{i}",
+            is_read=False,
+            created_at=base + timedelta(minutes=i),
+        )
+        for i in range(6)
+    ]
+    db_session.add_all(msgs)
+    await db_session.flush()
+    ids = [uuid_to_base62(m.id) for m in msgs]  # 커밋 전에 확보 — 이후 세션을 건드리지 않는다
+    pub = uuid_to_base62(room.id)
+    await db_session.commit()
+
+    cursor = ids[0]  # m0 이후를 요청한다
+
+    # limit=2로 이어 받아 m1..m5를 모두 모은다(페이지마다 다음 커서는 items[0]).
+    collected: list[str] = []
+    for _ in range(5):
+        res = await client.get(
+            f"/v1/chat/rooms/{pub}/messages",
+            headers=a,
+            params={"cursor": cursor, "limit": 2, "direction": "after"},
+        )
+        assert res.status_code == 200, res.text
+        data = res.json()["data"]
+        items = data["items"]
+        assert items, "after 페이지가 비면 안 된다"
+        # 응답 계약: 방향과 무관하게 항상 최신순
+        assert [i["content"] for i in items] == sorted([i["content"] for i in items], reverse=True)
+        collected.extend(i["content"] for i in reversed(items))
+        if not data["hasMore"]:
+            break
+        cursor = items[0]["id"]
+
+    # 빠짐도 겹침도 없어야 한다 — 최신 N건만 다시 읽는 방식이면 중간이 빈다.
+    assert collected == ["m1", "m2", "m3", "m4", "m5"]
+
+    # before는 반대 방향으로 과거를 준다(기존 무한 스크롤 계약 회귀 확인).
+    back = await client.get(
+        f"/v1/chat/rooms/{pub}/messages",
+        headers=a,
+        params={"cursor": ids[3], "limit": 2},
+    )
+    assert [i["content"] for i in back.json()["data"]["items"]] == ["m2", "m1"]
+
+    # 이을 지점이 없는 after는 거부한다 — 조용히 최신 페이지를 주면 구멍을 못 본다.
+    no_cursor = await client.get(
+        f"/v1/chat/rooms/{pub}/messages", headers=a, params={"direction": "after"}
+    )
+    assert no_cursor.status_code == 400, no_cursor.text

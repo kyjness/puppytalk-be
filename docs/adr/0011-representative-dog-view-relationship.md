@@ -4,7 +4,7 @@
 - **관련 코드**: `app/domain/users/model.py`(`User.representative_dog` 뷰 관계·`DogProfile`
   부분 유니크 인덱스 `uq_dog_profiles_owner_representative`),
   `app/domain/posts/repository.py`(`_post_author_and_content_loads`),
-  `app/domain/comments/model.py`(`_comment_author_loads`),
+  `app/domain/comments/repository.py`(`_comment_author_loads`),
   `app/domain/dogs/service.py`(`upsert_dog_profile` 대표 배정 정규화),
   `migrations/versions/008_dog_representative_unique.py`
 

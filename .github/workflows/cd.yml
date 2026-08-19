@@ -31,6 +31,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       # 배포 자격이 없는 포크·시크릿 미설정 상태에서 CD가 매번 빨간 X를 남기지 않게 한다.
       # 없는 시크릿은 빈 문자열로 주입되므로 ssh가 "@"로 호출돼 실패하는데, 그건 설정
@@ -83,7 +84,15 @@ jobs:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" 'bash -eu -o pipefail -s' <<'REMOTE'
+          # 서버가 먹통(2GB 박스라 OOM이 현실적)이면 ssh는 실패가 아니라 매달린다. 그러면
+          # 이 잡이 timeout-minutes(30분)를 다 쓰고, 그동안 다음 배포가 concurrency 큐에서
+          # 대기한다. ConnectTimeout은 접속 단계를, ServerAlive*는 붙은 뒤 멈춘 세션을 자른다
+          # (SSH 레벨 keepalive라 배포가 오래 걸려도 오탐으로 끊기지 않는다) — 합쳐 1분 내 실패.
+          ssh -i ~/.ssh/deploy_key \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'bash -eu -o pipefail -s' <<'REMOTE'
           cd /opt/puppytalk
           docker compose --env-file .env.prod -f compose.prod.yml pull
           docker compose --env-file .env.prod -f compose.prod.yml up -d

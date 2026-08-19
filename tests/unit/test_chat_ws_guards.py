@@ -17,6 +17,7 @@ from app.domain.chat.service import ChatService
 from app.domain.users.model import UsersRepository
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.unit.fakes import FakeDB
 from tests.unit.fakes import FakeRedis as SharedFakeRedis
 
 pytestmark = pytest.mark.asyncio
@@ -137,6 +138,7 @@ async def test_send_dm_rejects_blocked_relation_before_room_creation(monkeypatch
             sender_id=sender,
             payload=ChatMessageSend(peer_user_id=peer, content="hi"),
             redis=None,
+            room_cache={},
         )
     # 누가 차단했는지 방향을 노출하지 않는 중립 문구
     assert "차단" not in (exc.value.message or "")
@@ -159,6 +161,163 @@ async def test_status_and_block_between_checks_both_directions():
     assert src.count("or_") >= 1
     assert src.count("blocker_id == user_id") == 1
     assert src.count("blocker_id == other_id") == 1
+
+
+# --- 전송 경로 방 캐시 (room_cache) ---
+
+
+def _patch_open_pair(monkeypatch, calls: list[tuple]):
+    """차단·탈퇴 없는 정상 상대. 검사 호출 횟수를 세려고 calls에 기록한다."""
+
+    async def fake_status_and_block(user_id, other_id, *, db):
+        calls.append((user_id, other_id))
+        return SimpleNamespace(status="ACTIVE", blocked=False)
+
+    monkeypatch.setattr(UsersRepository, "get_status_and_block_between", fake_status_and_block)
+
+
+class _SendPathDb(FakeDB):
+    """방 upsert(execute) 횟수를 세는 가짜 세션. flush/add는 메시지 저장 경로."""
+
+    def __init__(self, room_id, *, fail_flush: bool = False) -> None:
+        self._room_id = room_id
+        self._fail_flush = fail_flush
+        self.executes = 0
+        self.added: list = []
+
+    async def execute(self, *args, **kwargs):
+        self.executes += 1
+        return SimpleNamespace(scalar_one=lambda: self._room_id)
+
+    def add(self, obj) -> None:
+        self.added.append(obj)
+
+    async def flush(self) -> None:
+        if self._fail_flush:
+            raise RuntimeError("flush 실패(트랜잭션 롤백 시뮬레이션)")
+
+
+async def test_room_cache_skips_room_upsert_on_repeat_send(monkeypatch):
+    """방 id는 유저 쌍당 불변 — 같은 소켓에서 두 번째 메시지부터는 방 upsert 왕복이 없다."""
+    sender, peer, room_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    _patch_open_pair(monkeypatch, [])
+    monkeypatch.setattr(ChatService, "_fanout_dm", classmethod(lambda cls, *a, **k: _noop()))
+
+    db = _SendPathDb(room_id)
+    cache: dict = {}
+    for _ in range(3):
+        await ChatService.send_dm_from_ws(
+            cast(AsyncSession, db),
+            sender_id=sender,
+            payload=ChatMessageSend(peer_user_id=peer, content="hi"),
+            redis=None,
+            room_cache=cache,
+        )
+
+    assert cache == {peer: room_id}
+    assert db.executes == 1  # 첫 전송에서만 upsert
+    assert len(db.added) == 3  # 메시지는 매번 저장
+    assert all(m.room_id == room_id for m in db.added)
+
+
+async def test_room_cache_still_checks_block_on_every_send(monkeypatch):
+    """캐시가 있어도 차단·탈퇴 검사는 매 전송마다 — 대화 도중 차단이 즉시 막혀야 한다."""
+    sender, peer, room_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    calls: list[tuple] = []
+    _patch_open_pair(monkeypatch, calls)
+    monkeypatch.setattr(ChatService, "_fanout_dm", classmethod(lambda cls, *a, **k: _noop()))
+
+    db = _SendPathDb(room_id)
+    cache: dict = {}
+    payload = ChatMessageSend(peer_user_id=peer, content="hi")
+    await ChatService.send_dm_from_ws(
+        cast(AsyncSession, db), sender_id=sender, payload=payload, redis=None, room_cache=cache
+    )
+    await ChatService.send_dm_from_ws(
+        cast(AsyncSession, db), sender_id=sender, payload=payload, redis=None, room_cache=cache
+    )
+    assert len(calls) == 2
+
+    # 대화 도중 차단되면 캐시 히트 경로에서도 거부된다.
+    _patch_blocked_pair(monkeypatch, sender, peer)
+    with pytest.raises(ForbiddenException):
+        await ChatService.send_dm_from_ws(
+            cast(AsyncSession, db), sender_id=sender, payload=payload, redis=None, room_cache=cache
+        )
+
+
+async def test_room_cache_not_poisoned_by_rolled_back_transaction(monkeypatch):
+    """캐시 기록은 커밋 성공 뒤에만 — 방 upsert 후 트랜잭션이 실패(메시지 flush 오류 등)하면
+    방 INSERT도 롤백되는데, 트랜잭션 안에서 캐시했다면 커밋된 적 없는 room_id가 남아
+    이후 그 상대에게 보내는 모든 메시지가 FK 위반으로 실패한다(소켓 루프는 예외를 삼키고
+    계속 돌므로 재연결 전까지 자가 치유가 없다)."""
+    sender, peer, room_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    _patch_open_pair(monkeypatch, [])
+
+    cache: dict = {}
+    with pytest.raises(RuntimeError):
+        await ChatService.send_dm_from_ws(
+            cast(AsyncSession, _SendPathDb(room_id, fail_flush=True)),
+            sender_id=sender,
+            payload=ChatMessageSend(peer_user_id=peer, content="hi"),
+            redis=None,
+            room_cache=cache,
+        )
+    assert cache == {}  # 실패한 전송은 캐시에 아무것도 남기지 않는다
+
+    # 같은 소켓의 다음 전송은 upsert부터 다시 — 정상 경로로 회복된다.
+    db = _SendPathDb(room_id)
+    await ChatService.send_dm_from_ws(
+        cast(AsyncSession, db),
+        sender_id=sender,
+        payload=ChatMessageSend(peer_user_id=peer, content="hi"),
+        redis=None,
+        room_cache=cache,
+    )
+    assert cache == {peer: room_id}
+    assert db.executes == 1
+
+
+async def _noop() -> None:
+    return None
+
+
+# --- WebSocket 종료 코드 계약 ---
+
+
+async def test_ws_close_codes_separate_capacity_from_auth():
+    """용량 사유는 1008에서 갈라져 있어야 한다 — 한 코드로 뭉치면 클라이언트가 연결 상한·
+    레이트리밋을 인증 실패로 오인해 로그인 세션을 폐기한다. 어휘는 ws_close_code 옆
+    (app/common/exceptions.py) 한 곳에 산다."""
+    from app.common.exceptions import (
+        WS_CLOSE_CONNECTION_LIMIT,
+        WS_CLOSE_RATE_LIMIT,
+        TooManyRequestsException,
+        UnauthorizedException,
+        ws_close_code,
+    )
+
+    assert ws_close_code(UnauthorizedException()) == 1008  # 인증 실패는 그대로
+    # 429 예외가 WS 표면에 닿아도 1008이 아니라 용량 코드로 — 스로틀=재로그인 오인 방지.
+    assert ws_close_code(TooManyRequestsException()) == WS_CLOSE_RATE_LIMIT
+    assert WS_CLOSE_CONNECTION_LIMIT == 4001
+    assert WS_CLOSE_RATE_LIMIT == 4002
+    # 4000~4999는 애플리케이션 전용 대역 — 표준 코드와 겹치면 브라우저가 가로챈다.
+    for code in (WS_CLOSE_CONNECTION_LIMIT, WS_CLOSE_RATE_LIMIT):
+        assert 4000 <= code <= 4999
+    assert len({1008, WS_CLOSE_CONNECTION_LIMIT, WS_CLOSE_RATE_LIMIT}) == 3
+
+
+async def test_ws_router_uses_dedicated_close_codes():
+    """라우터가 실제로 전용 상수를 쓰는지 — 상수만 정의하고 1008을 남겨두면 무의미하다."""
+    import inspect
+
+    from app.domain.chat import router as chat_router
+
+    src = inspect.getsource(chat_router.chat_dm_websocket)
+    assert "WS_CLOSE_CONNECTION_LIMIT" in src
+    assert "WS_CLOSE_RATE_LIMIT" in src
+    assert "code=1008" not in src
 
 
 # --- 멤버십 가드 (+커서 행 접기) ---
@@ -216,6 +375,103 @@ async def test_room_guard_returns_cursor_tuple_or_rejects_stray_cursor():
         )
 
 
+# --- 메시지 페이지 방향 (before=무한 스크롤 / after=재연결 재동기) ---
+
+
+class _ListDb(FakeDB):
+    """멤버십 가드 행(1번째 execute) → 메시지 행(2번째 execute) 순으로 돌려주는 가짜 세션."""
+
+    def __init__(self, guard_row, message_rows) -> None:
+        self._guard_row = guard_row
+        self._rows = message_rows
+        self.statements: list = []
+
+    async def execute(self, stmt, *args, **kwargs):
+        self.statements.append(stmt)
+        if len(self.statements) == 1:
+            return SimpleNamespace(one_or_none=lambda: self._guard_row)
+        rows = list(self._rows)
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
+
+
+def _list_fixture(count: int):
+    """(db, room_id, me, cursor_id) — created_at 오름차순 메시지 count건."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.domain.chat.model import ChatMessage
+
+    room, me, other = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    cursor_id, cursor_at = uuid.uuid4(), datetime(2026, 1, 1, tzinfo=UTC)
+    guard = SimpleNamespace(user1_id=me, user2_id=other, created_at=cursor_at, id=cursor_id)
+    rows = [
+        ChatMessage(
+            id=uuid.uuid4(),
+            room_id=room,
+            sender_id=other,
+            content=f"m{i}",
+            is_read=False,
+            created_at=cursor_at + timedelta(minutes=i + 1),
+        )
+        for i in range(count)
+    ]
+    return _ListDb(guard, rows), room, me, cursor_id
+
+
+async def test_list_messages_after_walks_forward_and_still_answers_newest_first():
+    """재동기는 커서 **이후**를 오래된 쪽부터 이어 받아야 구간이 연속된다.
+    최신 N건만 다시 읽으면 끊긴 사이 N건을 넘게 쌓였을 때 중간이 빈 채 앞뒤만 맞아떨어진다."""
+    db, room, me, cursor_id = _list_fixture(3)  # limit=2 → +1건으로 has_more 감지
+
+    items, has_more = await ChatService.list_room_messages(
+        cast(AsyncSession, db),
+        room_id=room,
+        user_id=me,
+        cursor_message_id=cursor_id,
+        limit=2,
+        direction="after",
+    )
+
+    assert has_more is True
+    stamps = [i.created_at for i in items]
+    assert stamps == sorted(stamps, reverse=True)  # 응답 계약은 방향과 무관하게 최신순
+
+    sql = str(db.statements[1])
+    assert "created_at ASC" in sql  # 커서에 인접한(오래된) 쪽부터 집어야 연속된다
+    assert ") > (" in sql
+
+
+async def test_list_messages_before_still_pages_backwards():
+    db, room, me, cursor_id = _list_fixture(1)
+
+    await ChatService.list_room_messages(
+        cast(AsyncSession, db),
+        room_id=room,
+        user_id=me,
+        cursor_message_id=cursor_id,
+        limit=2,
+    )
+
+    sql = str(db.statements[1])
+    assert "created_at DESC" in sql
+    assert ") < (" in sql
+
+
+async def test_list_messages_after_requires_cursor():
+    """이을 지점이 없으면 'after'는 의미가 없다 — 조용히 최신 페이지를 주면 구멍을 못 본다."""
+    from app.common.exceptions import InvalidRequestException
+
+    db, room, me, _ = _list_fixture(1)
+    with pytest.raises(InvalidRequestException):
+        await ChatService.list_room_messages(
+            cast(AsyncSession, db),
+            room_id=room,
+            user_id=me,
+            cursor_message_id=None,
+            limit=2,
+            direction="after",
+        )
+
+
 # --- 매니저 send 타임아웃 (공용 리스너 head-of-line 차단 상한) ---
 
 
@@ -243,8 +499,9 @@ async def test_send_personal_message_disconnects_stalled_socket(monkeypatch):
     await manager.connect(uid, ws)
     await manager.send_personal_message(uid, "x")  # 예외 없이 타임아웃 → 등록 해제 + 종료
     assert manager._by_user == {}
-    # 등록만 지우면 클라이언트가 수신만 조용히 잃는다 — 실제로 닫혀야 재연결이 뜬다
-    assert stalled.closed_with == 1011
+    # 등록만 지우면 클라이언트가 수신만 조용히 잃는다 — 실제로 닫혀야 재연결이 뜬다.
+    # 1013(Try Again Later): 정체 소켓 정리는 서버 오류(1011)가 아니라 재접속 유도다.
+    assert stalled.closed_with == 1013
 
 
 class _DummyWs:

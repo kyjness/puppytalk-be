@@ -27,6 +27,7 @@ jobs:
   quality:
     name: lint · format · type · vulture
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install uv
@@ -43,6 +44,7 @@ jobs:
   test:
     name: pytest (unit + integration)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:15
@@ -105,6 +107,7 @@ jobs:
     # include_object/compare_type 튜닝이 필요한데, 그건 이 잡의 목적(체인이 실제로 도는가)과
     # 별개의 작업이다.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:15
@@ -146,6 +149,7 @@ jobs:
     # "not supported"로 실패한다 — 그때 continue-on-error로 덮지 말고 설정을 다시 켤 것.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
@@ -159,6 +163,7 @@ jobs:
     # (이미 --ignore-vuln 예외를 하나 달고 있는 것이 그 증거다). 새로 들여오는 취약점은
     # 위 dependency-review가 막고, 여기는 재고 파악용으로 둔다.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -173,6 +178,7 @@ jobs:
   docker:
     name: docker build (+ push on main)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [quality, test]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

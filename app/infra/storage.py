@@ -1,13 +1,11 @@
 # S3 파일 스토리지(단일 경로). dev/CI는 S3 호환 MinIO(엔드포인트만 다름), prod는 실제 S3.
 
 import re
-from collections.abc import Mapping
 from typing import Any
 
 from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
-from app.core.ids import new_ulid_str
 
 _s3_client = None
 
@@ -128,51 +126,41 @@ def _head_pending_object_sync(file_key: str) -> dict[str, Any]:
         raise
 
 
-def _promote_pending_object_sync(
-    pending_key: str,
-    dest_purpose: str,
-    ext_by_content_type: Mapping[str, str],
-) -> tuple[str, int, str]:
-    """pending/ 객체를 영구 purpose 경로로 copy 후 삭제. 키 검증은 head가 담당한다.
+def _promote_pending_object_sync(pending_key: str, dest_key: str, *, etag: str) -> None:
+    """pending/ 객체를 `dest_key`로 copy 후 삭제. **첫 HEAD의 ETag와 다르면 copy가 실패한다.**
 
-    purpose·Content-Type 허용 정책은 도메인(media image_policy) 소유 — 어댑터는
-    전달받은 확장자 매핑에 없는 타입만 거부한다.
+    목적지 키는 **호출부가 만들어 넘긴다** — 도메인이 그 키로 DB 행을 먼저 만든 뒤 승격해야
+    "행 없는 객체"가 안 생긴다(ADR 0019). 그래서 purpose·확장자 정책도 여기 없다
+    (`image_policy.build_permanent_file_key`).
+
+    검증(HEAD)과 copy 사이에 presign URL로 재업로드하면 검증을 우회할 수 있다. 여기서 HEAD를
+    한 번 더 해도 그 HEAD와 copy 사이는 여전히 열려 있다. `CopySourceIfMatch`는 S3가 copy
+    시점에 원본 ETag를 대조하므로 창이 닫힌다 — 검증한 바로 그 객체만 승격된다. 불일치는
+    412(PreconditionFailed)로 오고, 호출부가 400으로 매핑한다.
     """
-    meta = _head_pending_object_sync(pending_key)
-    size = int(meta.get("ContentLength") or 0)
-    if size < 1 or size > PRESIGNED_MAX_BYTES:
-        raise ValueError("object size out of allowed range")
-    content_type = str(meta.get("ContentType") or "")
-    if not content_type:
-        raise ValueError("missing content type")
+    from botocore.exceptions import ClientError
 
-    ext = ext_by_content_type.get(content_type.split(";")[0].strip().lower())
-    if not ext:
-        raise ValueError("unsupported content type")
-    dest_key = f"{dest_purpose}/{new_ulid_str()}.{ext}"
     bucket = settings.S3_BUCKET_NAME
     client = _get_s3_client()
-    client.copy_object(
-        Bucket=bucket,
-        Key=_s3_object_key(dest_key),
-        CopySource={"Bucket": bucket, "Key": _s3_object_key(pending_key)},
-        ContentType=content_type,
-        MetadataDirective="REPLACE",
-    )
+    try:
+        client.copy_object(
+            Bucket=bucket,
+            Key=_s3_object_key(dest_key),
+            CopySource={"Bucket": bucket, "Key": _s3_object_key(pending_key)},
+            CopySourceIfMatch=etag,
+            MetadataDirective="COPY",
+        )
+    except ClientError as e:
+        status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if status in (404, 412):
+            raise ValueError("pending object missing or changed since validation") from e
+        raise
     client.delete_object(Bucket=bucket, Key=_s3_object_key(pending_key))
-    return dest_key, size, content_type
 
 
 async def head_pending_object(file_key: str) -> dict[str, Any]:
     return await run_in_threadpool(_head_pending_object_sync, file_key)
 
 
-async def promote_pending_object(
-    pending_key: str,
-    dest_purpose: str,
-    *,
-    ext_by_content_type: Mapping[str, str],
-) -> tuple[str, int, str]:
-    return await run_in_threadpool(
-        _promote_pending_object_sync, pending_key, dest_purpose, ext_by_content_type
-    )
+async def promote_pending_object(pending_key: str, dest_key: str, *, etag: str) -> None:
+    await run_in_threadpool(_promote_pending_object_sync, pending_key, dest_key, etag=etag)

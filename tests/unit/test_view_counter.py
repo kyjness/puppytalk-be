@@ -128,6 +128,41 @@ async def test_flush_merges_back_on_db_error(monkeypatch):
     assert ps.VIEW_FLUSH_LOCK_KEY not in r.kv  # finally에서 자기 락 해제
 
 
+class _HgetallTimesOutOnce(FakeRedis):
+    """RENAME(버퍼→drain)은 됐는데 그 다음 HGETALL 응답이 소켓 타임아웃을 넘긴 상황.
+    재병합 경로의 HGETALL은 정상 동작해야 하므로 첫 호출만 던진다."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._fail_next_hgetall = True
+
+    async def hgetall(self, key):
+        if self._fail_next_hgetall:
+            self._fail_next_hgetall = False
+            raise TimeoutError("reply exceeded socket_timeout")
+        return await super().hgetall(key)
+
+
+async def test_flush_merges_back_when_read_after_rename_fails(monkeypatch):
+    """RENAME 성공 뒤 drain 읽기가 실패해도 그 회차 조회수가 유실되면 안 된다.
+
+    소켓 타임아웃 도입으로 이 경로가 실제로 열렸다(BGSAVE·AOF 정지 중 응답이 1s를 넘김).
+    drain 키를 아무도 다시 읽지 않으므로(다음 회차는 새 버퍼를 RENAME한다) 재병합 없이
+    던지면 그 키의 카운트는 영영 사라진다. DB 실패와 똑같이 버퍼로 되돌려야 한다.
+    """
+    r = _HgetallTimesOutOnce()
+    p1 = uuid.uuid4()
+    await _seed_buffer(r, p1, 3)
+    _patch_db(monkeypatch, lambda post_id, delta: None)
+
+    with pytest.raises(TimeoutError):
+        await ps.PostService.flush_view_counts_to_db(r)
+
+    assert await ps._get_buffer_pending(r, p1) == 3, "drain에 갇힌 카운트가 버퍼로 돌아와야 한다"
+    assert not any(k.startswith("views:{v}:drain:") for k in r.hashes), "고아 drain 키가 남았다"
+    assert ps.VIEW_FLUSH_LOCK_KEY not in r.kv
+
+
 async def test_flush_no_double_count_when_drain_delete_fails(monkeypatch):
     """커밋 성공 후 drain 삭제만 실패해도 재병합하지 않는다(이미 반영된 delta 이중 집계 방지)."""
     r = FakeRedis(fail_delete_substr=":drain:")

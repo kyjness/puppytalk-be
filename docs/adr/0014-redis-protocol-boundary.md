@@ -2,7 +2,7 @@
 
 - **상태**: 채택됨 (Accepted)
 - **관련 코드**: `app/infra/redis.py`(`RedisLike`·`get_app_redis`·`close_redis`),
-  `app/domain/chat/ws_auth.py`, `tests/unit/fakes.py`
+  `app/domain/chat/router.py`(WS jti 조회 — 구 `ws_auth.py`), `tests/unit/fakes.py`
 
 ## 맥락 (Context)
 
@@ -26,10 +26,14 @@
 가드를 **혈통 검사에서 능력 검사로** 바꾼다.
 
 - `app/infra/redis.py`에 `@runtime_checkable` **`RedisLike` Protocol**을 정의한다.
-  멤버는 앱이 실제 호출하는 12개 명령만(ping·aclose·get·set·setex·delete·eval·
-  hget·hgetall·hincrby·publish·pubsub).
-- 가드 3곳(`get_app_redis`·`close_redis`·chat WS jti 조회)을
-  `isinstance(x, RedisLike)`로 교체하고, 앱 전역 타입 주석을 `RedisLike | None`로 통일.
+  멤버는 앱이 실제 호출하는 12개 명령만(ping·aclose·get·set·setex·delete·eval·evalsha·
+  hget·hgetall·hincrby·publish). 구독 소켓은 공유 풀을 쓰지 않고 전용 연결을 따로
+  만들므로(`app/infra/pubsub.py`) `pubsub`은 이 계약에 없다.
+- 가드를 `isinstance(x, RedisLike)`로 교체하고, 앱 전역 타입 주석을 `RedisLike | None`로 통일.
+  **런타임 isinstance는 종료 경로(`close_redis`) 한 곳에만 남긴다** — 요청 경로의 조회 창구
+  (`get_app_redis`)는 매 요청 도는 핫패스라 멤버 수에 비례하는 속성 검사를 태우지 않고,
+  대입 지점(`create_redis_client`의 `client: RedisLike = Redis(...)`)의 타입 주석이
+  계약 위반을 **컴파일 타임에** 잡는다. 즉 부팅은 정적으로, 종료는 런타임으로 지킨다.
 - `FakeRedis`는 상속을 버리고 Protocol 멤버를 직접 구현한다.
 - 로컬 스텁(`typings/`)과 `stubPath` 설정을 **삭제** — pyright가 업스트림 redis-py
   타입으로 검사한다. `cast(Any, Redis).from_url` 우회 2곳도 정타입 호출로 회귀.
@@ -51,8 +55,8 @@ Protocol 시그니처 규약: 파라미터는 positional-only(`/`)로 선언해 
 - `runtime_checkable` isinstance는 멤버 **존재만** 확인한다(시그니처는 pyright 몫)
   — 혈통 검사보다 얕다. 가드의 목적이 "잘못된 state 주입의 하류 AttributeError 방지"
   (fail-open 판별)이므로 존재 검사로 충분하다.
-- isinstance 비용이 멤버 수(12)에 비례 — 가드 3곳이 요청 경로에 있으나 Redis I/O
-  대비 무시 가능. 멤버를 실사용 명령으로 제한하는 이유이기도 하다.
+- isinstance 비용이 멤버 수(12)에 비례한다 — 그래서 요청 경로에서는 쓰지 않고(위 결정),
+  멤버도 실사용 명령으로 제한한다. 대신 요청 경로는 런타임 보증 없이 타입 검사에 의존한다.
 
 ## 고려한 대안 (Alternatives)
 

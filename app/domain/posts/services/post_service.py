@@ -79,9 +79,7 @@ async def _validate_refs(
     if category_id is not None and not await _category_exists(category_id, db):
         raise InvalidRequestException("존재하지 않는 카테고리입니다.")
     if image_ids:
-        images = await MediaRepository.get_images_by_ids(image_ids, db=db)
-        if {i.id for i in images} != set(image_ids):
-            raise InvalidRequestException("업로드되지 않은 이미지 ID를 참조할 수 없습니다.")
+        await MediaRepository.assert_images_attachable(image_ids, db=db)
 
 
 def _view_redis_key(post_id: UUID, viewer_key: str) -> str:
@@ -232,16 +230,20 @@ class PostService:
             )
             if lock_value is None:
                 return
-            if not await rename_if_exists(redis_client, VIEW_BUFFER_KEY, drain_key):
-                return
-            fields = await redis_client.hgetall(drain_key)
-            if not fields:
-                await redis_client.delete(drain_key)
-                return
             from app.db.session import get_connection
 
             flushed_views = 0
+            # 재병합 경계는 RENAME **시도**부터다. RENAME이 서버에서 되고 응답만 늦어 예외가
+            # 나거나(소켓 타임아웃) 그 다음 HGETALL이 던지면, drain 키를 아무도 다시 읽지
+            # 않아(다음 회차는 새 버퍼를 RENAME한다) 그 회차 카운트가 통째로 유실된다.
+            # merge_hash_into는 src가 없으면 no-op이라 RENAME이 실제로 안 된 경우에도 안전.
             try:
+                if not await rename_if_exists(redis_client, VIEW_BUFFER_KEY, drain_key):
+                    return
+                fields = await redis_client.hgetall(drain_key)
+                if not fields:
+                    await redis_client.delete(drain_key)
+                    return
                 async with get_connection() as db:
                     async with db.begin():
                         for pid, cnt_raw in fields.items():
@@ -253,7 +255,8 @@ class PostService:
                                 )
                                 flushed_views += delta
             except Exception:
-                # DB 트랜잭션이 롤백된 경우에만 재병합해야 이중 집계가 없다.
+                # 커밋 전 실패에서만 재병합해야 이중 집계가 없다 — 커밋 성공 뒤의 실패
+                # (아래 drain 삭제)는 이 try 밖이다.
                 await merge_hash_into(redis_client, drain_key, VIEW_BUFFER_KEY)
                 raise
             # 커밋 성공분만 계측(롤백 시 위에서 raise되어 여기 안 옴).

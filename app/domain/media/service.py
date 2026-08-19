@@ -3,7 +3,8 @@
 
 import logging
 import secrets
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,8 +20,8 @@ from app.core.config import settings
 from app.core.ids import new_uuid7
 from app.db import get_connection
 from app.domain.media.image_policy import (
-    CONTENT_TYPE_EXT,
     build_pending_file_key,
+    build_permanent_file_key,
     sanitize_presign_filename,
     validate_image_content_type,
 )
@@ -36,6 +37,7 @@ from app.domain.media.schema import (
 from app.infra.lock import release_lock, try_acquire_job_lock
 from app.infra.redis import RedisLike, bulk_to_str
 from app.infra.storage import (
+    PRESIGNED_MAX_BYTES,
     build_url,
     head_pending_object,
     is_valid_pending_file_key,
@@ -55,17 +57,39 @@ JOB_LOCK_SWEEP_UNUSED = "lock:media-sweep"
 _JOB_LOCK_TTL_SECONDS = 600
 
 
+class _ReservedUpload:
+    """승격까지 끝났지만 **아직 확정되지 않은** 업로드. `_reserved_upload` 블록이 끝나면
+    `image`가 확정된 행을 준다 — 블록 안에서 읽으면 아직 없다고 터진다."""
+
+    def __init__(self, image_id: UUID) -> None:
+        self.image_id = image_id
+        self._image: Image | None = None
+
+    @property
+    def image(self) -> Image:
+        if self._image is None:
+            raise RuntimeError("upload is not confirmed yet — read .image after the block")
+        return self._image
+
+
 async def _keyset_cleanup(
     db: AsyncSession,
     *,
     fetch: Callable[[UUID | None, int], Awaitable[list[Image]]],
     on_delete_failed: Callable[[Image, Exception], None],
 ) -> int:
-    """이미지 정리 공통 루프. keyset(id > last_id) 배치로 조회 → 트랜잭션 밖에서 스토리지 삭제 →
-    성공분만 짧은 트랜잭션으로 DB 제거. 반환 = 실제 삭제 수.
+    """이미지 정리 공통 루프. **배치당 트랜잭션 하나** — keyset(id > last_id)으로 행을 잠근 채
+    조회(`FOR UPDATE SKIP LOCKED`) → 스토리지 삭제 → 성공분 행 삭제 → 커밋. 반환 = 실제 삭제 수.
+
+    스토리지 삭제를 트랜잭션 **안**에서 하는 이유: 잠금을 놓고 지우면 그 사이 확정 요청이
+    예약 행을 확정하거나 첨부 검증이 이미지를 물 수 있고, 그 뒤의 행 삭제가 그걸 무너뜨린다.
+    잠근 채 지우면 두 배우가 겹칠 수 없다 — 그들은 이 행을 기다렸다가 "없음"을 보거나
+    (확정 → 500, 객체는 만들어지지 않았다), 우리가 잠긴 행을 건너뛴다. 배치 하나(≤200건)의
+    S3 삭제 동안 그 행들만 잠기고, 어차피 지워질 행이라 대기자는 저 둘뿐이다.
 
     스토리지 삭제 실패분도 커서를 넘겨 이번 실행에선 건너뛰고 다음 실행에서 재시도한다(실패
-    이미지가 id 앞머리에 쌓여 뒤쪽 정상 행을 굶기는 것을 방지).
+    이미지가 id 앞머리에 쌓여 뒤쪽 정상 행을 굶기는 것을 방지). 잠겨서 건너뛴 행은 페이지에
+    안 나오므로 커서가 그 위를 지나가도 다음 실행이 다시 본다.
     """
     batch_size = settings.MEDIA_CLEANUP_BATCH_SIZE
     total_deleted = 0
@@ -73,20 +97,19 @@ async def _keyset_cleanup(
     while True:
         async with db.begin():
             rows = await fetch(last_id, batch_size)
-        if not rows:
-            break
-        last_id = rows[-1].id
+            if not rows:
+                break
+            last_id = rows[-1].id
 
-        deletable_ids: list[UUID] = []
-        for img in rows:
-            try:
-                await run_in_threadpool(storage_delete, img.file_key)
-                deletable_ids.append(img.id)
-            except Exception as e:
-                on_delete_failed(img, e)
+            deletable_ids: list[UUID] = []
+            for img in rows:
+                try:
+                    await run_in_threadpool(storage_delete, img.file_key)
+                    deletable_ids.append(img.id)
+                except Exception as e:
+                    on_delete_failed(img, e)
 
-        if deletable_ids:
-            async with db.begin():
+            if deletable_ids:
                 total_deleted += await MediaRepository.delete_images_by_ids(deletable_ids, db=db)
 
         if len(rows) < batch_size:
@@ -105,47 +128,87 @@ class MediaService:
         return PresignUploadResponse(url=url, fields=fields, file_key=file_key)
 
     @classmethod
-    async def _confirm_pending_key(
+    @asynccontextmanager
+    async def _reserved_upload(
         cls,
         file_key: str,
         *,
         purpose: str,
         expected_size: int | None,
-    ) -> tuple[str, str, str, int]:
+        uploader_id: UUID | None,
+        db: AsyncSession,
+    ) -> AsyncIterator[_ReservedUpload]:
+        """예약 행 → (잠근 채) S3 승격 → **블록 본문** → 확정. 블록이 끝나면 `.image`가 채워진다.
+
+        **행이 먼저다.** 목적지 키를 미리 정해 `deleted_at`을 찍은 예약 행으로 커밋한 뒤
+        승격한다. 승격이든 그 뒤든 실패하면 예약 상태 그대로 두고 예외를 올린다 — 스위퍼가
+        S3 객체와 행을 함께 회수하므로 **행 없는 객체가 생길 수 없다**. 보상 삭제
+        (`storage_delete`)를 쓰지 않는 이유가 이것이다. 보상은 그 자체로 실패할 수 있고,
+        실패하면 행 기준 스위퍼가 원리적으로 못 보는 객체가 영구히 남는다(ADR 0019).
+
+        **승격부터 확정까지 예약 행을 `FOR UPDATE`로 잡고 있는다.** 유예를 넘긴 예약 행을
+        스위퍼가 집는 순간 확정이 성공하면, 순서에 따라 200 받은 이미지의 행이 지워지거나
+        객체만 지워지거나 행 없는 객체가 남는다. 잠금이 그 셋을 전부 막는다 — 스위퍼는
+        `SKIP LOCKED`로 잠긴 행을 건너뛰고, 스위퍼가 먼저 잡았으면 우리는 기다렸다가 행이
+        없어진 걸 보고 **승격 전에** 실패한다(객체는 만들어지지 않는다). 대가는 이 트랜잭션이
+        S3 copy 동안 열려 있다는 것.
+
+        확정이 블록 **뒤**인 이유: 확정 뒤에 할 일이 남은 호출부(가입은 토큰 발급이 남는다)가
+        있으면 그게 실패했을 때 되돌리는 쓰기가 필요해진다 — 방금 없앤 보상 쓰기가 S3 대신
+        DB로 되살아난다. 블록 본문이 실패하면 예약 상태로 롤백되고 스위퍼가 회수한다.
+        """
         key = file_key.strip().lstrip("/")
         if not is_valid_pending_file_key(key):
             raise InvalidRequestException(message="Invalid or expired pending file_key.")
-        # 검증은 promote(영구 경로 copy + pending 삭제) 앞에서 — 승격 후 거부는 DB 행 없는
-        # 영구 객체를 남겨, DB 행 기준 sweeper도 pending/ 전용 lifecycle도 지우지 못한다.
+        # 승격 전 검증 — 거부는 pending/에서 끝나야 한다(그쪽은 lifecycle이 회수한다).
         try:
             meta = await head_pending_object(key)
         except ValueError as e:
             raise InvalidImageFileException(message="Uploaded object is missing or invalid.") from e
         size = int(meta.get("ContentLength") or 0)
+        if size < 1 or size > PRESIGNED_MAX_BYTES:
+            raise InvalidImageFileException(message="Uploaded object is missing or invalid.")
         if expected_size is not None and expected_size != size:
             raise InvalidImageFileException(message="Reported size does not match stored object.")
-        validate_image_content_type(str(meta.get("ContentType") or ""))
-        try:
-            dest_key, size, content_type = await promote_pending_object(
-                key, purpose, ext_by_content_type=CONTENT_TYPE_EXT
+        content_type = validate_image_content_type(str(meta.get("ContentType") or ""))
+        etag = str(meta.get("ETag") or "")
+        if not etag:
+            raise InvalidImageFileException(message="Uploaded object is missing or invalid.")
+
+        dest_key = build_permanent_file_key(purpose, content_type)
+        async with db.begin():
+            image = await MediaRepository.create_reserved_image(
+                file_key=dest_key,
+                file_url=build_url(dest_key),
+                content_type=content_type,
+                size=size,
+                uploader_id=uploader_id,
+                db=db,
             )
-        except ValueError as e:
-            raise InvalidImageFileException(message="Uploaded object is missing or invalid.") from e
-        # presign URL(15분)이 살아 있는 동안 head~promote 사이 재업로드로 위 검증을 우회할 수
-        # 있어 승격 결과를 재확인한다 — 실패 시 승격본을 지워 누수 없이 거부.
-        try:
-            if expected_size is not None and expected_size != size:
-                raise InvalidImageFileException(
-                    message="Reported size does not match stored object."
-                )
-            validate_image_content_type(content_type)
-        except Exception:
+            image_id = image.id
+
+        async with db.begin():
+            if await MediaRepository.lock_reserved_image(image_id, db=db) is None:
+                # 잠그기 전에 스위퍼가 회수해 갔다(유예를 넘길 만큼 지연된 경우). 되살리지 않는다.
+                raise InternalServerErrorException("Upload was reclaimed before confirmation.")
+            # presign URL이 살아 있는 동안 head~copy 사이 재업로드로 위 검증을 우회할 수 있다.
+            # copy에 첫 HEAD의 ETag를 조건으로 걸어 그 경우 copy 자체가 실패하게 한다 —
+            # 승격 후 재검증이 필요 없고, 검증한 그 객체만 승격된다.
             try:
-                await run_in_threadpool(storage_delete, dest_key)
-            except Exception:
-                logger.warning("승격 후 검증 실패분 삭제 실패 dest_key=%s", dest_key)
-            raise
-        return dest_key, build_url(dest_key), content_type, size
+                await promote_pending_object(key, dest_key, etag=etag)
+            except ValueError as e:
+                raise InvalidImageFileException(
+                    message="Uploaded object is missing or invalid."
+                ) from e
+
+            upload = _ReservedUpload(image_id)
+            yield upload
+            confirmed = await MediaRepository.confirm_reserved_image(
+                image_id, size=size, content_type=content_type, db=db
+            )
+            if confirmed is None:  # 잠근 채라 일어날 수 없지만, 조용히 넘기지 않는다
+                raise InternalServerErrorException("Upload was reclaimed before confirmation.")
+            upload._image = confirmed
 
     @classmethod
     async def confirm_presigned_upload(
@@ -155,33 +218,15 @@ class MediaService:
         db: AsyncSession,
     ) -> ImageUploadResponse:
         # purpose 값 검증은 스키마의 Literal["profile", "post"]가 담당한다.
-        dest_key, file_url, content_type, size = await cls._confirm_pending_key(
+        async with cls._reserved_upload(
             body.file_key,
             purpose=body.purpose,
             expected_size=body.size,
-        )
-        try:
-            async with db.begin():
-                image = await MediaRepository.create_image(
-                    file_key=dest_key,
-                    file_url=file_url,
-                    content_type=content_type,
-                    size=size,
-                    uploader_id=user_id,
-                    db=db,
-                )
-                return ImageUploadResponse.model_validate(image)
-        except Exception:
-            try:
-                await run_in_threadpool(storage_delete, dest_key)
-            except Exception as rollback_e:
-                logger.warning(
-                    "Rollback storage delete failed after confirm_presigned_upload DB error "
-                    "file_key=%s: %s",
-                    dest_key,
-                    rollback_e,
-                )
-            raise
+            uploader_id=user_id,
+            db=db,
+        ) as upload:
+            pass  # 확정 전에 할 일이 없다
+        return ImageUploadResponse.model_validate(upload.image)
 
     @classmethod
     async def confirm_presigned_signup_upload(
@@ -190,41 +235,23 @@ class MediaService:
         db: AsyncSession,
         redis: RedisLike | None,
     ) -> SignupImageUploadData:
-        dest_key, file_url, content_type, size = await cls._confirm_pending_key(
+        # uploader_id는 아직 없다(가입 전) — 가입이 토큰으로 귀속시킨다.
+        async with cls._reserved_upload(
             body.file_key,
             purpose="signup",
             expected_size=body.size,
+            uploader_id=None,
+            db=db,
+        ) as upload:
+            # 토큰이 먼저다(블록 안 = 확정 전). 토큰 없이 확정된 이미지는 영영 귀속될 수 없는데,
+            # 확정을 먼저 하면 그 상태를 **되돌리는 쓰기**가 필요해진다. 여기서 실패하면 예약
+            # 상태로 롤백되고 스위퍼가 회수한다 — 되돌릴 것이 없다.
+            signup_token = await cls.issue_upload_token(upload.image_id, redis=redis)
+        return SignupImageUploadData(
+            id=upload.image.id,
+            file_url=upload.image.file_url,
+            signup_token=signup_token,
         )
-        image = None
-        try:
-            async with db.begin():
-                image = await MediaRepository.create_temp_image(
-                    file_key=dest_key,
-                    file_url=file_url,
-                    content_type=content_type,
-                    size=size,
-                    db=db,
-                )
-            signup_token = await cls.issue_upload_token(image.id, redis=redis)
-            return SignupImageUploadData(
-                id=image.id,
-                file_url=image.file_url,
-                signup_token=signup_token,
-            )
-        except Exception:
-            try:
-                if image is not None:
-                    async with db.begin():
-                        await MediaRepository.delete_images_by_ids([image.id], db=db)
-                await run_in_threadpool(storage_delete, dest_key)
-            except Exception as rollback_e:
-                logger.warning(
-                    "Rollback storage delete failed after confirm_presigned_signup_upload "
-                    "file_key=%s: %s",
-                    dest_key,
-                    rollback_e,
-                )
-            raise
 
     @classmethod
     async def issue_upload_token(cls, image_id: UUID, redis: RedisLike | None) -> str:
@@ -261,28 +288,48 @@ class MediaService:
 
     @classmethod
     async def delete_image(cls, image_id: UUID, user_id: UUID, db: AsyncSession) -> None:
-        file_key = None
+        """요청 안에서는 **DB만** 건드린다 — 소프트 삭제 + 참조 해제, 트랜잭션 하나.
+
+        스토리지 삭제는 주기 스위퍼가 뒤에서 한다. S3와 DB는 한 트랜잭션으로 묶을 수 없어
+        요청 안에서 둘 다 건드리면 "앞은 됐는데 뒤가 실패"가 반드시 존재하고, 그 실패가
+        사용자에게 재시도 요구로 나갔다. 이제 실패는 재시도가 공짜인 백그라운드에서만 난다
+        (backlog #44, ADR 0019).
+
+        수거해야 한다는 사실이 `deleted_at`으로 DB에 남으므로 스위퍼가 스스로 찾아낸다 —
+        따로 알릴 대상이 없어 알림이 유실될 표면 자체가 없다(ADR 0018의 등급 판단).
+        """
         async with db.begin():
-            image = await MediaRepository.get_image_by_id(image_id, db=db)
-            if not image or image.uploader_id != user_id:
+            if not await MediaRepository.soft_delete_image_if_owned(image_id, user_id, db=db):
+                # 없거나·남의 것이거나·이미 지워졌다. 셋을 구분해 알리지 않는다(존재 노출).
                 raise ImageNotFoundException()
-            file_key = image.file_key
-            await MediaRepository.delete_image_record(image, db=db)
-        if file_key:
-            await run_in_threadpool(storage_delete, file_key)
 
     @classmethod
     async def sweep_unused_images(cls, db: AsyncSession) -> int:
-        """24시간 이상 경과 + users/dog_profiles/post_images 어디에도 연결되지 않은 이미지 정리.
+        """어디에도 연결되지 않은 이미지 정리 — 버려진 업로드(24시간+)와 소프트 삭제분.
+
+        `deleted_at`이 찍힌 행은 24시간을 기다리지 않는다 — 지운 이미지가 하루 동안 S3에 남아
+        있으면 안 되고, 참조는 삭제 시점에 이미 끊겨 있다. 다만 확정 중인 예약 행을 지키려
+        짧은 유예를 둔다.
+
+        **두 종류를 따로 훑는다.** 조건을 OR로 합치면 `created_at`에 인덱스가 없어 전체 스캔이
+        되고, 소프트 삭제분용 부분 인덱스가 무용지물이 된다. 나눠 두면 그쪽은 인덱스를 탄다.
 
         **락은 잡지 않는다** — 배타 실행은 호출부가 JOB_LOCK_SWEEP_UNUSED로 보장한다.
         여기서 또 잡으면 러너가 이미 그 키를 쥔 상태라 SET NX가 항상 실패해(재진입 불가)
         정리가 영구 no-op이 된다.
         """
 
-        async def _fetch(after_id: UUID | None, limit: int) -> list[Image]:
-            return await MediaRepository.get_orphan_images_older_than(
+        async def _fetch_abandoned(after_id: UUID | None, limit: int) -> list[Image]:
+            return await MediaRepository.get_abandoned_images(
                 older_than_hours=24, db=db, limit=limit, after_id=after_id
+            )
+
+        async def _fetch_reclaimable(after_id: UUID | None, limit: int) -> list[Image]:
+            return await MediaRepository.get_reclaimable_images(
+                grace_seconds=settings.RESERVED_IMAGE_GRACE_SECONDS,
+                db=db,
+                limit=limit,
+                after_id=after_id,
             )
 
         def _on_fail(img: Image, e: Exception) -> None:
@@ -293,7 +340,9 @@ class MediaService:
                 e,
             )
 
-        return await _keyset_cleanup(db, fetch=_fetch, on_delete_failed=_on_fail)
+        return await _keyset_cleanup(
+            db, fetch=_fetch_abandoned, on_delete_failed=_on_fail
+        ) + await _keyset_cleanup(db, fetch=_fetch_reclaimable, on_delete_failed=_on_fail)
 
     @classmethod
     async def sweep_unused_images_detached(cls, redis: RedisLike | None) -> None:

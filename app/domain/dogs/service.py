@@ -13,6 +13,7 @@ from app.common.exceptions import (
 from app.db import utc_now
 from app.domain.dogs.model import DogProfilesRepository
 from app.domain.dogs.schema import DogProfileUpsertItem
+from app.domain.media.model import MediaRepository
 from app.domain.users.model import UsersRepository
 from app.domain.users.schema import UserProfileResponse
 
@@ -38,11 +39,14 @@ class DogService:
         update_rows: list[dict[str, object]] = []
         representative_existing_id: UUID | None = None
         representative_new_index: int | None = None
+        attached_image_ids: list[UUID] = []
 
         for raw in items:
             item: DogProfileUpsertItem = DogProfileUpsertItem.model_validate(raw)
             touch_dog_image = "profile_image_id" in item.model_fields_set
             gender_value = str(getattr(item.gender, "value", item.gender))
+            if touch_dog_image and item.profile_image_id is not None:
+                attached_image_ids.append(item.profile_image_id)
             if item.id is None:
                 create_rows.append(
                     {
@@ -79,6 +83,11 @@ class DogService:
         owned_update_ids = await DogProfilesRepository.get_owned_ids_in(owner_id, update_ids, db=db)
         if len(owned_update_ids) != len(set(update_ids)):
             raise ForbiddenException()
+
+        # 첨부 검증 — 안 거치면 수거 대기 중인 이미지를 개 프로필에 붙일 수 있고, 그러면
+        # 스위퍼의 참조 검사가 "아직 쓰인다"로 보아 그 행을 **영구히** 수거하지 못한다.
+        # users·posts와 같은 문을 쓴다.
+        await MediaRepository.assert_images_attachable(attached_image_ids, db=db)
 
         if update_rows:
             await DogProfilesRepository.bulk_update_by_owner(owner_id, update_rows, db=db)

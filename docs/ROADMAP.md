@@ -109,7 +109,8 @@
         우회 경로 차단 ② 로컬 전달을 publish 결과와 분리(로컬 우선 + envelope origin으로 자기
         발행분 스킵) — 리스너 재연결 창에서 같은 인스턴스 수신자 유실 제거 ③ 매니저 send 5s
         타임아웃 — 죽은 소켓 1개가 공용 리스너(인스턴스 실시간 전체)를 정지시키는 head-of-line
-        차단 상한 ④ WS 한도 초과 시 억제 창(Redis 왕복 생략)+연속 30회 거부 시 1008 종료 —
+        차단 상한 ④ WS 한도 초과 시 억제 창(Redis 왕복 생략)+연속 30회 거부 시 종료(현재
+        4002 — close code 계약은 ADR 0009) —
         스팸의 Redis 부하 증폭 차단 ⑤ 백오프 리셋을 구독 성공→첫 폴 성공으로 — 플래핑 시 0.5s
         고정 재연결 루프 방지. 정리: rate limit 정책을 check_fixed_window 단일화(fail_open 플래그,
         메트릭 단일 집계점), WS 에러 프레임 헬퍼화, envelope 죽은 방어 분기 제거.
@@ -181,6 +182,9 @@
 - [x] 댓글 목록 기본 정렬 **인기순 복원** — 루트 목록을 offset + `total`로 전환
       ([ADR 0016](adr/0016-comment-list-offset-pagination.md), `480a2ba0`). [`01`](01-architecture.md) C2에 개정 노트 반영
 - [x] 라이브 데모 배포 — 단일 인스턴스 compose + Caddy ([ADR 0017](adr/0017-demo-deployment-topology.md))
+- [x] **#44** 이미지 삭제·업로드의 S3↔DB 이중 쓰기 제거 — 요청은 `images.deleted_at`만 건드리고
+      스토리지는 스위퍼가 수거. 업로드는 예약 행을 먼저 만들어 "행 없는 객체"를 원천 차단
+      ([ADR 0019](adr/0019-storage-db-write-ordering.md), 마이그레이션 `015`)
 - [ ] **#37** 실시간 전달 심화 — 큐 기반 소켓별 전달 (P2 · 이연. 연결 상한은 #42로 선반영)
 
 ## 완료 유닛 (커밋)

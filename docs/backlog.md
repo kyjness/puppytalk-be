@@ -794,7 +794,9 @@ tie-breaker도 없어 동점 태그 순서가 비결정적 — 캐시 갱신마�
 WS 메시지 한도는 이미 연 연결의 트래픽만 막지 연결 수는 못 막는다(#37에 이연돼 있던 항목).
 
 > **수정 완료**: `REALTIME_MAX_CONNECTIONS_PER_USER`(기본 5)를 SSE·WS가 공유한다. WS는 close
-> code 1008, SSE는 429. SSE 거절을 위해 등록을 스트림 시작 **전으로 분리**했다 — 제너레이터
+> code 4001(연결 상한 전용 — ADR 0009 계약, 초기엔 1008이었으나 인증 실패와 뭉쳐 클라이언트가
+> 세션을 폐기하는 오동작이 있어 분리), SSE는 429. SSE 거절을 위해 등록을 스트림 시작
+> **전으로 분리**했다 — 제너레이터
 > 안에서 거절하면 이미 200이 나간 뒤라 상태 코드를 바꿀 수 없다.
 
 ---
@@ -810,6 +812,52 @@ WS 메시지 한도는 이미 연 연결의 트래픽만 막지 연결 수는 �
 > `user_blocks`의 PK가 `(blocker_id, blocked_id)`라 필터+정렬이 **추가 인덱스 없이 PK로 커버**된다.
 > 차단 시점(`created_at`) 정렬은 복합 커서 인코딩이 필요한데 이 목록에 그 복잡도는 정당화되지
 > 않는다. 응답 계약·정렬 축이 바뀌어 FE 동반 수정 대상.
+
+### 44. 이미지 삭제 — 요청 안에서 S3·DB를 둘 다 건드린다 — P1
+
+**파일**: `app/domain/media/service.py`(`delete_image`), `app/domain/media/model.py`, 마이그레이션 1건
+
+`DELETE /media/{id}`가 요청 안에서 스토리지 삭제와 DB 행 삭제를 **순서대로 둘 다** 수행한다.
+두 시스템은 트랜잭션으로 묶이지 않으므로 어느 순서든 "앞은 됐는데 뒤가 실패"가 존재한다:
+
+| 순서 | 실패 지점 | 남는 상태 | 회복 |
+|---|---|---|---|
+| 행 → 스토리지 (이전) | 스토리지 삭제 실패 | 아무도 못 찾는 객체 | **불가** (sweeper는 행 기준) |
+| 스토리지 → 행 (현재) | 행 삭제 실패 | 없는 객체를 가리키는 행 | 사용자 재시도 DELETE (멱등) |
+
+현재 순서가 낫지만 여전히 사용자에게 재시도를 떠넘긴다. 임시로 행 삭제 재시도(3회)를 넣었다.
+
+**수정 방향(업계 표준 — 요청 안에서 두 시스템을 건드리지 않는다)**: `images.deleted_at`
+컬럼 추가 → `delete_image`는 소유 확인 후 **소프트 삭제만**(DB 쓰기 하나, 즉시 200) →
+조회 쿼리에 `deleted_at IS NULL` → 기존 주기 스위퍼(`sweep_unused_images`)가 `deleted_at`
+행의 스토리지 삭제 후 행 삭제(실패하면 다음 회차 재시도). 스토리지 실패가 사용자에게 보이지
+않고, 행이 없는 객체·객체가 없는 행 둘 다 스위퍼가 수렴시킨다. ADR 0010에 결정 기록,
+마이그레이션은 [ADR 0015](adr/0015-index-migration-concurrently.md) 규약(부분 인덱스
+`WHERE deleted_at IS NOT NULL`은 CONCURRENTLY).
+
+> **수정 완료(media 도메인, 2단계)**: 마이그레이션 `015`로 `images.deleted_at`, `016`으로
+> 스위퍼용 부분 인덱스(`WHERE deleted_at IS NOT NULL`)와 `users.profile_image_id` 인덱스
+> (둘 다 CONCURRENTLY, ADR 0015). 결정은 [ADR 0019](adr/0019-storage-db-write-ordering.md).
+>
+> **1) 삭제 경로** — `delete_image`가 `soft_delete_image_if_owned` 하나만 호출한다(스토리지
+> 미접촉). 소프트 삭제는 행을 남겨 FK 연쇄가 안 걸리므로 참조 3종(`users`·`dog_profiles`의
+> `profile_image_id`, `post_images` 행)을 **같은 트랜잭션에서** 끊는다 — 덕분에 표시 경로
+> 쿼리는 손대지 않았다(조인이 그 행에 닿지 않는다). 첨부 검증은 문 하나
+> (`assert_images_attachable`, `FOR SHARE`)로 모아 users·posts·dogs가 쓴다 — 잠금이 없으면
+> 검증과 참조 insert 사이에 삭제가 끼어들어 지운 이미지가 붙고 영구히 수거 못 한다.
+>
+> **2) 업로드 경로** — 계획에 없던 후속. 같은 원인의 **반대 방향**이 남아 있었다(승격 후
+> 행 생성 전 실패 → 행 없는 객체 → 행 기준 스위퍼가 원리적으로 못 봄). 순서를 뒤집어
+> **예약 행**(`create_reserved_image`)을 커밋한 뒤 승격하고, 토큰 등 남은 일을 끝낸 뒤 확정한다.
+> 보상 삭제(`storage_delete`) 3곳을 전부 제거했다 — 보상은 그 자체로 실패할 수 있지만
+> 스위퍼는 다음 회차에 다시 시도한다. 키 생성이 `storage`에서 `image_policy`로 올라온 것은
+> 호출부가 승격 전에 키를 알아야 하기 때문이다.
+>
+> 승격은 첫 HEAD의 ETag를 `CopySourceIfMatch`로 걸어 검증한 그 객체만 옮기고, 승격부터
+> 확정까지 예약 행을 `FOR UPDATE`로 잡는다. 스위퍼는 `FOR UPDATE SKIP LOCKED`로 잠긴 행을
+> 건너뛴다 — 유예(`settings.RESERVED_IMAGE_GRACE_SECONDS`)는 예약 커밋~잠금 사이의 창만 덮는다.
+> 테스트는 참조 해제·유예·승격 실패 후 행 잔존·첨부 경쟁 블록·ETag 불일치·잠긴 예약 행
+> 건너뛰기 각각 결함을 되돌려 실패를 확인했다.
 
 ---
 
@@ -859,3 +907,4 @@ WS 메시지 한도는 이미 연 연결의 트래픽만 막지 연결 수는 �
 | **P1** | 41 | 인덱스 마이그레이션 비-CONCURRENTLY(배포 중 쓰기 차단) | `migrations/*`, ADR 0015 |
 | **P2** | 43 | 차단 목록 페이지네이션 부재 | `app/domain/users/model.py`, `service.py`, `router.py` |
 | **P3** | 42 | SSE·WS 유저당 연결 수 상한 부재 | `notifications/stream.py`, `chat/manager.py` |
+| **P1** | 44 | 이미지 삭제가 요청 안에서 S3·DB를 둘 다 건드림(소프트 삭제+스위퍼로) | `app/domain/media/service.py`, 마이그레이션 |

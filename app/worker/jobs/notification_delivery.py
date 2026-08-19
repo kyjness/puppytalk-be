@@ -4,7 +4,6 @@ import json
 import logging
 from uuid import UUID
 
-from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,7 +13,7 @@ from app.core.ids import parse_public_id_value
 from app.db import get_connection
 from app.domain.notifications.model import Notification
 from app.domain.notifications.schema import NotificationEvent, build_sns_payload
-from app.infra.redis import RedisLike
+from app.infra.redis import RedisLike, create_redis_client
 from app.infra.sns import deliver_once
 
 log = logging.getLogger(__name__)
@@ -30,12 +29,10 @@ class NotificationDeliverySkip(Exception):
 
 def _get_redis() -> RedisLike | None:
     global _redis_client
-    if _redis_client is None and settings.REDIS_URL:
-        _redis_client = Redis.from_url(
-            settings.REDIS_URL,
-            decode_responses=True,
-            max_connections=4,
-        )
+    if _redis_client is None:
+        # 앱과 같은 생성부를 쓴다 — 타임아웃 없이 두면 먹통 Redis에서 멱등성 조회가
+        # 반환하지 않아 워커 슬롯이 소진된다(ADR 0005). 풀만 작게(태스크는 순차).
+        _redis_client = create_redis_client(max_connections=4)
     return _redis_client
 
 

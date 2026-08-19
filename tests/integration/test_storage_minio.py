@@ -11,6 +11,7 @@ import httpx
 import pytest
 from app.core.config import settings
 from app.core.ids import new_uuid7
+from app.domain.media.image_policy import build_permanent_file_key
 from app.infra import storage
 
 pytestmark = pytest.mark.skipif(
@@ -70,13 +71,9 @@ def test_presigned_post_upload_then_promote():
     meta = asyncio.run(storage.head_pending_object(pending_key))
     assert int(meta["ContentLength"]) == len(_PNG)
 
-    dest_key, size, content_type = asyncio.run(
-        storage.promote_pending_object(
-            pending_key, "post", ext_by_content_type={"image/png": "png"}
-        )
-    )
-    assert size == len(_PNG)
-    assert content_type == "image/png"
+    # 목적지 키는 호출부(도메인)가 만들어 넘긴다 — 행을 먼저 만들려면 미리 알아야 한다.
+    dest_key = build_permanent_file_key("post", "image/png")
+    asyncio.run(storage.promote_pending_object(pending_key, dest_key, etag=meta["ETag"]))
     assert dest_key.startswith("post/") and dest_key.endswith(".png")
     assert _get_object(dest_key) == _PNG
 
@@ -85,3 +82,35 @@ def test_presigned_post_upload_then_promote():
         _get_object(pending_key)
 
     storage.storage_delete(dest_key)
+
+
+def test_promote_refuses_when_source_changed_since_validation():
+    """검증(HEAD)과 copy 사이에 재업로드된 객체는 승격되지 않는다 — CopySourceIfMatch.
+
+    승격 후 재검증으로는 못 막는다(그 재검증과 copy 사이도 열려 있다). S3가 copy 시점에
+    원본 ETag를 대조해야 창이 닫힌다. MinIO가 이 조건을 지키는지 이 테스트가 증명한다.
+    """
+    pending_key = f"pending/{new_uuid7()}/test.png"
+    url, fields = asyncio.run(storage.issue_presigned_post(pending_key, "image/png"))
+    resp = httpx.post(url, data=fields, files={"file": ("test.png", _PNG, "image/png")})
+    assert resp.status_code in (200, 201, 204), resp.text
+    validated = asyncio.run(storage.head_pending_object(pending_key))
+
+    # 같은 presign으로 다른 내용을 다시 올린다 — 검증을 우회하려는 재업로드.
+    tampered = _PNG + b"\x00tampered"
+    resp = httpx.post(url, data=fields, files={"file": ("test.png", tampered, "image/png")})
+    assert resp.status_code in (200, 201, 204), resp.text
+
+    dest_key = build_permanent_file_key("post", "image/png")
+    try:
+        with pytest.raises(ValueError):
+            asyncio.run(
+                storage.promote_pending_object(pending_key, dest_key, etag=validated["ETag"])
+            )
+        # copy가 거부됐으니 목적지엔 아무것도 없고, pending 원본(재업로드본)은 그대로다.
+        with pytest.raises(Exception):
+            _get_object(dest_key)
+        assert _get_object(pending_key) == tampered
+    finally:
+        storage.storage_delete(pending_key)
+        storage.storage_delete(dest_key)
