@@ -9,6 +9,7 @@ from app.common.exceptions import (
     InvalidImageFileException,
 )
 from app.core.config import settings
+from app.core.ids import new_ulid_str
 from app.infra.storage import PENDING_KEY_PREFIX
 
 CONTENT_TYPE_EXT: dict[str, str] = {
@@ -38,3 +39,13 @@ def sanitize_presign_filename(filename: str, content_type: str) -> str:
 
 def build_pending_file_key(upload_id: UUID, filename: str) -> str:
     return f"{PENDING_KEY_PREFIX}{upload_id}/{filename}"
+
+
+def build_permanent_file_key(purpose: str, content_type: str) -> str:
+    """승격 목적지 키. 확장자 정책이 여기 있으므로 어댑터가 아니라 도메인이 만든다.
+
+    호출부가 승격 **전에** 키를 알아야 하기 때문에 어댑터에서 올라왔다 — DB 행을 먼저 만들고
+    S3로 승격해야 "행 없는 객체"가 생기지 않는다(ADR 0019).
+    """
+    validated = validate_image_content_type(content_type)
+    return f"{purpose}/{new_ulid_str()}.{CONTENT_TYPE_EXT[validated]}"

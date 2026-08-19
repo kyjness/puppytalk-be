@@ -32,6 +32,8 @@
    않도록). 제거 시점 = Ops 단계에서 docker-compose에 MinIO를 올린 직후.
 4. **배선은 Transition(Ops)** — docker-compose·CI에 MinIO 컨테이너 추가, 통합 테스트를 MinIO 대상
    실행으로 전환, 그 후 local 백엔드 코드 삭제. 이 ADR은 **방향 확정**이고, 코드 반영은 Ops 묶음에서.
+5. **이 스토리지와 DB를 어떤 순서로 쓸지는 [ADR 0019](0019-storage-db-write-ordering.md)에서 정한다.**
+   요약: 요청 경로는 DB만 변경하고 스토리지 변경은 스위퍼가 맡는다. 근거와 대안은 그쪽에 있다.
 
 > 비용: 포트폴리오는 유료 S3 버킷을 상시 켤 필요가 없다. dev·데모는 MinIO(무료, 앱과 같은
 > compose/ECS에 동거 가능), 실제 S3는 설정·문서로만 두고 진짜 AWS 배포 시에만 과금한다.
@@ -98,13 +100,9 @@
   `docker-compose.yml`의 minio-init가 `mc ilm rule add --expire-days 1 --prefix
   media/pending/`로 배선. 앱 코드는 관여하지 않는다(저장소 수명주기는 저장소 계층 책임 —
   목록 순회 잡은 봉투 대비 과잉).
-- **`media/` 고아도 회수 수단이 필요하다(미해결 · infra 요건)**: 삭제 순서를 "스토리지 먼저,
-  DB 행 나중"으로 맞춰(`MediaService.delete_image`·signup confirm 롤백) 스토리지 삭제가
-  실패해도 행이 남아 sweeper가 회수하도록 했다. 그러나 **행이 존재한 적 없는 경로**는
-  이 방법으로 못 덮는다 — 승격 후 검증 실패(`_confirm_pending_key`)와 confirm DB 실패
-  (`confirm_presigned_upload`)는 롤백 시점에 DB 행이 없어, 보상 삭제가 실패하면 `media/`
-  아래에 **아무도 못 찾는 객체**가 남는다(행 기준 sweeper는 원리적으로 못 본다).
-  `pending/`과 달리 `media/`는 "오래되면 잔존물"이라는 판별식이 없어 단순 만료를 걸 수 없으므로,
-  회수는 **DB 키 집합과 대조하는 목록 기반 GC**여야 한다 — 저빈도(주 1회 등) infra 잡으로 두고
-  앱은 관여하지 않는다(위 불릿과 같은 책임 분리). 현재는 미배선이며, 보상 삭제 실패는
-  `logger.warning`으로만 남는다. 잔존량은 그 로그로 관측한다.
+- **`media/` 고아 회수 — 불변식으로 해소(backlog #44)**: 이전에는 "행이 존재한 적 없는 경로"가
+  남아 있었다 — 승격 후 검증 실패나 confirm DB 실패 시 보상 삭제(`storage_delete`)마저 실패하면
+  `media/` 아래에 아무도 못 찾는 객체가 남았다. `pending/`과 달리 `media/`는 "오래되면 잔존물"
+  이라는 판별식이 없어 단순 만료도 못 건다. 목록 기반 GC를 infra 잡으로 두는 안을 검토했으나,
+  **쓰기 순서 불변식으로 없애는 편이 싸고 확실하다** —
+  [ADR 0019](0019-storage-db-write-ordering.md)에 결정과 대가를 기록했다.

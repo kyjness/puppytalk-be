@@ -79,9 +79,7 @@ async def _validate_refs(
     if category_id is not None and not await _category_exists(category_id, db):
         raise InvalidRequestException("존재하지 않는 카테고리입니다.")
     if image_ids:
-        images = await MediaRepository.get_images_by_ids(image_ids, db=db)
-        if {i.id for i in images} != set(image_ids):
-            raise InvalidRequestException("업로드되지 않은 이미지 ID를 참조할 수 없습니다.")
+        await MediaRepository.assert_images_attachable(image_ids, db=db)
 
 
 def _view_redis_key(post_id: UUID, viewer_key: str) -> str:

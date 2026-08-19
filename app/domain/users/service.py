@@ -88,11 +88,9 @@ class UserService:
                     updates["profile_image_id"] = None
                 else:
                     new_pid = data.profile_image_id
-                    if (
-                        new_pid is None
-                        or await MediaRepository.get_image_by_id(new_pid, db=db) is None
-                    ):
+                    if new_pid is None:
                         raise InvalidRequestException()
+                    await MediaRepository.assert_images_attachable([new_pid], db=db)
                     updates["profile_image_id"] = new_pid
 
             # 2) 유저 행 갱신

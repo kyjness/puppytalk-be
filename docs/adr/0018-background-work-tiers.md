@@ -98,5 +98,8 @@ worker 서비스가 없는 것은 누락이 아니라 이 결정의 결과다(`c
   아니라 운영 표면이다.
 - **Celery Beat / 주기 스케줄러**: 위 표 참조. lifespan 루프로 충분하다.
 - **결과(result backend) 소비**: 배송 태스크는 fire-and-forget이라 호출부가 결과를 기다리지
-  않는다. backend는 Celery 기본 동작을 위해 두되 조회 경로를 만들지 않는다.
+  않는다. 읽는 곳이 없으므로 `task_ignore_result=True`로 **발행 시 결과 백엔드 구독 자체를
+  없앴다** — 그러지 않으면 `.delay()`가 요청 경로에서 pubsub subscribe를 하고, 그 클라이언트는
+  `broker_transport_options` 밖이라 Celery 기본값(socket_timeout 120s)을 쓴다
+  ([ADR 0005](0005-resilience-no-circuit-breaker.md)). 백엔드 설정은 남기되 쓰이지 않는다.
 - **워커의 수평 확장·오토스케일**: 태스크가 하나이고 트래픽이 데모 수준이다. 봉투 상한 밖.

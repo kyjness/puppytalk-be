@@ -19,6 +19,8 @@ _CsvList = Annotated[list[str], NoDecode]
 _MIN_FLOORS: dict[str, int] = {
     "DB_INIT_MAX_ATTEMPTS": 1,
     "MEDIA_CLEANUP_BATCH_SIZE": 1,
+    # 0이면 승격 중인 예약 행을 스위퍼가 지운다 — 설정으로도 그 값에 못 가게 막는다.
+    "RESERVED_IMAGE_GRACE_SECONDS": 5,
     "CELERY_BROKER_VISIBILITY_TIMEOUT": 300,
     "CELERY_RESULT_EXPIRES_SECONDS": 60,
     "CELERY_TASK_SOFT_TIME_LIMIT": 60,
@@ -80,6 +82,11 @@ class Settings(BaseSettings):
     # ----- 회원가입 임시 이미지 TTL 정리 -----
     SIGNUP_IMAGE_CLEANUP_INTERVAL: int = 3600
     MEDIA_CLEANUP_BATCH_SIZE: int = 200  # 이미지 정리(sweep·signup) 공통 배치 크기
+    # 예약 행(`deleted_at`을 찍고 S3 승격 중인 행)을 스위퍼가 집기까지의 유예.
+    # 승격(S3 copy 한 번)이 끝나기에 넉넉해야 한다 — 짧으면 사용자가 성공 응답을 받은
+    # 이미지가 사라진다. S3가 느린 환경에서는 키운다. 지운 이미지는 어차피 다음 주기에
+    # 수거되므로 이 값을 키워도 체감 삭제 지연은 늘지 않는다.
+    RESERVED_IMAGE_GRACE_SECONDS: int = 60
 
     # ----- Redis (비우면 연결 시도 안 함, rate limit 등 Fail-open) -----
     REDIS_URL: str = ""
