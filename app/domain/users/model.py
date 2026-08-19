@@ -39,7 +39,7 @@ class User(Base):
     password: Mapped[str] = mapped_column(String(255), nullable=False)
     nickname: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     profile_image_id: Mapped[UUID | None] = mapped_column(
-        PG_UUID, ForeignKey("images.id", ondelete="SET NULL"), nullable=True
+        PG_UUID, ForeignKey("images.id", ondelete="SET NULL"), nullable=True, index=True
     )
     role: Mapped[str] = mapped_column(String(20), nullable=False, default="USER")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default=UserStatus.ACTIVE.value)

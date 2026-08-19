@@ -211,69 +211,57 @@ async def test_presign_rate_limited_per_user(monkeypatch):
     assert ok is not None
 
 
-# --- 삭제 경로: 스토리지 실패 시 DB 행을 남긴다 ---
+# --- 삭제 경로: 요청 안에서는 DB만 건드린다 ---
 
 
-def _patch_delete_repo(monkeypatch, *, image_id, user_id, storage) -> list[Any]:
-    """`delete_image`가 보는 리포지터리·스토리지를 갈아끼우고 삭제된 id 싱크를 돌려준다.
+def _patch_delete_repo(monkeypatch, *, owned: bool) -> list[Any]:
+    """`delete_image`가 보는 리포지터리·스토리지를 갈아끼우고 소프트 삭제된 id 싱크를 돌려준다.
 
-    두 테스트의 차이는 `storage`가 던지는가뿐이라 나머지는 전부 여기서 공유한다.
+    스토리지는 호출되면 터지게 둔다 — 요청 경로가 S3를 건드리지 않는다는 것이 이 계약의
+    핵심이라, 조용히 통과시키면 회귀를 못 잡는다.
     """
-    deleted_ids: list[Any] = []
-
-    class _Image:
-        id = image_id
-        uploader_id = user_id
-        file_key = "media/some/key.png"
+    soft_deleted: list[Any] = []
 
     class _Repo:
         @staticmethod
-        async def get_image_by_id(iid, db):
-            return _Image()
-
-        @staticmethod
-        async def delete_image_if_owned(iid, uid, *, db):
-            deleted_ids.append(iid)
+        async def soft_delete_image_if_owned(iid, uid, *, db):
+            if not owned:
+                return False
+            soft_deleted.append(iid)
             return True
 
+    def _boom(_key):
+        raise AssertionError("요청 경로에서 스토리지를 건드렸다")
+
     monkeypatch.setattr(media_service_mod, "MediaRepository", _Repo)
-    monkeypatch.setattr(media_service_mod, "storage_delete", storage)
-    return deleted_ids
+    monkeypatch.setattr(media_service_mod, "storage_delete", _boom)
+    return soft_deleted
 
 
-async def test_delete_image_keeps_db_row_when_storage_delete_fails(monkeypatch):
-    """스토리지 삭제가 실패하면 DB 행을 지우면 안 된다.
+async def test_delete_image_never_touches_storage_in_request_path(monkeypatch):
+    """삭제 요청은 DB 쓰기 하나로 끝난다 — S3가 죽어 있어도 사용자는 성공을 받는다.
 
-    행이 유일한 추적 수단이라(고아 sweeper는 `images` 행 기준, `pending/` lifecycle은
-    `media/`를 안 덮는다) 행을 먼저 지우면 아무도 못 찾는 객체가 영구히 남는다.
-    행이 남으면 사용자 재시도·sweeper 회수가 모두 가능하다.
+    S3와 DB는 한 트랜잭션으로 묶을 수 없어, 요청 안에서 둘 다 건드리면 "앞은 됐는데 뒤가
+    실패"가 반드시 존재한다(backlog #44). 스토리지 삭제는 스위퍼가 뒤에서 재시도하며 맡는다.
     """
     image_id, user_id = uuid.uuid4(), uuid.uuid4()
-
-    def boom(_key):
-        raise RuntimeError("S3 down")
-
-    deleted_ids = _patch_delete_repo(monkeypatch, image_id=image_id, user_id=user_id, storage=boom)
-
-    with pytest.raises(RuntimeError):
-        await MediaService.delete_image(image_id, user_id, as_session(FakeDB()))
-
-    assert deleted_ids == [], "스토리지 삭제 실패 후 DB 행이 지워지면 객체를 영영 회수할 수 없다"
-
-
-async def test_delete_image_removes_db_row_after_storage_succeeds(monkeypatch):
-    """정상 경로 회귀 — 스토리지 삭제가 성공하면 행도 지워진다."""
-    image_id, user_id = uuid.uuid4(), uuid.uuid4()
-    deleted_keys: list[str] = []
-
-    deleted_ids = _patch_delete_repo(
-        monkeypatch, image_id=image_id, user_id=user_id, storage=deleted_keys.append
-    )
+    soft_deleted = _patch_delete_repo(monkeypatch, owned=True)
 
     await MediaService.delete_image(image_id, user_id, as_session(FakeDB()))
 
-    assert deleted_keys == ["media/some/key.png"]
-    assert deleted_ids == [image_id]
+    assert soft_deleted == [image_id]
+
+
+async def test_delete_image_raises_not_found_when_not_owned(monkeypatch):
+    """없거나·남의 것이거나·이미 지운 것은 전부 404 — 셋을 구분해 알리면 존재가 노출된다."""
+    from app.common.exceptions import ImageNotFoundException
+
+    soft_deleted = _patch_delete_repo(monkeypatch, owned=False)
+
+    with pytest.raises(ImageNotFoundException):
+        await MediaService.delete_image(uuid.uuid4(), uuid.uuid4(), as_session(FakeDB()))
+
+    assert soft_deleted == []
 
 
 async def test_signup_confirm_rollback_keeps_db_row_when_storage_delete_fails(monkeypatch):

@@ -1,7 +1,6 @@
 # 미디어 비즈니스 로직. 순수 데이터 반환·커스텀 예외. HTTP·ApiResponse 없음. Full-Async.
 
 
-import asyncio
 import logging
 import secrets
 from collections.abc import Awaitable, Callable
@@ -62,11 +61,18 @@ async def _keyset_cleanup(
     fetch: Callable[[UUID | None, int], Awaitable[list[Image]]],
     on_delete_failed: Callable[[Image, Exception], None],
 ) -> int:
-    """이미지 정리 공통 루프. keyset(id > last_id) 배치로 조회 → 트랜잭션 밖에서 스토리지 삭제 →
-    성공분만 짧은 트랜잭션으로 DB 제거. 반환 = 실제 삭제 수.
+    """이미지 정리 공통 루프. **배치당 트랜잭션 하나** — keyset(id > last_id)으로 행을 잠근 채
+    조회(`FOR UPDATE SKIP LOCKED`) → 스토리지 삭제 → 성공분 행 삭제 → 커밋. 반환 = 실제 삭제 수.
+
+    스토리지 삭제를 트랜잭션 **안**에서 하는 이유: 잠금을 놓고 지우면 그 사이 확정 요청이
+    예약 행을 확정하거나 첨부 검증이 이미지를 물 수 있고, 그 뒤의 행 삭제가 그걸 무너뜨린다.
+    잠근 채 지우면 두 배우가 겹칠 수 없다 — 그들은 이 행을 기다렸다가 "없음"을 보거나
+    (확정 → 500, 객체는 만들어지지 않았다), 우리가 잠긴 행을 건너뛴다. 배치 하나(≤200건)의
+    S3 삭제 동안 그 행들만 잠기고, 어차피 지워질 행이라 대기자는 저 둘뿐이다.
 
     스토리지 삭제 실패분도 커서를 넘겨 이번 실행에선 건너뛰고 다음 실행에서 재시도한다(실패
-    이미지가 id 앞머리에 쌓여 뒤쪽 정상 행을 굶기는 것을 방지).
+    이미지가 id 앞머리에 쌓여 뒤쪽 정상 행을 굶기는 것을 방지). 잠겨서 건너뛴 행은 페이지에
+    안 나오므로 커서가 그 위를 지나가도 다음 실행이 다시 본다.
     """
     batch_size = settings.MEDIA_CLEANUP_BATCH_SIZE
     total_deleted = 0
@@ -74,31 +80,24 @@ async def _keyset_cleanup(
     while True:
         async with db.begin():
             rows = await fetch(last_id, batch_size)
-        if not rows:
-            break
-        last_id = rows[-1].id
+            if not rows:
+                break
+            last_id = rows[-1].id
 
-        deletable_ids: list[UUID] = []
-        for img in rows:
-            try:
-                await run_in_threadpool(storage_delete, img.file_key)
-                deletable_ids.append(img.id)
-            except Exception as e:
-                on_delete_failed(img, e)
+            deletable_ids: list[UUID] = []
+            for img in rows:
+                try:
+                    await run_in_threadpool(storage_delete, img.file_key)
+                    deletable_ids.append(img.id)
+                except Exception as e:
+                    on_delete_failed(img, e)
 
-        if deletable_ids:
-            async with db.begin():
+            if deletable_ids:
                 total_deleted += await MediaRepository.delete_images_by_ids(deletable_ids, db=db)
 
         if len(rows) < batch_size:
             break
     return total_deleted
-
-
-# delete_image의 행 삭제 재시도 — 스토리지 삭제 뒤라 여기서 포기하면 없는 객체를 가리키는
-# 행이 남는다. 순간 끊김만 겨냥한다(DB가 진짜 죽었으면 어차피 요청 전체가 실패한다).
-_DELETE_ROW_ATTEMPTS = 3
-_DELETE_ROW_RETRY_DELAY_SEC = 0.1
 
 
 class MediaService:
@@ -271,61 +270,44 @@ class MediaService:
 
     @classmethod
     async def delete_image(cls, image_id: UUID, user_id: UUID, db: AsyncSession) -> None:
-        """스토리지 먼저, DB 행 나중 — sweeper(`_keyset_cleanup`)와 같은 순서다.
+        """요청 안에서는 **DB만** 건드린다 — 소프트 삭제 + 참조 해제, 트랜잭션 하나.
 
-        행을 먼저 지우고 커밋하면 스토리지 삭제가 실패했을 때 **아무도 찾을 수 없는**
-        객체가 영구히 남는다: 고아 sweeper는 `images` 행 기준이라 행이 없으면 못 보고,
-        `pending/` lifecycle은 `media/` 접두사를 덮지 않는다(ADR 0010). 이 순서면 실패 시
-        행이 남아 사용자 재시도와 sweeper 회수가 모두 가능하다 — confirm 경로가 검증을
-        promote 앞에 두는 것과 같은 이유다.
+        스토리지 삭제는 주기 스위퍼가 뒤에서 한다. S3와 DB는 한 트랜잭션으로 묶을 수 없어
+        요청 안에서 둘 다 건드리면 "앞은 됐는데 뒤가 실패"가 반드시 존재하고, 그 실패가
+        사용자에게 재시도 요구로 나갔다. 이제 실패는 재시도가 공짜인 백그라운드에서만 난다
+        (backlog #44, ADR 0019).
 
-        **알려진 갭**: 요청 안에서 두 시스템(S3·DB)을 건드리므로 반대 케이스 — 스토리지는
-        지웠는데 행 삭제가 실패 — 도 존재한다. 그때 행은 없는 객체를 가리키며 남는다(재시도
-        DELETE는 멱등이라 정리된다). 순간 끊김은 아래 재시도가 덮고, 근본 해소는 소프트 삭제 +
-        스위퍼 수거로의 재설계다(backlog #44) — 요청은 DB 하나만 건드리고 스토리지는 뒤에서.
+        수거해야 한다는 사실이 `deleted_at`으로 DB에 남으므로 스위퍼가 스스로 찾아낸다 —
+        따로 알릴 대상이 없어 알림이 유실될 표면 자체가 없다(ADR 0018의 등급 판단).
         """
         async with db.begin():
-            image = await MediaRepository.get_image_by_id(image_id, db=db)
-            if not image or image.uploader_id != user_id:
+            if not await MediaRepository.soft_delete_image_if_owned(image_id, user_id, db=db):
+                # 없거나·남의 것이거나·이미 지워졌다. 셋을 구분해 알리지 않는다(존재 노출).
                 raise ImageNotFoundException()
-            file_key = image.file_key
-
-        if file_key:
-            await run_in_threadpool(storage_delete, file_key)
-
-        # 스토리지는 이미 지워졌으므로 행 삭제는 최대한 붙잡는다 — DB 순간 끊김에 한해.
-        for attempt in range(1, _DELETE_ROW_ATTEMPTS + 1):
-            try:
-                async with db.begin():
-                    removed = await MediaRepository.delete_image_if_owned(image_id, user_id, db=db)
-                if not removed:
-                    logger.warning(
-                        "delete_image: 행이 이미 없음(동시 삭제·소유 변경) image_id=%s", image_id
-                    )
-                return
-            except Exception:
-                if attempt == _DELETE_ROW_ATTEMPTS:
-                    logger.error(
-                        "delete_image: 스토리지는 지웠는데 행 삭제 실패 — 행이 없는 객체를 "
-                        "가리킴(재시도 DELETE로 정리됨) image_id=%s file_key=%s",
-                        image_id,
-                        file_key,
-                    )
-                    raise
-                await asyncio.sleep(_DELETE_ROW_RETRY_DELAY_SEC * attempt)
 
     @classmethod
     async def sweep_unused_images(cls, db: AsyncSession) -> int:
-        """24시간 이상 경과 + users/dog_profiles/post_images 어디에도 연결되지 않은 이미지 정리.
+        """어디에도 연결되지 않은 이미지 정리 — 버려진 업로드(24시간+)와 소프트 삭제분.
+
+        소프트 삭제분은 24시간을 기다리지 않는다. 사용자가 지운 이미지가 하루 동안 S3에 남아
+        있으면 안 되고, 참조는 삭제 시점에 이미 끊겨 있어 더 기다릴 이유가 없다.
+
+        **두 종류를 따로 훑는다.** 조건을 OR로 합치면 `created_at`에 인덱스가 없어 전체 스캔이
+        되고, 소프트 삭제분용 부분 인덱스가 무용지물이 된다. 나눠 두면 그쪽은 인덱스를 탄다.
 
         **락은 잡지 않는다** — 배타 실행은 호출부가 JOB_LOCK_SWEEP_UNUSED로 보장한다.
         여기서 또 잡으면 러너가 이미 그 키를 쥔 상태라 SET NX가 항상 실패해(재진입 불가)
         정리가 영구 no-op이 된다.
         """
 
-        async def _fetch(after_id: UUID | None, limit: int) -> list[Image]:
-            return await MediaRepository.get_orphan_images_older_than(
+        async def _fetch_abandoned(after_id: UUID | None, limit: int) -> list[Image]:
+            return await MediaRepository.get_abandoned_images(
                 older_than_hours=24, db=db, limit=limit, after_id=after_id
+            )
+
+        async def _fetch_reclaimable(after_id: UUID | None, limit: int) -> list[Image]:
+            return await MediaRepository.get_reclaimable_images(
+                db=db, limit=limit, after_id=after_id
             )
 
         def _on_fail(img: Image, e: Exception) -> None:
@@ -336,7 +318,9 @@ class MediaService:
                 e,
             )
 
-        return await _keyset_cleanup(db, fetch=_fetch, on_delete_failed=_on_fail)
+        return await _keyset_cleanup(
+            db, fetch=_fetch_abandoned, on_delete_failed=_on_fail
+        ) + await _keyset_cleanup(db, fetch=_fetch_reclaimable, on_delete_failed=_on_fail)
 
     @classmethod
     async def sweep_unused_images_detached(cls, redis: RedisLike | None) -> None:

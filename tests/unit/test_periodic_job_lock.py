@@ -127,7 +127,9 @@ def test_runner_locked_job_body_still_does_its_work():
     finally:
         media_service._keyset_cleanup = original
 
-    assert swept == [1], "러너 락이 잡 본문을 스스로 막았다 — 정리가 no-op이 된다"
+    # 몇 번 훑었는지는 이 테스트의 관심사가 아니다(수거 대상 종류가 늘면 바뀐다).
+    # 본문이 자기 락에 막혀 **한 번도** 안 도는 것을 잡는 게 목적이다.
+    assert swept, "러너 락이 잡 본문을 스스로 막았다 — 정리가 no-op이 된다"
 
 
 def test_redis_failure_falls_open_to_running():

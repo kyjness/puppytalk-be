@@ -136,3 +136,61 @@ async def test_partial_unique_index_rejects_second_representative(db_session):
     db_session.add(DogProfile(name="바둑", is_representative=True, **common))
     with pytest.raises(IntegrityError):
         await db_session.flush()
+
+
+async def test_dog_profile_rejects_soft_deleted_image(client: AsyncClient, db_session):
+    """수거 대기 중인 이미지는 개 프로필에 붙일 수 없다.
+
+    붙게 두면 스위퍼의 참조 검사가 "아직 쓰인다"로 보아 그 행을 **영구히** 수거하지 못하고,
+    지운 사진이 화면에 되살아난다. users·posts는 첨부 검증을 거치고 있었는데 dogs만
+    payload의 id를 그대로 bulk upsert에 넘겨 뚫려 있었다(ADR 0019 결정 3).
+    """
+    import uuid
+
+    from app.db.base_class import utc_now
+    from app.domain.media.model import Image
+    from sqlalchemy import delete
+
+    now = utc_now()
+    sfx = uuid.uuid4().hex[:8]
+
+    def _image(tag: str, deleted_at) -> Image:
+        key = f"dog-attach-{tag}-{sfx}"
+        return Image(
+            file_key=key,
+            file_url=f"http://example.test/{key}",
+            content_type="image/png",
+            size=1,
+            uploader_id=None,
+            created_at=now,
+            deleted_at=deleted_at,
+        )
+
+    live, dead = _image("live", None), _image("dead", now)
+    db_session.add_all([live, dead])
+    await db_session.commit()
+    live_id, dead_id = str(live.id), str(dead.id)
+
+    headers = await setup_auth_user(client, f"dog_image_{sfx}@example.com", f"퍼피{sfx[:6]}")
+
+    try:
+        ok = await client.patch(
+            "/v1/users/me",
+            json={"dogs": [{**_dog("초코"), "profileImageId": live_id}]},
+            headers=headers,
+        )
+        assert ok.status_code == 200, ok.text
+
+        rejected = await client.patch(
+            "/v1/users/me",
+            json={"dogs": [{**_dog("바둑"), "profileImageId": dead_id}]},
+            headers=headers,
+        )
+        assert rejected.status_code == 400, (
+            f"수거 대기 이미지가 개 프로필에 붙었다 — 영구 누수 경로다: {rejected.text}"
+        )
+    finally:
+        # 남기면 스위퍼가 수거 대상으로 집어 다른 테스트의 기대값을 흔든다.
+        await db_session.rollback()
+        await db_session.execute(delete(Image).where(Image.file_key.like(f"dog-attach-%-{sfx}")))
+        await db_session.commit()
