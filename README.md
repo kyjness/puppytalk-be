@@ -4,7 +4,7 @@
 **SSE(알림)** 를 더한 서버입니다.
 
 이 저장소의 초점은 기능의 개수가 아니라 **"현실적 트래픽을 가정한 운영 등급 백엔드 설계"** 입니다.
-초당 수백~수천 조회의 핫스팟, 멀티 인스턴스(3~10대), 무중단 배포를 **의도적으로 전제**하고,
+초당 수백\~수천 조회의 핫스팟, 멀티 인스턴스(3\~10대), 무중단 배포를 **의도적으로 전제**하고,
 그 전제로 정당화되는 복잡도만 남겼습니다. **정당화되지 않는 과잉은 의식적으로 걷어냈고**, 그 판단
 근거를 전부 [ADR](docs/adr/)로 남겼습니다. → *"쓸 데와 안 쓸 데를 구분했다"* 가 핵심입니다.
 
@@ -22,9 +22,9 @@
 
 | 축 | 전제 | 설계 함의 |
 |----|------|----------|
-| 핫스팟 | 인기글 1건에 **초당 수백~수천 조회** | 조회 경로 최적화 1순위 → 버퍼링·캐시 |
+| 핫스팟 | 인기글 1건에 **초당 수백\~수천 조회** | 조회 경로 최적화 1순위 → 버퍼링·캐시 |
 | 쓰기 | 신규 write는 초당 수십 | 강정합성 write는 정직하게 트랜잭션으로 |
-| 서버 | 멀티 인스턴스 **3~10대** | 상태는 인스턴스 밖(Redis/DB), 로컬 상태 금지 |
+| 서버 | 멀티 인스턴스 **3\~10대** | 상태는 인스턴스 밖(Redis/DB), 로컬 상태 금지 |
 | 배포 | 무중단 롤링 / 블루-그린 | 마이그레이션 하위호환, graceful shutdown, 헬스 분리 |
 | 가용성 | **99.9%** | 외부 I/O는 fallback 우선(가용성 > 순간 정합성) |
 
@@ -55,6 +55,8 @@
 | [0015](docs/adr/0015-index-migration-concurrently.md) | 라이브 테이블 인덱스는 **CONCURRENTLY** | 일반 `CREATE INDEX`(쓰기 잠금 → 사실상 다운타임) |
 | [0016](docs/adr/0016-comment-list-offset-pagination.md) | 댓글 루트 목록 = **offset + `total`**(인기순 복원) | keyset 강제(정렬 축 `like_count`가 변동값이라 커서 불성립) |
 | [0017](docs/adr/0017-demo-deployment-topology.md) | 라이브 데모 = **단일 인스턴스 compose** | 관리형 서비스(RDS·ElastiCache·ALB) — 쇼케이스 등급으로 한정 |
+| [0018](docs/adr/0018-background-work-tiers.md) | 백그라운드 작업 = **실패 비용 기준 3단 분리**(인라인 / lifespan 루프 / Celery) | "무거우면 일단 큐"(큐는 공짜가 아니라 운영 표면) · Celery Beat · result backend 소비 |
+| [0019](docs/adr/0019-storage-db-write-ordering.md) | S3·DB 쓰기 순서 — **요청은 DB만, 스토리지는 스위퍼**(객체는 행보다 늦게 생기고 먼저 사라진다) | 보상 삭제(실패하면 끝) · 목록 기반 GC · 표시 경로에 `deleted_at` 조건 추가 |
 
 > 횡단 관심사 종합은 [`docs/01-architecture.md`](docs/01-architecture.md), 리팩토링 진행·완료
 > 이력은 [`docs/ROADMAP.md`](docs/ROADMAP.md), 버그·최적화 백로그와 각 항목 근거는
@@ -82,20 +84,18 @@
 
 ## 아키텍처 · 파이프라인
 
-> **바로 보기 → https://kyjness.github.io/puppytalk-be/architecture-flows.html**
-> (GitHub 파일 뷰어는 HTML을 렌더링하지 않고 소스로 보여줍니다. 위 링크로 여세요.)
+> **바로 보기 → [`docs/pipeline.md`](docs/pipeline.md)**
 
-시스템 구성(목표 토폴로지·실제 배포)과 요청 처리 파이프라인 다이어그램은
-[`docs/architecture-flows.html`](docs/architecture-flows.html) 한 곳으로 모았습니다 —
-그림 11장(아키텍처 2 · 도메인 의존 관계 1 · 공통 경로 2 · 파이프라인 6)과
-장애 시 동작 표가 들어 있습니다.
+백엔드를 요청이 흐르는 순서로 읽는 문서입니다. `app/domain/` 11개를 단락으로 나누고,
+각 단락이 그 도메인의 대표 경로 1건을 끝까지 따라갑니다. 엔드포인트 55개가 모두 들어
+있습니다.
 
 | 다루는 것 | 내용 |
 |-----------|------|
-| 시스템 구성 | 코드가 전제하는 아키텍처(인스턴스 3~10대·상태는 인스턴스 밖) vs 실제 단일 인스턴스 compose 배포 |
-| 도메인 의존 관계 | 도메인 11개의 import 방향 — `auth·users·media`가 기반, `posts ↔ comments·likes`는 양방향 |
+| 도메인 한눈에 · 의존 관계 | 11개 도메인의 엔드포인트 수 · 핵심 불변식 · import 방향 |
 | 공통 경로 | 미들웨어 스택(429가 CORS 안쪽에서 끊기는 이유) · 계층별 책임과 트랜잭션 경계 |
-| 파이프라인 6종 | 인증 · 게시글 작성(멱등) · 조회수 집계 · 실시간 전달 · 이미지 업로드 · 알림 |
+| 배포 구성 | 코드가 전제하는 아키텍처(인스턴스 3\~10대·상태는 인스턴스 밖) vs 실제 compose 배포 |
+| 도메인 11개 | auth · users · posts · comments · likes · media · chat · notifications · dogs · reports · admin |
 | 장애 시 동작 | 무엇이 죽으면 코드가 무엇을 하고 사용자가 무엇을 느끼는지 |
 
 ## 아키텍처 · 폴더 구조
@@ -326,8 +326,8 @@ docker compose --env-file .env.prod -f compose.prod.yml exec backend python -m a
 |------|------|
 | [00 · 운영 봉투와 범위](docs/00-operating-envelope-and-scope.md) | 모든 설계·복잡도 판정의 단일 근거(전제·과제·재건 순서) |
 | [01 · 아키텍처](docs/01-architecture.md) | 횡단 관심사 결정(식별자·API·트랜잭션·캐시·페이지네이션·관측성·인덱스) |
-| [파이프라인 다이어그램](docs/architecture-flows.html) | 요청 처리 공통 경로 + 파이프라인 6종(인증·게시글·조회수·실시간·업로드·알림) + 장애 시 동작 |
-| [ADR](docs/adr/) | 핵심 설계 결정 18건 — 각 결정의 트레이드오프와 *안 한 것* |
+| [파이프라인](docs/pipeline.md) | 도메인 11개를 요청이 흐르는 순서로 — 엔드포인트 55개 · 공통 경로 · 배포 구성 · 장애 시 동작 |
+| [ADR](docs/adr/) | 핵심 설계 결정 19건 — 각 결정의 트레이드오프와 *안 한 것* |
 | [ROADMAP](docs/ROADMAP.md) | RUP-lite 리팩토링 진행·완료 이력(도메인 단위 + 커밋) |
 | [backlog](docs/backlog.md) | 버그·최적화 백로그와 각 항목의 근거·수정 방향 |
 | [CONVENTIONS](CONVENTIONS.md) | git 워크플로 규약 — 브랜치·커밋 메시지·PR 작성 기준 |
