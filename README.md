@@ -222,7 +222,6 @@ uv run poe migrate             # 4. DB 스키마 = alembic upgrade head (새 마
 uv run poe run                 # 5. 서버 http://localhost:8000 (문서 /v1/docs · 헬스 /v1/health)
 
 uv run poe celery-worker       # (선택) Celery — CELERY_ENABLED=true 일 때만
-uv run poe celery-beat
 ```
 
 프로덕션 기동 시 `validate_settings_for_environment()`가 `JWT_SECRET_KEY`(placeholder 금지·32자+)와
