@@ -100,15 +100,9 @@
   `docker-compose.yml`의 minio-init가 `mc ilm rule add --expire-days 1 --prefix
   media/pending/`로 배선. 앱 코드는 관여하지 않는다(저장소 수명주기는 저장소 계층 책임 —
   목록 순회 잡은 봉투 대비 과잉).
-- **`media/` 고아 회수 — 삭제 경로는 해소, 업로드 경로는 잔존**: `MediaService.delete_image`는
-  더 이상 요청 안에서 스토리지를 건드리지 않는다([ADR 0019](0019-storage-db-write-ordering.md)).
-  `deleted_at`이 찍힌 행을 스위퍼가
-  찾아 스토리지·행 순으로 지우고, 실패하면 다음 회차가 재시도하므로 이 경로의 고아는 수렴한다.
-
-  그러나 **행이 존재한 적 없는 경로**는 아직 못 덮는다 — 승격 후 검증 실패
-  (`_confirm_pending_key`)와 confirm DB 실패(`confirm_presigned_upload`)는 보상 삭제 시점에
-  DB 행이 없어, 그 보상마저 실패하면 `media/` 아래에 **아무도 못 찾는 객체**가 남는다
-  (행 기준 sweeper는 원리적으로 못 본다). `pending/`과 달리 `media/`는 "오래되면 잔존물"이라는
-  판별식이 없어 단순 만료를 걸 수 없다. 해소 방향은 목록 기반 GC가 아니라 **불변식** —
-  *S3 객체는 항상 그것을 가리키는 `images` 행보다 늦게 생긴다*(backlog #44 후속). 현재는
-  보상 삭제 실패가 `logger.warning`으로만 남고, 잔존량은 그 로그로 관측한다.
+- **`media/` 고아 회수 — 불변식으로 해소(backlog #44)**: 이전에는 "행이 존재한 적 없는 경로"가
+  남아 있었다 — 승격 후 검증 실패나 confirm DB 실패 시 보상 삭제(`storage_delete`)마저 실패하면
+  `media/` 아래에 아무도 못 찾는 객체가 남았다. `pending/`과 달리 `media/`는 "오래되면 잔존물"
+  이라는 판별식이 없어 단순 만료도 못 건다. 목록 기반 GC를 infra 잡으로 두는 안을 검토했으나,
+  **쓰기 순서 불변식으로 없애는 편이 싸고 확실하다** —
+  [ADR 0019](0019-storage-db-write-ordering.md)에 결정과 대가를 기록했다.

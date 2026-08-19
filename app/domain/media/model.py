@@ -23,6 +23,7 @@ from app.common.exceptions import InvalidRequestException
 from app.core.config import settings
 from app.core.ids import new_uuid7
 from app.db.base_class import PG_UUID, Base, utc_now
+from app.db.statements import update_one_returning
 
 # 이미지를 참조하는 세 테이블을 경량 구문으로 잡는다 — 참조 해제(soft_delete_image_if_owned)와
 # 고아 판별(_unreferenced)이 같은 정의를 쓴다. ORM 모델을 import하면 media가
@@ -87,26 +88,7 @@ def _cleanup_page(
 
 class MediaRepository:
     @classmethod
-    async def create_temp_image(
-        cls,
-        file_key: str,
-        file_url: str,
-        content_type: str | None,
-        size: int | None,
-        *,
-        db: AsyncSession,
-    ) -> Image:
-        return await cls.create_image(
-            file_key=file_key,
-            file_url=file_url,
-            content_type=content_type,
-            size=size,
-            uploader_id=None,
-            db=db,
-        )
-
-    @classmethod
-    async def create_image(
+    async def create_reserved_image(
         cls,
         file_key: str,
         file_url: str,
@@ -116,6 +98,15 @@ class MediaRepository:
         *,
         db: AsyncSession,
     ) -> Image:
+        """`deleted_at`을 찍은 채 만든다 — **예약 행**.
+
+        업로드 확정은 이 행을 먼저 커밋한 뒤 S3로 승격한다. 승격이나 그 뒤 단계가 실패하면
+        예약 상태 그대로 남아 스위퍼가 S3 객체와 행을 함께 회수한다. 덕분에 "행이 존재한 적
+        없는 S3 객체"가 생길 수 없다(ADR 0019).
+
+        이미지 행이 생기는 경로는 이것 하나뿐이다 — 확정되지 않은 행은 존재할 수 있어도
+        그 반대(S3에만 있는 객체)는 존재할 수 없어야 하므로, 예약을 건너뛰는 생성자를 두지 않는다.
+        """
         img = Image(
             file_key=file_key,
             file_url=file_url,
@@ -123,10 +114,47 @@ class MediaRepository:
             size=size,
             uploader_id=uploader_id,
             created_at=utc_now(),
+            deleted_at=utc_now(),
         )
         db.add(img)
         await db.flush()
         return img
+
+    @classmethod
+    async def lock_reserved_image(cls, image_id: UUID, *, db: AsyncSession) -> Image | None:
+        """예약 행을 `FOR UPDATE`로 잡는다 — 승격부터 확정까지 스위퍼가 이 행을 못 건드리게.
+
+        스위퍼의 수거 페이지는 `SKIP LOCKED`라 잠긴 행을 건너뛰고, 스위퍼가 먼저 잡았으면
+        여기서 기다렸다가 None을 본다(행이 지워졌다). 어느 쪽도 겹치지 않는다.
+        `deleted_at IS NOT NULL` — 예약 상태가 아니면 잠글 대상이 아니다.
+        """
+        r = await db.execute(
+            select(Image)
+            .where(Image.id == image_id, Image.deleted_at.is_not(None))
+            .with_for_update()
+        )
+        return r.scalars().one_or_none()
+
+    @classmethod
+    async def confirm_reserved_image(
+        cls,
+        image_id: UUID,
+        *,
+        size: int | None,
+        content_type: str | None,
+        db: AsyncSession,
+    ) -> Image | None:
+        """예약 행을 확정한다 — `deleted_at`을 지우고 승격이 실제로 확인한 메타를 반영한다.
+
+        `deleted_at IS NOT NULL`을 조건에 두어, 스위퍼가 먼저 회수해 간 행을 되살리지 않는다.
+        """
+        return await update_one_returning(
+            db,
+            Image,
+            [Image.id == image_id, Image.deleted_at.is_not(None)],
+            {"deleted_at": None, "size": size, "content_type": content_type},
+            Image,
+        )
 
     # 아래 둘은 **첨부 검증** 경로다 — 새 게시글·프로필에 이미지를 붙여도 되는지 판단한다.
     # 둘 다 `deleted_at IS NULL`을 건다: 걸지 않으면 수거를 기다리는 행을 다시 붙일 수 있고,
@@ -195,6 +223,8 @@ class MediaRepository:
             select(Image)
             .where(
                 Image.uploader_id.is_(None),
+                # 예약 행(deleted_at 찍힘)은 수거 패스 소관 — 두 잡이 같은 행을 다투지 않는다.
+                Image.deleted_at.is_(None),
                 Image.created_at < cutoff,
             )
             .order_by(Image.id.asc())
@@ -229,6 +259,7 @@ class MediaRepository:
     async def get_reclaimable_images(
         cls,
         *,
+        grace_seconds: int,
         db: AsyncSession,
         limit: int | None = None,
         after_id: UUID | None = None,
@@ -237,11 +268,17 @@ class MediaRepository:
 
         참조는 삭제 시점에 이미 끊겨 있고, 지운 이미지가 하루 동안 S3에 남아 직링크로
         열리면 안 된다. `idx_images_reclaimable` 부분 인덱스를 타므로 작업량이 `images`
-        전체가 아니라 **수거 대상 수**에 비례한다.
+        전체가 아니라 **수거 대상 수**에 비례한다(`deleted_at < X`는 `IS NOT NULL`을
+        함의하므로 부분 인덱스 조건이 성립한다).
+
+        `grace_seconds`는 **기본값을 주지 않는다.** 업로드 확정이 예약 행(`deleted_at`을
+        찍은 채)을 먼저 만들고 S3 승격 후 확정하므로, 유예가 0이면 승격 중인 행과 방금 올린
+        객체를 스위퍼가 지운다 — 사용자는 성공 응답을 받았는데 이미지가 사라진다.
+        데이터 계층이 그 사고를 기본값으로 들고 있으면 안 된다.
         """
         stmt = (
             select(Image)
-            .where(Image.deleted_at.is_not(None))
+            .where(Image.deleted_at < utc_now() - timedelta(seconds=grace_seconds))
             .where(*_unreferenced())
             .order_by(Image.id.asc())
         )

@@ -835,6 +835,30 @@ WS 메시지 한도는 이미 연 연결의 트래픽만 막지 연결 수는 �
 마이그레이션은 [ADR 0015](adr/0015-index-migration-concurrently.md) 규약(부분 인덱스
 `WHERE deleted_at IS NOT NULL`은 CONCURRENTLY).
 
+> **수정 완료(media 도메인, 2단계)**: 마이그레이션 `015`로 `images.deleted_at`, `016`으로
+> 스위퍼용 부분 인덱스(`WHERE deleted_at IS NOT NULL`)와 `users.profile_image_id` 인덱스
+> (둘 다 CONCURRENTLY, ADR 0015). 결정은 [ADR 0019](adr/0019-storage-db-write-ordering.md).
+>
+> **1) 삭제 경로** — `delete_image`가 `soft_delete_image_if_owned` 하나만 호출한다(스토리지
+> 미접촉). 소프트 삭제는 행을 남겨 FK 연쇄가 안 걸리므로 참조 3종(`users`·`dog_profiles`의
+> `profile_image_id`, `post_images` 행)을 **같은 트랜잭션에서** 끊는다 — 덕분에 표시 경로
+> 쿼리는 손대지 않았다(조인이 그 행에 닿지 않는다). 첨부 검증은 문 하나
+> (`assert_images_attachable`, `FOR SHARE`)로 모아 users·posts·dogs가 쓴다 — 잠금이 없으면
+> 검증과 참조 insert 사이에 삭제가 끼어들어 지운 이미지가 붙고 영구히 수거 못 한다.
+>
+> **2) 업로드 경로** — 계획에 없던 후속. 같은 원인의 **반대 방향**이 남아 있었다(승격 후
+> 행 생성 전 실패 → 행 없는 객체 → 행 기준 스위퍼가 원리적으로 못 봄). 순서를 뒤집어
+> **예약 행**(`create_reserved_image`)을 커밋한 뒤 승격하고, 토큰 등 남은 일을 끝낸 뒤 확정한다.
+> 보상 삭제(`storage_delete`) 3곳을 전부 제거했다 — 보상은 그 자체로 실패할 수 있지만
+> 스위퍼는 다음 회차에 다시 시도한다. 키 생성이 `storage`에서 `image_policy`로 올라온 것은
+> 호출부가 승격 전에 키를 알아야 하기 때문이다.
+>
+> 승격은 첫 HEAD의 ETag를 `CopySourceIfMatch`로 걸어 검증한 그 객체만 옮기고, 승격부터
+> 확정까지 예약 행을 `FOR UPDATE`로 잡는다. 스위퍼는 `FOR UPDATE SKIP LOCKED`로 잠긴 행을
+> 건너뛴다 — 유예(`settings.RESERVED_IMAGE_GRACE_SECONDS`)는 예약 커밋~잠금 사이의 창만 덮는다.
+> 테스트는 참조 해제·유예·승격 실패 후 행 잔존·첨부 경쟁 블록·ETag 불일치·잠긴 예약 행
+> 건너뛰기 각각 결함을 되돌려 실패를 확인했다.
+
 ---
 
 ## 요약표

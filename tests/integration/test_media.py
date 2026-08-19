@@ -288,25 +288,31 @@ async def test_delete_image_soft_deletes_and_detaches_every_reference(
         await db_session.commit()
 
 
-async def test_sweeper_collects_soft_deleted_images_without_waiting_24h(
+async def test_sweeper_collects_deleted_rows_but_spares_ones_still_in_grace(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ):
-    """소프트 삭제분은 24시간 고아 조건과 무관하게 다음 회차에 수거된다.
+    """`deleted_at`이 찍힌 행의 수거 규칙 — 24시간은 안 기다리되, 유예는 지킨다.
 
-    24시간을 그대로 적용하면 사용자가 지운 이미지가 하루 동안 S3에 남아 직링크로 열린다.
-    참조는 삭제 시점에 이미 끊겨 있으므로 더 기다릴 이유도 없다.
+    - 24시간을 그대로 적용하면 지운 사진이 하루 동안 S3에 남아 직링크로 열린다.
+    - 반대로 유예가 없으면 확정 중인 **예약 행**(승격 진행 중)을 지워버려, 사용자가 성공
+      응답을 받은 이미지가 사라진다.
     """
     from app.domain.media.service import MediaService
 
     now = utc_now()
     sfx = uuid.uuid4().hex[:8]
-    deleted_key, live_key = f"sweep-deleted-{sfx}", f"sweep-live-{sfx}"
-
-    # created_at은 방금 — 24시간 고아 조건으로는 둘 다 안 걸린다. deleted_at만이 근거다.
+    ripe_key = f"sweep-ripe-{sfx}"
+    fresh_key = f"sweep-fresh-{sfx}"
+    live_key = f"sweep-live-{sfx}"
+    keys = [ripe_key, fresh_key, live_key]
+    # created_at은 방금 — 24시간 고아 조건으로는 셋 다 안 걸린다. deleted_at만이 근거다.
+    # 유예는 설정값을 읽는다. 숫자를 박아 두면 설정을 바꿨을 때 테스트가 조용히 무의미해진다.
+    ripe_at = now - timedelta(seconds=settings.RESERVED_IMAGE_GRACE_SECONDS + 60)
     db_session.add_all(
         [
-            _img(deleted_key, created_at=now, deleted_at=now),
-            _img(live_key, created_at=now),
+            _img(ripe_key, created_at=now, deleted_at=ripe_at),  # 유예 지남 → 수거
+            _img(fresh_key, created_at=now, deleted_at=now),  # 방금 찍힘(확정 중) → 보존
+            _img(live_key, created_at=now),  # 멀쩡한 이미지 → 보존
         ]
     )
     await db_session.commit()
@@ -316,17 +322,63 @@ async def test_sweeper_collects_soft_deleted_images_without_waiting_24h(
 
     try:
         await MediaService.sweep_unused_images(db=db_session)
-        assert deleted_keys == [deleted_key], (
-            "소프트 삭제분이 24시간 갇히면 지운 사진이 계속 열린다"
-        )
+        assert deleted_keys == [ripe_key], "유예 안의 행을 건드리면 확정 중인 업로드가 사라진다"
 
-        rows = await db_session.execute(
-            select(Image.file_key).where(Image.file_key.in_([deleted_key, live_key]))
-        )
-        assert set(rows.scalars().all()) == {live_key}
+        rows = await db_session.execute(select(Image.file_key).where(Image.file_key.in_(keys)))
+        assert set(rows.scalars().all()) == {fresh_key, live_key}
         await db_session.commit()
     finally:
-        await db_session.execute(delete(Image).where(Image.file_key.in_([deleted_key, live_key])))
+        await db_session.execute(delete(Image).where(Image.file_key.in_(keys)))
+        await db_session.commit()
+
+
+async def test_confirm_leaves_reclaimable_row_when_promote_fails(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+):
+    """업로드 확정이 도중에 실패해도 **행이 남아** 스위퍼가 회수할 수 있다.
+
+    이 순서(행 → S3)가 아니면 승격과 행 생성 사이에 "행 없는 S3 객체"가 존재하는 창이 생기고,
+    보상 삭제마저 실패하면 행 기준 스위퍼가 원리적으로 못 보는 객체가 영구히 남는다.
+    실 DB로 확인하는 이유는 예약 행이 **커밋**되어야만 회수 가능하기 때문이다 — 가짜 세션은
+    그 차이를 못 본다.
+    """
+    from app.common.exceptions import InvalidImageFileException
+    from app.core.ids import new_uuid7
+    from app.domain.media import service as media_service_mod
+    from app.domain.media.image_policy import build_pending_file_key
+    from app.domain.media.service import MediaService
+
+    pending_key = build_pending_file_key(new_uuid7(), "x.png")
+
+    async def fake_head(_key):
+        return {"ContentLength": 100, "ContentType": "image/png", "ETag": '"e"'}
+
+    # 승격 대상 키를 여기서 붙잡는다 — `post/%` 전체를 훑어 before/after를 비교하면 다른
+    # 테스트가 남긴 행에 얽힌다.
+    promoted_to: list[str] = []
+
+    async def failing_promote(_key, dest_key, *, etag):
+        promoted_to.append(dest_key)
+        raise ValueError("S3 copy failed")
+
+    monkeypatch.setattr(media_service_mod, "head_pending_object", fake_head)
+    monkeypatch.setattr(media_service_mod, "promote_pending_object", failing_promote)
+
+    with pytest.raises(InvalidImageFileException):
+        async with MediaService._reserved_upload(
+            pending_key, purpose="post", expected_size=100, uploader_id=None, db=db_session
+        ):
+            pass
+
+    assert len(promoted_to) == 1
+    dest_key = promoted_to[0]
+    try:
+        row = await db_session.execute(select(Image.deleted_at).where(Image.file_key == dest_key))
+        deleted_at = row.scalar_one_or_none()
+        await db_session.commit()
+        assert deleted_at is not None, "승격 실패 후 예약 행이 없으면 S3 잔존물을 영영 못 찾는다"
+    finally:
+        await db_session.execute(delete(Image).where(Image.file_key == dest_key))
         await db_session.commit()
 
 
@@ -396,3 +448,43 @@ async def test_attach_validation_blocks_concurrent_soft_delete(db_session: Async
             await db_session.execute(delete(Image).where(Image.id == image_id))
             await db_session.execute(delete(User).where(User.id == owner_id))
             await db_session.commit()
+
+
+async def test_sweeper_skips_reserved_row_while_upload_holds_it(
+    db_session: AsyncSession, monkeypatch
+):
+    """확정 중인 예약 행은 유예를 넘겼어도 스위퍼가 건드리지 않는다 — 행 잠금(SKIP LOCKED).
+
+    유예는 확률적 방어일 뿐이다. 승격이 유예보다 오래 걸리면 스위퍼가 그 행을 집는 순간
+    확정이 성공해, 200 받은 이미지의 행이 지워지거나 객체만 지워진다. 업로드가 승격부터
+    확정까지 행을 `FOR UPDATE`로 잡고 있고 스위퍼가 잠긴 행을 건너뛰면 둘은 겹칠 수 없다.
+    """
+    from app.domain.media.model import MediaRepository
+    from app.domain.media.service import MediaService
+
+    from tests.integration.conftest import TestSessionLocal
+
+    now = utc_now()
+    key = f"sweep-locked-{uuid.uuid4().hex[:8]}"
+    stale = now - timedelta(seconds=settings.RESERVED_IMAGE_GRACE_SECONDS + 60)
+    img = _img(key, created_at=now, deleted_at=stale)  # 유예를 한참 넘긴 예약 행
+    db_session.add(img)
+    await db_session.commit()
+    image_id = img.id
+
+    deleted_keys: list[str] = []
+    monkeypatch.setattr("app.domain.media.service.storage_delete", deleted_keys.append)
+
+    try:
+        async with TestSessionLocal() as uploader:
+            async with uploader.begin():
+                assert await MediaRepository.lock_reserved_image(image_id, db=uploader) is not None
+                # 업로드가 잡고 있는 동안 — 스위퍼는 이 행을 못 본다
+                await MediaService.sweep_unused_images(db=db_session)
+                assert key not in deleted_keys, "잠긴 예약 행을 스위퍼가 집으면 확정과 겹친다"
+        # 업로드가 놓았다(확정 안 하고 롤백) — 이제 수거 대상이다
+        await MediaService.sweep_unused_images(db=db_session)
+        assert key in deleted_keys
+    finally:
+        await db_session.execute(delete(Image).where(Image.id == image_id))
+        await db_session.commit()

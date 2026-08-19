@@ -1,15 +1,21 @@
 """presigned confirm 견고성 + 인증 presign 유저 한도 단위 테스트.
 
-핵심 불변식: confirm 검증(size·content-type)은 promote(영구 copy + pending 삭제) **앞**에서
-실행된다 — 승격 후 거부는 DB 행 없는 영구 객체를 남겨 sweeper(DB 행 기준)·pending/ lifecycle
-어느 쪽도 못 지운다. head~promote 사이 재업로드(TOCTOU)로 우회된 경우엔 승격본을 보상 삭제한다.
-미업로드/소진된 키의 404는 500이 아니라 400으로 매핑된다.
+핵심 불변식(ADR 0019): **S3에 객체가 있으면 그것을 가리키는 `images` 행이 먼저 있다.**
+확정은 예약 행(`deleted_at` 찍힌 채)을 커밋한 뒤 승격하고, 실패하면 예약 상태로 남겨 스위퍼에
+넘긴다 — 보상 삭제를 쓰지 않는다. 보상은 그 자체로 실패할 수 있고, 실패하면 행 기준 스위퍼가
+원리적으로 못 보는 객체가 영구히 남는다.
 
-같은 불변식이 삭제 경로에도 걸린다 — `delete_image`는 스토리지를 먼저 지우고 DB 행을
-나중에 지운다. 순서가 반대면 스토리지 삭제 실패 시 추적 수단(행)이 사라져 회수가 불가능하다.
+확정은 **호출부의 마지막 단계**다. 확정 뒤에 할 일이 남으면 그게 실패했을 때 되돌리는 쓰기가
+필요해지고, 방금 없앤 보상 쓰기가 S3 대신 DB로 되살아난다.
+
+값싼 거부(size·content-type)는 여전히 승격 **앞**에서 한다 — 거부가 `pending/`에서 끝나면
+lifecycle이 회수하므로 예약 행조차 만들 필요가 없다. 미업로드/소진된 키의 404는 400으로 매핑.
+
+삭제 경로도 같은 원리다 — 요청 안에서는 DB만 건드리고 스토리지는 스위퍼가 맡는다.
 """
 
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -23,29 +29,73 @@ pytestmark = pytest.mark.asyncio
 
 
 def _valid_pending_key() -> str:
+    # 키 형식은 `is_valid_pending_file_key` 정규식과 묶여 있다 — 리터럴로 박으면 조용히 썩는다.
     from app.core.ids import new_uuid7
+    from app.domain.media.image_policy import build_pending_file_key
 
-    return f"pending/{new_uuid7()}/x.png"
+    return build_pending_file_key(new_uuid7(), "x.png")
 
 
 def _meta(size: int = 100, content_type: str = "image/png") -> dict[str, Any]:
-    return {"ContentLength": size, "ContentType": content_type}
+    return {"ContentLength": size, "ContentType": content_type, "ETag": '"etag-1"'}
+
+
+class _ReservingRepo:
+    """예약 → 잠금 → 확정 흐름을 기록하는 가짜 리포지터리."""
+
+    def __init__(self, *, reclaimed: bool = False) -> None:
+        self.reserved: list[str] = []
+        self.locked: list[Any] = []
+        self.confirmed: list[Any] = []
+        self.reclaimed = reclaimed  # True면 잠그려 할 때 이미 스위퍼가 가져간 것처럼 군다
+
+    async def create_reserved_image(
+        self, *, file_key, file_url, content_type, size, uploader_id, db
+    ):
+        self.reserved.append(file_key)
+        return SimpleNamespace(id=uuid.uuid4())
+
+    async def lock_reserved_image(self, image_id, *, db):
+        self.locked.append(image_id)
+        return None if self.reclaimed else SimpleNamespace(id=image_id)
+
+    async def confirm_reserved_image(self, image_id, *, size, content_type, db):
+        self.confirmed.append(image_id)
+        return SimpleNamespace(id=image_id, file_url="https://cdn/x.png")
+
+
+def _patch_repo(monkeypatch, **kw) -> _ReservingRepo:
+    repo = _ReservingRepo(**kw)
+    monkeypatch.setattr(media_service_mod, "MediaRepository", repo)
+    monkeypatch.setattr(media_service_mod, "build_url", lambda k: f"https://cdn/{k}")
+    return repo
+
+
+async def _upload(expected_size: int | None):
+    """예약 → 승격 → 확정 한 바퀴. 블록 안에서 할 일이 없는 일반 업로드와 같다."""
+    async with MediaService._reserved_upload(
+        _valid_pending_key(),
+        purpose="post",
+        expected_size=expected_size,
+        uploader_id=None,
+        db=as_session(FakeDB()),
+    ) as upload:
+        pass
+    return upload
 
 
 async def test_confirm_rejects_size_mismatch_before_promote(monkeypatch):
     async def fake_head(key):
         return _meta(size=100)
 
-    async def fail_promote(key, purpose, **_):
+    async def fail_promote(key, dest_key, *, etag):
         raise AssertionError("검증 실패 시 promote(영구 copy + pending 삭제)가 실행되면 안 된다")
 
     monkeypatch.setattr(media_service_mod, "head_pending_object", fake_head)
     monkeypatch.setattr(media_service_mod, "promote_pending_object", fail_promote)
 
     with pytest.raises(InvalidImageFileException):
-        await MediaService._confirm_pending_key(
-            _valid_pending_key(), purpose="post", expected_size=99
-        )
+        await _upload(99)
 
 
 async def test_confirm_rejects_disallowed_type_before_promote(monkeypatch):
@@ -59,16 +109,14 @@ async def test_confirm_rejects_disallowed_type_before_promote(monkeypatch):
     async def fake_head(key):
         return _meta(content_type="image/webp")
 
-    async def fail_promote(key, purpose, **_):
+    async def fail_promote(key, dest_key, *, etag):
         raise AssertionError("정책 거부 대상이 promote되면 안 된다")
 
     monkeypatch.setattr(media_service_mod, "head_pending_object", fake_head)
     monkeypatch.setattr(media_service_mod, "promote_pending_object", fail_promote)
 
     with pytest.raises(InvalidFileTypeException):
-        await MediaService._confirm_pending_key(
-            _valid_pending_key(), purpose="post", expected_size=100
-        )
+        await _upload(100)
 
 
 async def test_confirm_maps_missing_object_to_400(monkeypatch):
@@ -80,60 +128,79 @@ async def test_confirm_maps_missing_object_to_400(monkeypatch):
     monkeypatch.setattr(media_service_mod, "head_pending_object", fake_head)
 
     with pytest.raises(InvalidImageFileException):
-        await MediaService._confirm_pending_key(
-            _valid_pending_key(), purpose="post", expected_size=None
-        )
+        await _upload(None)
 
 
-async def test_confirm_deletes_promoted_object_when_recheck_fails(monkeypatch):
-    """head~promote 사이 재업로드로 선검증을 우회한 경우 — 승격 결과 재확인 실패 시
-    승격본을 보상 삭제해 누수 없이 거부한다."""
-    from app.common.exceptions import InvalidFileTypeException
-    from app.core.config import settings
+async def test_confirm_leaves_reserved_row_when_source_changed_since_validation(monkeypatch):
+    """head~copy 사이 재업로드로 선검증을 우회하려 한 경우 — copy가 ETag 불일치로 실패하고,
+    예약 행은 **지우지 않는다.**
 
-    monkeypatch.setattr(settings, "ALLOWED_IMAGE_TYPES", ["image/jpeg", "image/png"])
-    deleted: list[str] = []
+    보상 삭제는 그 자체로 실패할 수 있고, 실패하면 행 없는 객체가 영구히 남는다. 대신 예약
+    행을 그대로 둬 스위퍼가 회수하게 한다(ADR 0019). 사용자에겐 400.
+    """
+    repo = _patch_repo(monkeypatch)
 
     async def fake_head(key):
         return _meta(size=100, content_type="image/png")
 
-    async def fake_promote(key, purpose, **_):
-        return f"{purpose}/swapped.webp", 100, "image/webp"  # 승격 시점엔 webp로 바뀜
+    async def fake_promote(key, dest_key, *, etag):
+        raise ValueError("pending object missing or changed since validation")
 
-    def fake_delete(key):
-        deleted.append(key)
+    def boom(_key):
+        raise AssertionError("보상 삭제를 쓰면 실패 시 회수 불가능한 객체가 남는다")
 
     monkeypatch.setattr(media_service_mod, "head_pending_object", fake_head)
     monkeypatch.setattr(media_service_mod, "promote_pending_object", fake_promote)
-    monkeypatch.setattr(media_service_mod, "storage_delete", fake_delete)
+    monkeypatch.setattr(media_service_mod, "storage_delete", boom)
 
-    with pytest.raises(InvalidFileTypeException):
-        await MediaService._confirm_pending_key(
-            _valid_pending_key(), purpose="post", expected_size=100
-        )
-    assert deleted == ["post/swapped.webp"]
+    with pytest.raises(InvalidImageFileException):
+        await _upload(100)
+
+    assert repo.reserved, "승격 전에 예약 행이 없으면 회수할 근거가 없다"
+    assert repo.confirmed == [], "승격 실패분이 확정되면 안 된다"
 
 
-async def test_confirm_happy_path(monkeypatch):
+async def test_upload_reserves_then_locks_then_promotes_with_validated_etag(monkeypatch):
+    """정상 경로 — 예약 행 커밋 → 그 행을 잠금 → 첫 HEAD의 ETag를 조건으로 승격 → 확정."""
+    order: list[str] = []
+    repo = _patch_repo(monkeypatch)
+
     async def fake_head(key):
         return _meta(size=100, content_type="image/png")
 
-    async def fake_promote(key, purpose, **_):
-        return f"{purpose}/ok.png", 100, "image/png"
+    async def fake_promote(key, dest_key, *, etag):
+        order.append("promote")
+        assert repo.reserved == [dest_key], "행 없이 승격하면 그 사이 실패가 영구 누수가 된다"
+        assert repo.locked, "잠그지 않고 승격하면 스위퍼가 그 사이 행을 가져갈 수 있다"
+        assert etag == '"etag-1"', "검증한 객체의 ETag를 copy 조건으로 넘겨야 재업로드를 막는다"
 
     monkeypatch.setattr(media_service_mod, "head_pending_object", fake_head)
     monkeypatch.setattr(media_service_mod, "promote_pending_object", fake_promote)
-    monkeypatch.setattr(media_service_mod, "build_url", lambda k: f"https://cdn/{k}")
 
-    dest_key, url, content_type, size = await MediaService._confirm_pending_key(
-        _valid_pending_key(), purpose="post", expected_size=100
-    )
-    assert (dest_key, url, content_type, size) == (
-        "post/ok.png",
-        "https://cdn/post/ok.png",
-        "image/png",
-        100,
-    )
+    upload = await _upload(100)
+
+    assert order == ["promote"]
+    assert repo.reserved[0].startswith("post/") and repo.reserved[0].endswith(".png")
+    assert repo.confirmed == [upload.image.id]
+
+
+async def test_upload_fails_before_promote_when_sweeper_already_reclaimed(monkeypatch):
+    """잠그려는데 스위퍼가 먼저 가져갔으면 **승격 전에** 실패한다 — 객체가 안 만들어진다."""
+    from app.common.exceptions import InternalServerErrorException
+
+    _patch_repo(monkeypatch, reclaimed=True)
+
+    async def fake_head(key):
+        return _meta()
+
+    async def fake_promote(key, dest_key, *, etag):
+        raise AssertionError("회수된 행에 승격하면 행 없는 객체가 생긴다")
+
+    monkeypatch.setattr(media_service_mod, "head_pending_object", fake_head)
+    monkeypatch.setattr(media_service_mod, "promote_pending_object", fake_promote)
+
+    with pytest.raises(InternalServerErrorException):
+        await _upload(100)
 
 
 # --- storage head: 404 → ValueError 매핑 ---
@@ -256,52 +323,39 @@ async def test_delete_image_raises_not_found_when_not_owned(monkeypatch):
     """없거나·남의 것이거나·이미 지운 것은 전부 404 — 셋을 구분해 알리면 존재가 노출된다."""
     from app.common.exceptions import ImageNotFoundException
 
-    soft_deleted = _patch_delete_repo(monkeypatch, owned=False)
+    _patch_delete_repo(monkeypatch, owned=False)
 
     with pytest.raises(ImageNotFoundException):
         await MediaService.delete_image(uuid.uuid4(), uuid.uuid4(), as_session(FakeDB()))
 
-    assert soft_deleted == []
 
+async def test_signup_confirms_only_after_token_is_issued(monkeypatch):
+    """가입 확정은 토큰이 발급된 **뒤에** 일어난다 — 그래서 되돌릴 것이 없다.
 
-async def test_signup_confirm_rollback_keeps_db_row_when_storage_delete_fails(monkeypatch):
-    """signup confirm 롤백도 스토리지 실패 시 DB 행을 남겨야 한다.
-
-    `create_temp_image`는 커밋되므로 실제 행이 존재한다. 행을 먼저 지우고 스토리지 삭제가
-    실패하면 회수 수단이 사라진다 — temp image는 어디에도 연결되지 않아 행만 남아 있으면
-    고아 sweeper가 24시간 뒤 정리한다.
+    순서가 반대면(확정 먼저, 토큰 나중) 토큰 발급 실패 시 확정을 되돌리는 쓰기가 필요하다.
+    그건 이 브랜치가 S3에서 없앤 보상 쓰기가 DB로 되살아난 것일 뿐이고, 그 되돌리기 역시
+    실패할 수 있다. 확정을 맨 뒤로 미루면 실패는 예약 행을 남기고 스위퍼가 회수한다.
     """
     from app.domain.media.schema import ConfirmSignupUploadRequest
 
-    image_id = uuid.uuid4()
-    deleted_ids: list[Any] = []
+    repo = _patch_repo(monkeypatch)
 
-    class _Image:
-        id = image_id
-        file_url = "http://example.test/media/x.png"
+    async def fake_head(key):
+        return _meta()
 
-    class _Repo:
-        @staticmethod
-        async def create_temp_image(**_kwargs):
-            return _Image()
-
-        @staticmethod
-        async def delete_images_by_ids(ids, db):
-            deleted_ids.extend(ids)
-            return len(ids)
-
-    async def fake_confirm(key, *, purpose, expected_size):
-        return "media/dest/x.png", _Image.file_url, "image/png", 100
+    async def fake_promote(key, dest_key, *, etag):
+        return None
 
     async def fail_token(image_id_, redis):
-        raise RuntimeError("redis down")  # 롤백 유발
+        assert repo.confirmed == [], "토큰보다 먼저 확정하면 되돌리는 쓰기가 필요해진다"
+        raise RuntimeError("redis down")
 
     def boom(_key):
-        raise RuntimeError("S3 down")
+        raise AssertionError("가입 확정 실패가 스토리지를 건드리면 안 된다")
 
-    monkeypatch.setattr(MediaService, "_confirm_pending_key", fake_confirm)
+    monkeypatch.setattr(media_service_mod, "head_pending_object", fake_head)
+    monkeypatch.setattr(media_service_mod, "promote_pending_object", fake_promote)
     monkeypatch.setattr(MediaService, "issue_upload_token", fail_token)
-    monkeypatch.setattr(media_service_mod, "MediaRepository", _Repo)
     monkeypatch.setattr(media_service_mod, "storage_delete", boom)
 
     with pytest.raises(RuntimeError):
@@ -311,4 +365,4 @@ async def test_signup_confirm_rollback_keeps_db_row_when_storage_delete_fails(mo
             None,
         )
 
-    assert deleted_ids == [], "스토리지 삭제 실패 후 행을 지우면 고아를 영영 회수할 수 없다"
+    assert repo.confirmed == [], "실패했는데 확정돼 있으면 되돌릴 쓰기가 필요하다"
