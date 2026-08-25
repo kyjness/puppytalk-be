@@ -60,7 +60,7 @@ AI 기능이 아니라 **"현실적 트래픽을 가정한 운영 등급 백엔�
 | **media** | 이미지 업로드(멱등성), 스토리지 삭제 정합성(고아 파일 방지), 잡 락(Lua CAS) | #1 |
 | **comments** | 트리 페이지네이션(하드리밋 제거), 좋아요 카운트 중복 제거 | #6, #15 |
 | **chat** | WebSocket Stateless, 워커 간 Redis Pub/Sub, 미읽음 카운트 쿼리 최적화 | #16, #19 |
-| **notifications** | 비동기 알림(Celery), 전달(SSE/pub-sub) | — |
+| **notifications** | 비동기 알림(워커 큐), 전달(SSE/pub-sub) | — |
 | **reports / admin** | 신고 목록 페이지네이션(메모리 슬라이스 제거) | #5 |
 | **dogs / likes** | 도메인 정리(대표견, 좋아요 카운트 일관성) | #11, #15 |
 

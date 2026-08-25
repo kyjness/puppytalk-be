@@ -9,14 +9,14 @@
   `app/domain/notifications/service.py`(`publish_after_commit`·`sse_subscribe`),
   `app/domain/notifications/stream.py`(워커-로컬 `SseFanoutManager`),
   `app/infra/pubsub.py`(envelope publish·공용 구독 리스너),
-  `app/worker/jobs/notification_delivery.py`(Celery SNS 배송 잡),
+  `app/worker/jobs/notification_delivery.py`(SNS 배송 잡),
   `app/infra/redis.py`·`app/main.py`(풀 커넥션·lifespan 리스너 배선)
 
 ## 맥락 (Context)
 
 [운영 봉투](../00-operating-envelope-and-scope.md)는 **멀티 인스턴스 · 무중단 재배포**를 전제한다.
 그런데 실시간 연결(채팅 소켓·알림 스트림)은 본질적으로 **특정 워커 프로세스에 붙는다** — LB 뒤 N개
-인스턴스 중 하나의 메모리에 소켓이 산다. 이벤트의 발생지(상대 유저의 액션을 처리한 요청, 혹은 Celery
+인스턴스 중 하나의 메모리에 소켓이 산다. 이벤트의 발생지(상대 유저의 액션을 처리한 요청, 혹은 백그라운드
 워커)는 **다른 워커**일 수 있다. 단일 프로세스라면 인메모리 연결 맵으로 끝나지만, 멀티 인스턴스에서는
 "발생지 워커 → 수신자 소켓을 가진 워커"로 이벤트를 넘길 **프로세스 간 fanout**이 필요하다.
 
@@ -82,13 +82,13 @@
      (재접속·GET 재동기 경로 존재). 큐 기반 소켓별 전달(정체 격리 + 순서 보장)은 현
      운영 봉투에서 미정당 복잡도로 보류(backlog #37).
 
-4. **오프라인 배송(SNS) 오프로드 = Celery**
+4. **오프라인 배송(SNS) 오프로드 = 워커 큐** ([ADR 0018](0018-background-work-tiers.md) 3등급, 구현은 [0020](0020-worker-queue-arq.md))
    - 실시간 인앱(pub/sub)은 인라인으로 두고, **재시도·백오프가 필요한 외부 I/O인 SNS publish만**
-     알림 생성 시 `deliver_notification_sns`(high_priority 큐)로 오프로드한다 — "쓸 데(외부 배송)와
+     알림 생성 시 `deliver_notification_sns` 잡으로 오프로드한다 — "쓸 데(외부 배송)와
      안 쓸 데(인라인으로 충분한 실시간 발행)"의 구분.
-   - 멱등키 `celery:notif:delivered:{key}`는 **publish 성공 후에만 마킹**한다 — 선마킹하면 실패
+   - 멱등키 `notif:delivered:{key}`는 **publish 성공 후에만 마킹**한다 — 선마킹하면 실패
      재시도가 멱등 skip으로 유실된다. 경쟁 중복 publish(at-least-once)는 SNS 구독자가 흡수.
-   - `CELERY_ENABLED=false`·브로커 장애 시 인라인 fire-and-forget으로 폴백(fail-open).
+   - `WORKER_ENABLED=false`·큐 장애 시 인라인 fire-and-forget으로 폴백(fail-open).
      페이로드는 태스크 인자가 아니라 워커가 DB 행에서 재구성한다(재시도 시점에도 진실은 DB).
    - 초기의 사용자 트리거 재전달 API(`POST /notifications/{id}/dispatch`)는 실제 UX 흐름이 없는
      합성 경로라 제거했다(2차 감사 #22).
@@ -121,7 +121,7 @@
 | Sticky session(LB가 유저를 워커에 고정, Redis 없이 인메모리) | 무중단 재배포·스케일아웃에서 깨짐. 워커 사망 시 전달 소실, 다기기 크로스-워커 불가 |
 | 알림도 WebSocket | 단방향 이벤트에 양방향 전이중은 과함. SSE 자동 재연결·HTTP 친화성 이점 상실 |
 | 채팅도 SSE | 채팅은 클라 송신이 필요 — SSE는 서버→클라 단방향이라 별도 POST 채널을 덧대야 함 |
-| 외부 브로커(Kafka·RabbitMQ)로 fanout | 지속성·순서 보장은 at-most-once 실시간에 불필요. 운영 봉투에서 브로커 운영비 정당화 안 됨(지속성은 DB+Celery가 담당) |
+| 외부 브로커(Kafka·RabbitMQ)로 fanout | 지속성·순서 보장은 at-most-once 실시간에 불필요. 운영 봉투에서 브로커 운영비 정당화 안 됨(지속성은 DB+워커 큐가 담당) |
 | 클라이언트 폴링 | 지연·부하. 채팅/알림 실시간성은 제품 요구 |
 
 ## 일부러 하지 않은 것 (Non-goals)

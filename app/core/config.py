@@ -1,5 +1,6 @@
 # 환경 변수 (Settings). pydantic-settings 기반: .env 로딩·타입 강제·프로덕션 가드.
 # 주의: app.common 등 상위 패키지를 import하지 않는다(Alembic env 로드 시 순환 참조 회피).
+import os
 from pathlib import Path
 from typing import Annotated
 
@@ -21,11 +22,11 @@ _MIN_FLOORS: dict[str, int] = {
     "MEDIA_CLEANUP_BATCH_SIZE": 1,
     # 0이면 승격 중인 예약 행을 스위퍼가 지운다 — 설정으로도 그 값에 못 가게 막는다.
     "RESERVED_IMAGE_GRACE_SECONDS": 5,
-    "CELERY_BROKER_VISIBILITY_TIMEOUT": 300,
-    "CELERY_RESULT_EXPIRES_SECONDS": 60,
-    "CELERY_TASK_SOFT_TIME_LIMIT": 60,
-    "CELERY_TASK_TIME_LIMIT": 120,
-    "CELERY_TASK_IDEMPOTENCY_TTL_SECONDS": 300,
+    "ARQ_JOB_TIMEOUT": 120,
+    "ARQ_MAX_TRIES": 1,
+    # 0이면 재시도 4회가 지연 없이 즉시 소진돼 지터가 막으려던 thundering herd가 열린다.
+    "ARQ_RETRY_BASE_SECONDS": 1,
+    "WORKER_IDEMPOTENCY_TTL_SECONDS": 300,
     "IDEMPOTENCY_POST_CREATE_TTL_SECONDS": 60,
     "IDEMPOTENCY_POST_CREATE_LOCK_TTL_SECONDS": 5,
     "VIEW_BUFFER_FLUSH_INTERVAL_SECONDS": 60,
@@ -90,17 +91,17 @@ class Settings(BaseSettings):
 
     # ----- Redis (비우면 연결 시도 안 함, rate limit 등 Fail-open) -----
     REDIS_URL: str = ""
-    # ----- Celery (REDIS_URL 기반 broker/result DB 인덱스 분리) -----
-    CELERY_ENABLED: bool = False
-    CELERY_BROKER_URL: str = ""
-    CELERY_RESULT_BACKEND: str = ""
-    CELERY_BROKER_DB: int = 1
-    CELERY_RESULT_DB: int = 2
-    CELERY_BROKER_VISIBILITY_TIMEOUT: int = 3600
-    CELERY_RESULT_EXPIRES_SECONDS: int = 3600
-    CELERY_TASK_SOFT_TIME_LIMIT: int = 300
-    CELERY_TASK_TIME_LIMIT: int = 600
-    CELERY_TASK_IDEMPOTENCY_TTL_SECONDS: int = 86400
+    # ----- 워커 큐(arq) — REDIS_URL 기반, DB 인덱스만 분리 -----
+    # 끄면 배송이 인라인 fire-and-forget으로 떨어진다(fail-open, ADR 0005·0020).
+    WORKER_ENABLED: bool = False
+    ARQ_REDIS_DB: int = 1
+    # arq는 soft/hard 구분이 없는 단일 타임아웃이다(Celery의 soft 120·hard 180을 하나로).
+    ARQ_JOB_TIMEOUT: int = 180
+    # 총 시도 횟수. Celery의 max_retries=3(최초 1 + 재시도 3)과 같은 4회.
+    ARQ_MAX_TRIES: int = 4
+    # 재시도 백오프의 기준값 — n번째 시도는 base * 2**(n-1)에 지터를 얹는다.
+    ARQ_RETRY_BASE_SECONDS: int = 60
+    WORKER_IDEMPOTENCY_TTL_SECONDS: int = 86400
     # SSE 알림 pubsub이 연결을 길게 점유하므로 기본 풀 크기를 넉넉히 둠.
     REDIS_MAX_CONNECTIONS: int = 128
     # Fail-open(ADR 0005)은 예외를 받아야 발동한다 — 타임아웃이 없으면 Redis가 "죽은" 게 아니라
@@ -211,8 +212,6 @@ class Settings(BaseSettings):
         "WRITER_DB_URL",
         "READER_DB_URL",
         "REDIS_URL",
-        "CELERY_BROKER_URL",
-        "CELERY_RESULT_BACKEND",
         "S3_ENDPOINT_URL",
         "SNS_TOPIC_ARN",
         "LOG_FILE_PATH",
@@ -267,6 +266,19 @@ def validate_settings_for_environment() -> None:
         errors.append(
             "TRUST_X_FORWARDED_FOR=true와 TRUSTED_PROXY_IPS(프록시 대역)가 설정돼야 합니다 — "
             "IP 기반 rate limit·조회수 dedup이 프록시 IP로 수렴하는 것을 방지."
+        )
+
+    # ADR 0020에서 Celery를 걷어내며 CELERY_* 를 WORKER_*·ARQ_* 로 바꿨다. `extra="ignore"` 라
+    # 옛 이름이 남아 있어도 조용히 무시되고 새 이름은 기본값으로 떨어진다 — 특히
+    # `CELERY_ENABLED=true`만 있으면 `WORKER_ENABLED`가 False가 되어 배송이 **재시도 없는
+    # 인라인으로 영구 강등**된다. 겉보기엔 푸시가 나가므로 아무도 모른다. 이름이 바뀌었다는
+    # 사실을 조용히 흘리지 않고 기동을 막아 알린다.
+    legacy = sorted(k for k in os.environ if k.startswith("CELERY_"))
+    if legacy:
+        errors.append(
+            f"Celery 설정이 남아 있습니다({', '.join(legacy)}). ADR 0020으로 제거된 이름입니다 — "
+            "CELERY_ENABLED는 WORKER_ENABLED, CELERY_TASK_IDEMPOTENCY_TTL_SECONDS는 "
+            "WORKER_IDEMPOTENCY_TTL_SECONDS로 바꾸고 나머지는 지우세요."
         )
 
     if errors:

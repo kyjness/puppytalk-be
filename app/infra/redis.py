@@ -1,13 +1,17 @@
 # Redis 연결. Rate Limit·Refresh Token 저장. 앱 lifespan에서 init/close.
 import hashlib
 import logging
+import math
 from collections.abc import Awaitable
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from redis.asyncio import ConnectionPool, Redis
 from redis.exceptions import NoScriptError
 
 from app.core.config import settings
+
+if TYPE_CHECKING:
+    from arq.connections import RedisSettings
 
 log = logging.getLogger(__name__)
 
@@ -107,8 +111,10 @@ def bulk_to_str(value: Any) -> str | None:
 def redis_connection_kwargs(*, socket_timeout: float | None = None) -> dict[str, Any]:
     """모든 Redis 클라이언트가 공유하는 연결 옵션.
 
-    생성부가 셋이라(앱 풀·구독 소켓·워커) 각자 손으로 쓰면 그중 하나만 옵션이 빠지는 식으로
-    조용히 갈라진다 — 실제로 한 번 그렇게 됐다. 여기가 유일한 출처다.
+    생성부가 넷이라(앱 풀·구독 소켓·워커 멱등 클라이언트·arq 큐) 각자 손으로 쓰면 그중 하나만
+    옵션이 빠지는 식으로 조용히 갈라진다 — 실제로 한 번 그렇게 됐다. 여기가 유일한 출처다.
+    arq는 자체 `RedisSettings`를 쓰므로 이 dict를 직접 못 받는다 — 아래 `arq_redis_settings()`가
+    여기서 값을 꺼내 변환한다(`tests/unit/test_worker_queue_config.py`가 그 경유를 검사한다).
 
     소켓 타임아웃은 성능 튜닝이 아니라 **fail-open 계약의 전제**다(ADR 0005). 앱의 모든
     fail-open은 `except`로 발동하는데, 타임아웃이 없으면 Redis가 먹통일 때 예외 자체가
@@ -125,6 +131,43 @@ def redis_connection_kwargs(*, socket_timeout: float | None = None) -> dict[str,
         ),
         "socket_connect_timeout": settings.REDIS_SOCKET_CONNECT_TIMEOUT,
     }
+
+
+def arq_redis_settings() -> "RedisSettings | None":
+    """워커 큐(arq)용 연결 설정. `REDIS_URL`이 비면 None(큐 비활성).
+
+    arq는 redis-py 클라이언트를 자기 `RedisSettings`로 직접 만든다 — 위 `redis_connection_kwargs`를
+    안 거치는 **네 번째 생성부**다. 그대로 두면 ADR 0005가 막으려던 "생성부마다 타임아웃이 갈린다"가
+    재발하므로, 변환을 이 모듈 안에 가둬 창구를 하나로 유지한다.
+
+    `ARQ_REDIS_DB`로 앱 데이터와 DB 인덱스를 분리한다(큐 키가 앱 키스페이스를 오염시키지 않게).
+    arq에는 명령 단위 `socket_timeout`이 없고 연결 타임아웃(`conn_timeout`)만 있다 — 그 차이는
+    ADR 0020 트레이드오프에 적었다.
+    """
+    from arq.connections import RedisSettings
+
+    if not settings.REDIS_URL:
+        return None
+    rs = RedisSettings.from_dsn(settings.REDIS_URL)
+    rs.database = settings.ARQ_REDIS_DB
+    # 타임아웃 값은 위 공용 창구에서 꺼낸다 — 설정을 직접 읽으면 읽는 곳이 둘이 되어
+    # "유일한 출처"가 문구로만 남는다.
+    #
+    # arq의 conn_timeout은 int다. 내림하면 설정값보다 **짧아져** 정상 연결이 오탐으로 끊길 수
+    # 있으므로 올림한다 — 타임아웃은 늘어나는 쪽이 안전하다.
+    rs.conn_timeout = math.ceil(redis_connection_kwargs()["socket_connect_timeout"])
+    # arq 기본은 5회 재시도 × 1초 지연이다. `conn_retries`는 `create_pool`에서만 읽히고
+    # 클라이언트로 전달되지 않으므로 **요청 경로에는 닿지 않는다** — 요청 경로 방어는
+    # lifespan에서 풀을 미리 만드는 쪽이 혼자 맡는다(ADR 0020 결정 5).
+    # 여기서 자르는 것은 **부팅 지연**이다: 죽은 Redis에서 기본값이면 ~17초, 이 값이면 ~4초.
+    # 지연도 함께 없앤다 — 재시도를 1회로 줄여도 그 사이 1초 슬립은 arq 기본으로 남는다.
+    rs.conn_retries = 1
+    rs.conn_retry_delay = 0
+    # 이 레포의 다른 클라이언트는 전부 풀 크기를 의도적으로 묶는다(앱 128 · 워커 멱등 4).
+    # arq 기본은 None이고 redis-py가 그걸 2**31로 바꾼다 — 사실상 무제한이라 2GB 박스에서
+    # 앱 풀 128 위로 끝없이 얹힌다. enqueue는 밀리초 단위라 16이면 넉넉하다.
+    rs.max_connections = 16
+    return rs
 
 
 def create_redis_client(*, max_connections: int | None = None) -> RedisLike | None:

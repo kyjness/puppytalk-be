@@ -190,8 +190,10 @@ async def test_pubsub_listener_raises_in_bounded_time_when_redis_is_unresponsive
 
 
 # --- 배선 그물 ---
-# 위 동작 테스트가 본 계약이고, 아래는 클라이언트 생성부가 셋이라 그중 하나만 옵션이
-# 빠지는 것을 막는 값싼 보조 검사다. 셋 다 `redis_connection_kwargs()`를 거쳐야 한다.
+# 위 동작 테스트가 본 계약이고, 아래는 클라이언트 생성부가 넷이라 그중 하나만 옵션이
+# 빠지는 것을 막는 값싼 보조 검사다. 여기 셋은 `redis_connection_kwargs()`를 직접 거친다.
+# 넷째(arq 큐)는 자체 `RedisSettings`라 살아 있는 클라이언트가 없어 이 그물에 못 넣는다 —
+# 그 경유는 `tests/unit/test_worker_queue_config.py`가 검사한다.
 
 
 def _app_client() -> Any:
@@ -217,7 +219,7 @@ def _subscriber_client() -> Any:
 async def test_every_redis_client_carries_socket_timeouts(
     monkeypatch: pytest.MonkeyPatch, make: str
 ) -> None:
-    """앱 풀·워커·구독 소켓 셋 다 타임아웃을 실어야 한다.
+    """앱 풀·워커·구독 소켓 셋 다 타임아웃을 실어야 한다(arq 큐는 별도 파일).
 
     워커가 빠지면 먹통 Redis에서 멱등성 조회가 워커 슬롯을 소진하고, 구독 소켓이 빠지면
     그 인스턴스의 실시간 전달이 재시작까지 죽는다 — 셋의 실패 결과가 각각 다르다.

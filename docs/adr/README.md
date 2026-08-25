@@ -28,12 +28,16 @@ PuppyTalk 백엔드의 주요 설계 결정을 기록한다. 각 ADR은
 | [0015](0015-index-migration-concurrently.md) | 인덱스 마이그레이션 — 라이브 테이블은 CONCURRENTLY | 횡단·Ops | 채택됨 |
 | [0016](0016-comment-list-offset-pagination.md) | 댓글 목록 — 인기순 복원을 위한 offset + `total` | 도메인(comments) | 채택됨 |
 | [0017](0017-demo-deployment-topology.md) | 라이브 데모 배포 — 단일 인스턴스 compose(관리형 미사용) | Ops | 채택됨 |
-| [0018](0018-background-work-tiers.md) | 백그라운드 작업 — 실패 비용 기준 3단 분리 · Celery 채택 | 횡단 | 채택됨 |
+| [0018](0018-background-work-tiers.md) | 백그라운드 작업 — 실패 비용 기준 3단 분리 | 횡단 | 채택됨 (3등급 구현은 0020) |
 | [0019](0019-storage-db-write-ordering.md) | S3·DB 쓰기 순서 — 요청은 DB만, 스토리지는 스위퍼 | 도메인(media) | 채택됨 |
+| [0020](0020-worker-queue-arq.md) | 작업 큐 — Celery → ARQ (0018의 3등급 구현 교체) | 횡단 | 채택됨 |
 
 > 0006의 얇은 메트릭(`/metrics` RED)·헬스 분리(`/livez`·`/readyz`)는 Transition(Ops)에서 구현됐다
 > — readiness는 DB=hard·Redis=soft(fail-open)로 구체화(0006 구현 노트).
 > 0009는 chat·notifications 재건 단계에서 기구현된 실시간 설계를 소급 근거화했다.
+> [0020](0020-worker-queue-arq.md)은 **0018을 대체하지 않는다** — 등급 분리 프레임워크는 0018이,
+> 3등급을 무엇으로 실행하는가는 0020이 정본이다. 0018을 덮어쓰지 않은 이유는 그 되짚기
+> (기각 사유 셋 중 둘이 사실이 아니었다) 자체가 남길 기록이기 때문이다.
 > [0002](0002-cursor-pagination.md)의 cursor 표준에는 *의도적 예외*가 **둘** 있다 — 0012(admin 신고 피드:
 > 저트래픽·변동 정렬·total 필요)와 0016(댓글 루트 목록: 인기순의 정렬 축 `like_count`가 변동값이라
 > keyset 불성립). 둘 다 offset + `total`이며, 그 외 목록은 keyset 표준을 따른다.
