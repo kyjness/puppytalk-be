@@ -1,9 +1,11 @@
-# 알림 SNS 배송 Job: DB 행 검증 → SNS publish → 성공 후 멱등 마킹. Celery 태스크는 tasks/ 에서 호출.
+# 알림 SNS 배송 arq 잡: DB 행 검증 → SNS publish → 성공 후 멱등 마킹 + 재시도 정책.
 
 import json
 import logging
+import random
 from uuid import UUID
 
+from arq.worker import Retry
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,8 +20,8 @@ from app.infra.sns import deliver_once
 
 log = logging.getLogger(__name__)
 
-# 워커 프로세스당 Redis 클라이언트 1개 재사용 — async_bridge가 프로세스당 단일 이벤트 루프를
-# 유지하므로 안전하다(태스크마다 from_url→aclose는 커넥션 churn).
+# 워커 프로세스당 Redis 클라이언트 1개 재사용 — arq 워커는 프로세스당 단일 이벤트 루프에서
+# 잡을 돌리므로 안전하다(잡마다 from_url→aclose는 커넥션 churn).
 _redis_client: RedisLike | None = None
 
 
@@ -92,10 +94,55 @@ async def deliver_notification_sns_async(
         idempotency_key,
         settings.SNS_TOPIC_ARN,
         json.dumps(payload, ensure_ascii=False),
-        settings.CELERY_TASK_IDEMPOTENCY_TTL_SECONDS,
+        settings.WORKER_IDEMPOTENCY_TTL_SECONDS,
     )
     if not delivered:
         log.info("notification_delivery_skip_idempotent key=%s", idempotency_key)
         return {"status": "skipped", "reason": "idempotent"}
     log.info("notification_sns_delivered notification_id=%s user_id=%s", nid, uid)
     return {"status": "delivered", "notification_id": str(nid)}
+
+
+def _retry_delay(job_try: int) -> float:
+    """지수 백오프 + 지터. Celery의 `retry_backoff`·`retry_jitter`와 같은 곡선.
+
+    지터가 없으면 한 번에 실패한 배송들이 같은 초에 재시도돼 SNS로 몰린다(thundering herd).
+    """
+    base = settings.ARQ_RETRY_BASE_SECONDS * (2 ** (job_try - 1))
+    return base * random.uniform(1.0, 1.5)
+
+
+async def deliver_notification_sns(
+    ctx: dict,
+    *,
+    notification_id: str,
+    user_id: str,
+    idempotency_key: str,
+) -> dict[str, str]:
+    """워커가 실행하는 진입점 — 위 잡 본문에 재시도 정책만 얹는다.
+
+    **arq는 그냥 예외를 올리면 재시도하지 않는다** — `Retry`를 올려야 한다. Celery의
+    `self.retry(exc=...)`와 시맨틱이 반대라, 이 교체에서 가장 놓치기 쉬운 지점이다
+    (ADR 0020 결정 2). 총 시도 횟수는 `WorkerSettings.max_tries`가 막는다.
+
+    잡이 둘 이상이 되면 이 번역을 공용 데코레이터로 올린다 — 지금은 잡이 하나라
+    미리 만들지 않는다(ADR 0020 "일부러 하지 않은 것").
+    """
+    try:
+        return await deliver_notification_sns_async(
+            notification_id=notification_id,
+            user_id=user_id,
+            idempotency_key=idempotency_key,
+        )
+    except NotificationDeliverySkip as e:
+        # 재시도해도 결과가 같다(미존재·멱등 스킵·SNS 비활성) — Retry를 올리지 않는다.
+        log.warning("deliver_notification_sns_skip: %s", e)
+        return {"status": "skipped", "reason": str(e)}
+    except Exception:
+        job_try = int(ctx.get("job_try", 1))
+        log.exception(
+            "deliver_notification_sns_failed notification_id=%s try=%s",
+            notification_id,
+            job_try,
+        )
+        raise Retry(defer=_retry_delay(job_try)) from None

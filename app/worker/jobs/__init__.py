@@ -1,1 +1,1 @@
-# Worker 비동기 Job(ORM·UoW). Celery tasks 레이어와 분리해 순환 import 방지.
+# 워커가 실행하는 arq 잡. 잡 본문과 재시도 정책을 함께 둔다.

@@ -62,13 +62,11 @@ services:
   worker:
     <<: *app
     container_name: puppytalk-prod-worker
-    # 큐 2종은 app/core/celery.py 의 task_queues·task_routes 와 일치해야 한다.
-    command: >
-      celery -A app.core.celery:celery_app worker
-      -Q default,high_priority --concurrency=2 --loglevel=info
+    # 잡·동시성은 app/worker/settings.py 의 WorkerSettings 가 정한다(큐는 하나).
+    command: python3 -m arq app.worker.settings.WorkerSettings
     # 이미지의 HEALTHCHECK는 /livez(HTTP)를 때린다 — 워커는 같은 이미지를 쓰지만 command를
-    # celery로 바꿔 8000에 리스너가 없다. 그대로 상속하면 정상 동작 중에도 영구 unhealthy로
-    # 뜬다. celery inspect ping으로 바꾸는 대안은 30초마다 브로커를 왕복해 2GB에서 과하다.
+    # 워커로 바꿔 8000에 리스너가 없다. 그대로 상속하면 정상 동작 중에도 영구 unhealthy로
+    # 뜬다. 워커에 헬스 프로브를 붙이는 대안은 30초마다 Redis를 왕복해 2GB에서 과하다.
     healthcheck:
       disable: true
     depends_on:

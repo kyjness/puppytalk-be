@@ -1,1 +1,1 @@
-# Celery worker 패키지. 태스크는 app.worker.tasks, 앱 인스턴스는 app.core.celery.
+# arq 워커 패키지. 진입점은 app.worker.settings, 잡 본문은 app.worker.jobs.

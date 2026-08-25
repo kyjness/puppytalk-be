@@ -4,11 +4,9 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator
-from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from starlette.concurrency import run_in_threadpool
 
 from app.common.enums import NotificationKind
 from app.common.exceptions import TooManyRequestsException
@@ -23,6 +21,7 @@ from app.domain.notifications.schema import (
 )
 from app.domain.notifications.stream import NOTIF_SSE_FANOUT_CHANNEL, notification_sse_manager
 from app.infra.pubsub import publish_user_envelope
+from app.infra.queue import get_queue
 from app.infra.redis import RedisLike
 from app.infra.sns import deliver_once
 
@@ -48,7 +47,7 @@ async def drain_sns_inline_tasks(timeout_seconds: float = 5.0) -> None:
 
 
 def _sns_idempotency_key(notification_id: UUID) -> str:
-    """결정적 멱등키 — Celery enqueue와 인라인 폴백이 같은 키를 써서 이중 배송 창을 닫는다."""
+    """결정적 멱등키 — 워커 잡과 인라인 폴백이 같은 키를 써서 이중 배송 창을 닫는다."""
     return f"sns:{uuid_to_base62(notification_id)}"
 
 
@@ -87,20 +86,22 @@ class NotificationService:
 
     @classmethod
     async def _dispatch_sns_publish(cls, redis: RedisLike | None, event: NotificationEvent) -> None:
-        """오프라인 배송(SNS)은 재시도·백오프가 필요한 외부 I/O라 Celery로 오프로드한다.
+        """오프라인 배송(SNS)은 재시도·백오프가 필요한 외부 I/O라 워커 큐로 오프로드한다.
 
-        워커 비활성(CELERY_ENABLED=false)·브로커 장애 시에는 인라인 fire-and-forget으로
+        워커 비활성(WORKER_ENABLED=false)·큐 장애 시에는 인라인 fire-and-forget으로
         폴백한다(fail-open — 실시간 인앱 경로와 DB는 이미 확보된 상태).
+
+        arq의 `enqueue_job`은 네이티브 async다 — Celery `.delay()`가 동기라서 알림마다
+        스레드풀 슬롯을 태우던 `run_in_threadpool` 왕복이 사라졌다(ADR 0020).
         """
         if not settings.SNS_TOPIC_ARN:
             return
-        if settings.CELERY_ENABLED:
+        queue = get_queue()
+        if queue is not None:
             try:
-                from app.worker.tasks.notifications import deliver_notification_sns
-
                 # 결정적 멱등키: 같은 알림의 중복 enqueue가 워커에서 1회 배송으로 수렴.
-                await run_in_threadpool(
-                    cast(Any, deliver_notification_sns).delay,
+                await queue.enqueue_job(
+                    "deliver_notification_sns",
                     notification_id=uuid_to_base62(event.notification_id),
                     user_id=uuid_to_base62(event.recipient_user_id),
                     idempotency_key=_sns_idempotency_key(event.notification_id),
@@ -108,7 +109,7 @@ class NotificationService:
                 return
             except Exception:
                 log.exception(
-                    "알림 SNS Celery enqueue 실패 — 인라인 폴백. notification_id=%s",
+                    "알림 SNS enqueue 실패 — 인라인 폴백. notification_id=%s",
                     event.notification_id,
                 )
         cls._schedule_sns_publish(redis, event)
@@ -129,14 +130,14 @@ class NotificationService:
         topic = settings.SNS_TOPIC_ARN
         message_json = json.dumps(build_sns_payload(event), ensure_ascii=False)
         try:
-            # 워커 잡과 같은 멱등 스토어·키·안무(deliver_once) — 브로커 ack 유실로
+            # 워커 잡과 같은 멱등 스토어·키·안무(deliver_once) — 큐 ack 유실로
             # enqueue와 인라인 폴백이 둘 다 실행돼도(교차 경로) 한쪽만 배송된다.
             await deliver_once(
                 redis,
                 _sns_idempotency_key(event.notification_id),
                 topic,
                 message_json,
-                settings.CELERY_TASK_IDEMPOTENCY_TTL_SECONDS,
+                settings.WORKER_IDEMPOTENCY_TTL_SECONDS,
             )
         except Exception:
             log.exception(

@@ -1,11 +1,14 @@
-# ADR 0018 — 백그라운드 작업: 3단 분리와 Celery 채택
+# ADR 0018 — 백그라운드 작업: 실패 비용 기준 3단 분리
 
-- **상태**: 채택됨 (Accepted)
-- **관련 코드**: `app/core/celery.py`(브로커·큐·재시도 정책),
-  `app/worker/tasks/notifications.py`(유일한 Celery 태스크),
-  `app/worker/async_bridge.py`(동기 Celery ↔ async 앱 어댑터),
+- **상태**: 채택됨 (Accepted). **등급 분리 프레임워크는 이 문서가 정본이다.**
+  단, **3등급의 구현 수단은 [ADR 0020](0020-worker-queue-arq.md)이 Celery → ARQ로 교체**했다.
+- **관련 코드**: `app/worker/settings.py`·`app/infra/queue.py`(3등급 실행·발행 — 0020),
   `app/domain/notifications/service.py`(`_dispatch_sns_publish` — 오프로드 판단과 인라인 폴백),
   `app/domain/media/service.py`(BackgroundTasks sweep), `app/main.py`(lifespan 주기 루프)
+
+> **이 문서의 Celery 서술은 당시 결정의 기록이다.** 0020이 뒤집은 것은 *3등급을 무엇으로
+> 실행하는가* 하나이고, 아래 등급 판단 기준·진입 장벽 논지는 그대로 유효하다. 되짚기의 근거는
+> 0020의 맥락에 있다 — **여기서 든 ARQ 기각 사유 셋 중 둘이 사실이 아니었다.**
 
 ## 맥락 (Context)
 
@@ -29,7 +32,7 @@
 |---|---|---|---|
 | 1 | **인라인 asyncio** (`create_task`) | 실패해도 무방·복구 불필요 | SNS 인라인 폴백 |
 | 2 | **FastAPI BackgroundTasks** | 실패해도 **다음 주기가 치유** | 안 쓰는 이미지 sweep |
-| 3 | **Celery** | 실패 시 **유실이 확정**되고 재시도가 유일한 복구 | SNS 오프라인 배송 |
+| 3 | **작업 큐** (당시 Celery → 현 ARQ, [0020](0020-worker-queue-arq.md)) | 실패 시 **유실이 확정**되고 재시도가 유일한 복구 | SNS 오프라인 배송 |
 | — | **lifespan asyncio 루프 + 분산락** | 트리거 요청이 없는 **주기** 작업 | 조회수 flush, 미디어 정리 |
 
 핵심은 **3등급의 진입 장벽을 높게 두는 것**이다. "무거우니까 백그라운드로"는 1·2등급으로
@@ -44,13 +47,16 @@ Redis를 DB 인덱스로 분리해** 재사용한다(broker=`/1`, result backend
 
 ### 인라인 폴백은 유지한다
 
-`CELERY_ENABLED=false`·브로커 장애 시 1등급(인라인)으로 떨어진다(fail-open, ADR 0005).
+`WORKER_ENABLED=false`(당시 이름 `CELERY_ENABLED`)·큐 장애 시 1등급(인라인)으로
+떨어진다(fail-open, ADR 0005).
 **두 경로가 같은 멱등키·같은 `deliver_once`를 쓴다** — 브로커 ack 유실로 워커와 인라인이
 둘 다 실행돼도 배송은 한 번이다.
 
 단 이 폴백은 **너무 조용하다**. 푸시가 뜨긴 뜨므로 겉보기엔 멀쩡하고, "워커가 죽었는데
-아무도 모르는" 상태가 된다. 그래서 데모 배포에서도 `CELERY_ENABLED=true`를 강제한다
-(`.env.prod.example`).
+아무도 모르는" 상태가 된다. 그래서 데모 배포에서도 **`WORKER_ENABLED=true`를 강제**한다
+(`.env.prod.example`). 끄고 뜨면 기동 로그에 경고가 남고, 옛 이름(`CELERY_*`)이 남아 있으면
+프로덕션 기동 자체가 막힌다 — 이름이 바뀐 사실이 조용히 흘러 폴백으로 강등되는 것을
+방지한다([ADR 0020](0020-worker-queue-arq.md)).
 
 ### 로컬에는 워커를 두지 않는다
 
@@ -78,6 +84,8 @@ worker 서비스가 없는 것은 누락이 아니라 이 결정의 결과다(`c
 - **동기/비동기 임피던스.** Celery는 동기 기반인데 이 앱은 async라, 태스크가 `run_async_task`로
   이벤트 루프를 빌려 쓰는 어댑터(`app/worker/async_bridge.py`)가 필요하다. 이 파일이 곧
   Celery 선택의 청구서다 — ARQ였다면 없었을 코드다.
+  → **이 청구서를 실제로 지불하지 않기로 했다.** [0020](0020-worker-queue-arq.md)에서 ARQ로
+  옮기며 어댑터가 삭제됐다.
 - 배포 표면 +1(워커 컨테이너). Lightsail 2GB에서 메모리를 나눠 쓴다(ADR 0017 실측 포함).
 
 ## 고려한 대안 (Alternatives)

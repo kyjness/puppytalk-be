@@ -1,5 +1,5 @@
 # SNS publish 공용 헬퍼 + 배송 멱등 스토어.
-# 서비스 인라인 폴백과 Celery 워커 잡이 같은 클라이언트 캐시·같은 멱등 키를 공유해,
+# 서비스 인라인 폴백과 워커 잡이 같은 클라이언트 캐시·같은 멱등 키를 공유해,
 # 브로커 ack 유실 후 인라인 폴백 → 워커 재실행 같은 교차 경로에서도 이중 배송 창이 닫힌다.
 
 
@@ -13,7 +13,7 @@ from app.infra.redis import RedisLike
 
 log = logging.getLogger(__name__)
 
-DELIVERED_KEY_PREFIX = "celery:notif:delivered:"
+DELIVERED_KEY_PREFIX = "notif:delivered:"
 
 # 프로세스당 SNS 클라이언트 1개 재사용(publish마다 생성하면 커넥션·시그너 비용 반복).
 _sns_client: Any = None
