@@ -1,5 +1,8 @@
 # PuppyTalk Backend
 
+> 🐕 **라이브 데모 — [puppytalk.shop](https://puppytalk.shop)**
+> API: [api.puppytalk.shop/v1/docs](https://api.puppytalk.shop/v1/docs) · 데모 계정은 로그인 화면의 *"데모 계정으로 둘러보기"*
+
 반려견 커뮤니티 서비스의 백엔드. **FastAPI(Full-Async)** 기반 REST API에 **WebSocket(DM)**·
 **SSE(알림)** 를 더한 서버입니다.
 
