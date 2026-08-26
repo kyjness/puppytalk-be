@@ -10,7 +10,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from starlette.middleware.gzip import GZipMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.v1 import v1_router
 from app.common import ApiCode, ApiResponse, RootData, api_response, setup_logging
@@ -24,6 +23,7 @@ from app.core.middleware import (
 )
 from app.core.middleware.proxy_headers import ProxyHeadersMiddleware
 from app.core.middleware.rate_limit import RateLimitMiddleware
+from app.core.middleware.trusted_host import ProbeAwareTrustedHostMiddleware
 from app.core.openapi_camel import openapi_schema_to_camel
 from app.db import check_database
 from app.infra.redis import get_app_redis
@@ -238,7 +238,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 if settings.TRUSTED_HOSTS != ["*"]:
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.TRUSTED_HOSTS)
+    app.add_middleware(ProbeAwareTrustedHostMiddleware, allowed_hosts=settings.TRUSTED_HOSTS)
 # RequestIdMiddleware가 가장 바깥 → 요청 진입 즉시 request_id 발급(에러 응답 포함 전 구간 전파).
 # GZip은 관측 미들웨어보다 바깥에 두어 압축 시간이 duration 측정을 오염시키지 않게 한다.
 # 보안 헤더·접근 로그·RED 메트릭은 한 겹(observability)으로 — 층당 task·스트림 할당 절감.
