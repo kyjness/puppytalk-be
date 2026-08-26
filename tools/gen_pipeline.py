@@ -315,7 +315,7 @@ bx("     /livez · /readyz 로 준비된 대상만       flush_interval -1 없�
 bx("        │                                   프록시 버퍼에 갇혀 실시간이 아니게 된다")
 bx("        ▼                                        │")
 bx("   앱 인스턴스 3~10대 · stateless           backend    gunicorn -w 2 · uvicorn worker")
-bx("   Celery 워커                              worker     celery · 큐 2종 · 동시 2")
+bx("   워커(arq)                                worker     arq · 큐 1종 · 동시 2")
 bx("        │                                   ★ 마이그레이션은 backend 에서만 —")
 bx("        │                                     worker 와 동시 실행 시 alembic 경합")
 bx("        ▼")
@@ -354,8 +354,9 @@ md(
     "master를 읽는다 | 방금 쓴 것은 제대로 보인다 |",
     "| S3 | confirm이 명확한 실패 응답. 예약 행이 남아 스위퍼가 회수 | "
     "이미지 업로드만 실패. 글쓰기·읽기는 정상 |",
-    "| Celery 브로커 | 같은 멱등 키로 인라인 발송 폴백. `enqueue` 소켓에 타임아웃이 걸려 있어 "
-    "요청이 매달리지 않는다 | 푸시가 한 번만 간다. 재시도가 없어질 뿐 |",
+    "| 워커 큐(arq) | 같은 멱등 키로 인라인 발송 폴백. 풀은 기동 때 만들고(연결) 소켓 "
+    "타임아웃을 직접 건다(명령) — 둘 다 있어야 먹통 Redis 에서 요청이 안 매달린다 | "
+    "푸시가 한 번만 간다. 재시도가 없어질 뿐 |",
     "| pubsub 리스너 | 0.5초 → 30초 백오프 재연결. 유휴 10초면 PING, pong이 5초 없으면 끊고 재연결 | "
     "재연결까지 다른 인스턴스발 메시지 유실. 같은 인스턴스 안 전달은 계속 |",
     "| DB가 먹통(응답 없음) | 프로브에 **이중 취소**로 상한. psycopg는 첫 `CancelledError`를 잡아 "
@@ -1351,18 +1352,20 @@ down()
 step(
     "④ ENQUEUE           푸시를 요청 밖으로",
     [
-        "워커가 꺼내 SNS 발송 · 3회까지 재시도",
+        "워커가 꺼내 SNS 발송 · 총 4회 시도(재시도 3)",
         "같은 알림은 멱등 키로 한 번만 배송",
     ],
-    ["──▶ [ Celery / Redis ]", "큐 high_priority", "→ [ AWS SNS ]", "", "task_ignore_result=True"],
+    ["──▶ [ arq / Redis ]", "큐 1종 · DB 인덱스 분리", "→ [ AWS SNS ]", "", "keep_result=0"],
     last=True,
 )
 notes(
-    "★ 브로커 장애 → 앱이 인라인 발송(같은 멱등 키)",
-    "★ .delay() 가 요청 경로라 소켓 타임아웃 필수 — 죽은 브로커에 매달리면 요청이 통째로",
-    "  멈춘다",
-    "★ 결과 백엔드를 껐다. ignore_result 가 아니면 .delay() 가 pubsub.subscribe 를",
-    "  여는데(Celery 기본 socket 120s · connect 무제한) 결과를 읽는 곳이 없다",
+    "★ 큐 장애 → 앱이 인라인 발송(같은 멱등 키)",
+    "★ 큐 핸들을 요청이 아니라 기동 때 만든다 — 요청 경로에서 만들면 죽은 Redis 에",
+    "  첫 알림이 연결 시도만큼 매달린다. 연결 재시도 1 회는 부팅 지연을 자른다",
+    "★ arq 는 명령 타임아웃을 안 건다(RedisSettings 에 필드가 없다) — 풀 생성 직후",
+    "  공용 socket_timeout 을 직접 건다. 없으면 먹통 Redis 에서 enqueue 가 무한 대기하고",
+    "  예외가 안 나 인라인 폴백도 발동하지 않는다 (ADR 0005)",
+    "★ 결과를 보관하지 않는다(keep_result=0) — 읽는 곳이 없다",
 )
 fbot(True)
 bx("")
@@ -1404,8 +1407,8 @@ stack(
     "| **저장소** | PostgreSQL writer / 목록은 reader | `notifications` — 여기가 진실 |",
     "| **로컬 전달** | 프로세스 메모리 큐 100건 · 넘치면 버린다 | 느린 클라이언트 격리 |",
     "| **인스턴스 간** | Redis Pub/Sub `notif:sse` | 채팅과 같은 봉투 규약 |",
-    "| **푸시** | Celery `high_priority` → AWS SNS · 3회 재시도 | "
-    "브로커 장애 시 인라인 폴백(같은 멱등 키) · `task_ignore_result=True` |",
+    "| **푸시** | arq 잡 → AWS SNS · 총 4회 시도(지수 백오프+지터) | "
+    "큐 장애 시 인라인 폴백(같은 멱등 키) · `keep_result=0` |",
     "| **순서** | 기록은 트랜잭션 안, 발행은 **반드시 커밋 이후** | 롤백 시 실체 없는 알림이 남지 않게 |",
     "| **프록시** | Caddy `flush_interval -1` | 없으면 SSE가 버퍼에 갇힌다 |",
 )

@@ -27,8 +27,11 @@
    구체값은 `REDIS_SOCKET_TIMEOUT`(1s)·`REDIS_SOCKET_CONNECT_TIMEOUT`(2s)이고, 설정 창구는
    `app/infra/redis.py::redis_connection_kwargs` **하나**다 — 클라이언트 생성부가 셋이라
    (앱 풀·구독 소켓·워커) 각자 쓰면 그중 하나만 옵션이 빠지는 식으로 조용히 갈라진다.
-   Celery 브로커·결과 백엔드는 `app/core/celery.py`에서 따로 설정하며 결과는 읽지 않으므로
-   `task_ignore_result`로 발행 시 결과 백엔드 구독 자체를 없앤다.
+   워커 큐(arq)는 자체 `RedisSettings`로 클라이언트를 만들어 이 창구를 안 거치는 **네 번째
+   생성부**다 — 그래서 변환을 같은 모듈(`arq_redis_settings`)에 가둬 창구를 하나로 유지하고,
+   연결 재시도도 1회로 자른다(enqueue가 요청 경로다). Celery 시절엔 `.delay()`가 결과 백엔드를
+   pubsub subscribe 하는 별도 위험이 있어 `task_ignore_result`로 막았는데, arq에는 그 구독이
+   아예 없어 위험이 구조적으로 사라졌다([ADR 0020](0020-worker-queue-arq.md)).
    **소켓 타임아웃이 못 덮는 곳이 하나 있다** — 구독 소켓의 폴 루프. redis-py의
    `get_message(timeout=…)`는 명시 타임아웃이 소켓 타임아웃을 덮어쓰고 `None`을 반환하므로,
    구독 성립 후 먹통이 되면 예외가 영영 안 난다. 그래서 리스너는 **앱 수준 워치독**(유휴 시

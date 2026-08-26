@@ -55,8 +55,9 @@
 | [0015](docs/adr/0015-index-migration-concurrently.md) | 라이브 테이블 인덱스는 **CONCURRENTLY** | 일반 `CREATE INDEX`(쓰기 잠금 → 사실상 다운타임) |
 | [0016](docs/adr/0016-comment-list-offset-pagination.md) | 댓글 루트 목록 = **offset + `total`**(인기순 복원) | keyset 강제(정렬 축 `like_count`가 변동값이라 커서 불성립) |
 | [0017](docs/adr/0017-demo-deployment-topology.md) | 라이브 데모 = **단일 인스턴스 compose** | 관리형 서비스(RDS·ElastiCache·ALB) — 쇼케이스 등급으로 한정 |
-| [0018](docs/adr/0018-background-work-tiers.md) | 백그라운드 작업 = **실패 비용 기준 3단 분리**(인라인 / lifespan 루프 / Celery) | "무거우면 일단 큐"(큐는 공짜가 아니라 운영 표면) · Celery Beat · result backend 소비 |
+| [0018](docs/adr/0018-background-work-tiers.md) | 백그라운드 작업 = **실패 비용 기준 3단 분리**(인라인 / lifespan 루프 / 작업 큐) | "무거우면 일단 큐"(큐는 공짜가 아니라 운영 표면) · 주기 스케줄러 · 잡 결과 보관 |
 | [0019](docs/adr/0019-storage-db-write-ordering.md) | S3·DB 쓰기 순서 — **요청은 DB만, 스토리지는 스위퍼**(객체는 행보다 늦게 생기고 먼저 사라진다) | 보상 삭제(실패하면 끝) · 목록 기반 GC · 표시 경로에 `deleted_at` 조건 추가 |
+| [0020](docs/adr/0020-worker-queue-arq.md) | 작업 큐 = **ARQ**(0018의 3등급 구현 교체) — 동기 Celery ↔ async 앱 어댑터 105줄 제거 | Celery 유지(유효 사유가 "자료가 두껍다" 하나뿐) · 큐 2종 이식 · 재시도 데코레이터(잡이 하나다) |
 
 > 횡단 관심사 종합은 [`docs/01-architecture.md`](docs/01-architecture.md), 리팩토링 진행·완료
 > 이력은 [`docs/ROADMAP.md`](docs/ROADMAP.md), 버그·최적화 백로그와 각 항목 근거는
@@ -73,7 +74,7 @@
 | 서버 | Uvicorn (dev) · Gunicorn + Uvicorn worker (prod) |
 | DB / ORM | PostgreSQL · psycopg3(async) · SQLAlchemy 2.x · Alembic |
 | 캐시·메시징 | Redis (asyncio) |
-| 비동기 작업(선택) | Celery — 알림 dispatch 등 큐 오프로딩 (`CELERY_ENABLED`) |
+| 비동기 작업(선택) | ARQ — 알림 SNS 배송 오프로딩 (`WORKER_ENABLED`) |
 | 스토리지 | S3 단일 경로 — 실서비스 AWS S3 / dev·CI는 MinIO (boto3, `run_in_threadpool`) |
 | 인증 | JWT(PyJWT) · bcrypt(+ pepper) |
 | 실시간 | WebSocket(DM) · SSE(알림) × Redis Pub/Sub |
@@ -120,7 +121,7 @@ app/
 ├── domain/            # admin · auth · chat · comments · dogs · likes · media
 │                      # · notifications · posts · reports · users
 ├── infra/             # Redis(refresh·rate limit·채팅·캐시), storage(S3/MinIO)
-└── worker/            # Celery 태스크(선택)
+└── worker/            # arq 워커 — settings(진입점)·jobs(잡 본문+재시도). 발행은 infra/queue
 
 docs/                  # 00(봉투)·01(아키텍처)·adr/·ROADMAP·backlog
 migrations/            # Alembic env.py + versions/
@@ -221,7 +222,7 @@ cp .env.example .env           # 3. 환경 변수 — DB_*, JWT_SECRET_KEY, REDI
 uv run poe migrate             # 4. DB 스키마 = alembic upgrade head (새 마이그레이션 생기면 재실행)
 uv run poe run                 # 5. 서버 http://localhost:8000 (문서 /v1/docs · 헬스 /v1/health)
 
-uv run poe celery-worker       # (선택) Celery — CELERY_ENABLED=true 일 때만
+uv run poe worker              # (선택) arq 워커 — WORKER_ENABLED=true 일 때만
 ```
 
 프로덕션 기동 시 `validate_settings_for_environment()`가 `JWT_SECRET_KEY`(placeholder 금지·32자+)와
@@ -294,7 +295,7 @@ uv run poe grant-admin --list                            # 현재 관리자 목�
 ## 배포
 
 공개 데모는 **인스턴스 한 대에서 compose로** 돕니다 — Caddy(TLS 종단) · API(gunicorn 2) ·
-Celery 워커 · PostgreSQL · Redis. 관리형 서비스(RDS·ElastiCache·ALB)를 쓰지 않는 대신 HA·자동
+워커(arq) · PostgreSQL · Redis. 관리형 서비스(RDS·ElastiCache·ALB)를 쓰지 않는 대신 HA·자동
 백업·무중단 배포를 포기한 **쇼케이스 등급** 배포이며, 그 판단은
 [ADR 0017](docs/adr/0017-demo-deployment-topology.md)에 있습니다. AWS 리소스는
 [인프라 레포의 `demo/`](https://github.com/kyjness/puppytalk-infra/tree/main/demo) terraform root가

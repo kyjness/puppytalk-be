@@ -125,7 +125,11 @@ async def lifespan(app: FastAPI):
         sys.exit(1)
     log.info("PostgreSQL 연결 성공.")
 
-    await init_redis(app)
+    from app.infra.queue import close_queue, init_queue
+
+    # 데이터 의존이 없는 두 Redis 연결이다 — 직렬로 두면 먹통 Redis에서 두 타임아웃이
+    # 더해져 부팅이 그만큼 늦다. 각자 예외를 삼키므로 gather가 안전하다.
+    await asyncio.gather(init_redis(app), init_queue())
 
     redis_client = get_app_redis(app)
     cleanup_jobs = _cleanup_jobs(redis_client)
@@ -200,6 +204,7 @@ async def lifespan(app: FastAPI):
     from app.domain.notifications.service import drain_sns_inline_tasks
 
     await drain_sns_inline_tasks()
+    await close_queue()
     await close_redis(app)
     await close_database()
 

@@ -1,7 +1,7 @@
 """알림 SNS 배송 오프로드 단위 테스트.
 
 실 브로커/SNS 없이 몽키패치로 라우팅 불변식을 검증한다:
-CELERY_ENABLED=true → 태스크 enqueue(결정적 멱등키) · enqueue 실패/비활성 → 인라인 폴백 ·
+큐 사용 가능 → 잡 enqueue(결정적 멱등키) · enqueue 실패/큐 없음 → 인라인 폴백 ·
 워커 잡·인라인 폴백 모두 publish 성공 후에만 같은 멱등 스토어에 마킹(교차 경로 이중 배송 차단).
 """
 
@@ -29,15 +29,17 @@ def _ids():
     return uuid.uuid4(), uuid.uuid4()
 
 
-class _RecordingTask:
+class _RecordingQueue:
+    """arq 풀 대역. 실 큐는 `enqueue_job(name, **kwargs)`를 await한다."""
+
     def __init__(self, fail: bool = False) -> None:
         self.calls: list[dict] = []
         self._fail = fail
 
-    def delay(self, **kwargs):
+    async def enqueue_job(self, name: str, **kwargs):
         if self._fail:
-            raise ConnectionError("broker down")
-        self.calls.append(kwargs)
+            raise ConnectionError("queue down")
+        self.calls.append({"name": name, **kwargs})
 
 
 def _event(recipient, nid) -> NotificationEvent:
@@ -65,20 +67,19 @@ def _capture_inline(monkeypatch) -> list[NotificationEvent]:
     return inline_calls
 
 
-async def test_dispatch_enqueues_celery_task_when_enabled(monkeypatch):
+async def test_dispatch_enqueues_job_when_queue_available(monkeypatch):
     recipient, nid = _ids()
-    task = _RecordingTask()
+    queue = _RecordingQueue()
     monkeypatch.setattr(settings, "SNS_TOPIC_ARN", "arn:aws:sns:test:topic")
-    monkeypatch.setattr(settings, "CELERY_ENABLED", True)
-    import app.worker.tasks.notifications as tasks_mod
-
-    monkeypatch.setattr(tasks_mod, "deliver_notification_sns", task)
+    monkeypatch.setattr(notif_service, "get_queue", lambda: queue)
     inline_calls = _capture_inline(monkeypatch)
 
     await _dispatch(recipient, nid)
 
-    assert len(task.calls) == 1
-    call = task.calls[0]
+    assert len(queue.calls) == 1
+    call = queue.calls[0]
+    # 잡 이름은 WorkerSettings.functions에 등록된 함수명이어야 워커가 찾는다.
+    assert call["name"] == "deliver_notification_sns"
     assert call["notification_id"] == uuid_to_base62(nid)
     assert call["user_id"] == uuid_to_base62(recipient)
     # 결정적 멱등키: 같은 알림의 중복 enqueue가 워커에서 1회 배송으로 수렴해야 한다.
@@ -89,20 +90,18 @@ async def test_dispatch_enqueues_celery_task_when_enabled(monkeypatch):
 async def test_dispatch_falls_back_inline_when_enqueue_fails(monkeypatch):
     recipient, nid = _ids()
     monkeypatch.setattr(settings, "SNS_TOPIC_ARN", "arn:aws:sns:test:topic")
-    monkeypatch.setattr(settings, "CELERY_ENABLED", True)
-    import app.worker.tasks.notifications as tasks_mod
-
-    monkeypatch.setattr(tasks_mod, "deliver_notification_sns", _RecordingTask(fail=True))
+    monkeypatch.setattr(notif_service, "get_queue", lambda: _RecordingQueue(fail=True))
     inline_calls = _capture_inline(monkeypatch)
 
     await _dispatch(recipient, nid)
     assert len(inline_calls) == 1
 
 
-async def test_dispatch_uses_inline_when_celery_disabled(monkeypatch):
+async def test_dispatch_uses_inline_when_queue_absent(monkeypatch):
+    """WORKER_ENABLED=false·Redis 부재·큐 기동 실패는 전부 get_queue() -> None으로 수렴한다."""
     recipient, nid = _ids()
     monkeypatch.setattr(settings, "SNS_TOPIC_ARN", "arn:aws:sns:test:topic")
-    monkeypatch.setattr(settings, "CELERY_ENABLED", False)
+    monkeypatch.setattr(notif_service, "get_queue", lambda: None)
     inline_calls = _capture_inline(monkeypatch)
 
     await _dispatch(recipient, nid)
@@ -112,7 +111,7 @@ async def test_dispatch_uses_inline_when_celery_disabled(monkeypatch):
 async def test_dispatch_noop_without_topic(monkeypatch):
     recipient, nid = _ids()
     monkeypatch.setattr(settings, "SNS_TOPIC_ARN", "")
-    monkeypatch.setattr(settings, "CELERY_ENABLED", True)
+    monkeypatch.setattr(notif_service, "get_queue", lambda: _RecordingQueue())
     inline_calls = _capture_inline(monkeypatch)
 
     await _dispatch(recipient, nid)
@@ -201,7 +200,7 @@ async def test_job_does_not_mark_idempotent_when_publish_fails(monkeypatch):
         await job.deliver_notification_sns_async(
             notification_id=str(nid), user_id=str(uid), idempotency_key="sns:test-key"
         )
-    # 마킹이 없어야 Celery 재시도가 멱등 skip으로 유실되지 않는다.
+    # 마킹이 없어야 워커 재시도가 멱등 skip으로 유실되지 않는다.
     assert client.set_calls == []
 
 

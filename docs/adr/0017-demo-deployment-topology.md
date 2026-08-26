@@ -16,7 +16,7 @@
 
 - **장시간 연결** — DM은 WebSocket(`app/domain/chat/manager.py`가 프로세스 메모리에 세션 보유),
   알림은 SSE. 유휴 시 잠드는 실행 모델과 맞지 않는다.
-- **상주 프로세스** — Celery 워커와 lifespan 주기 작업(조회수 flush · 미디어 정리).
+- **상주 프로세스** — 워커(arq)와 lifespan 주기 작업(조회수 flush · 미디어 정리).
 - **Redis · PostgreSQL 상시 가동** — 캐시·레이트리밋·pub/sub·조회수 버퍼가 전부 Redis 위에 있다.
 
 즉 "요청당 과금" 모델(Lambda 등)로는 요구를 못 맞추고, 맞추려 해도 상태 저장 계층을 관리형으로
@@ -47,7 +47,7 @@ ElastiCache)이다. **이 데모는 그 설계의 구현이 아니라, 같은 �
 
 **배포 등급을 "쇼케이스"로 명시하고, 관리형 서비스 없이 단일 인스턴스 compose로 돌린다.**
 
-1. **Lightsail 2GB 한 대**에 `compose.prod.yml` 전부 — Caddy · API(gunicorn 2) · Celery 워커 ·
+1. **Lightsail 2GB 한 대**에 `compose.prod.yml` 전부 — Caddy · API(gunicorn 2) · 워커(arq) ·
    PostgreSQL · Redis. 실측 유휴 메모리 합계 414MiB.
 2. **관리형 데이터 계층을 쓰지 않는다** — RDS 대신 postgres 컨테이너, ElastiCache 대신 redis
    컨테이너. RDS가 파는 것은 성능이 아니라 관리(백업·패치·페일오버)이므로, 이 축소로 잃는 것은
@@ -87,9 +87,9 @@ ElastiCache)이다. **이 데모는 그 설계의 구현이 아니라, 같은 �
 |---|---|
 | `terraform/` 운영 스택 그대로 apply | 월 $150~200. 트래픽 0인 데모에 정당화 불가 |
 | **ECS Fargate** | 서버리스가 되는 건 **컨테이너 실행뿐**이다. Fargate 태스크에는 영속 볼륨이 없어 PostgreSQL·Redis를 함께 담을 수 없고(EFS를 붙여도 DB를 얹을 물건이 아니다), 결국 **RDS + ElastiCache를 사야 한다**. 인터넷 노출에는 ALB(월 ~$16)가, 프라이빗 배치에는 NAT(월 ~$32)가 더 붙는다. 태스크 자체는 0.25 vCPU 기준 월 ~$9로 싸지만 **합계는 월 $60 이상**이다. 얻는 것(롤링 무중단 배포·오토스케일·노드 관리 없음)은 트래픽이 0인 데모에서 값을 못 한다 — 그 설계가 필요해지는 규모의 답은 `terraform/` 스택에 이미 코드로 있다 |
-| **Lambda + API Gateway** | 구조적으로 불가능하다. API Gateway는 응답을 버퍼링해 **SSE가 죽고**(Function URL의 응답 스트리밍은 Node.js 런타임 전용), WebSocket은 커넥션 저장소를 둔 전면 재작성이 필요하다. Celery 워커와 lifespan 주기 작업도 각각 SQS·EventBridge로 쪼개야 한다. 그러고도 RDS·ElastiCache(+커넥션 폭증 방지용 RDS Proxy)를 사야 해 **월 $40~55** |
+| **Lambda + API Gateway** | 구조적으로 불가능하다. API Gateway는 응답을 버퍼링해 **SSE가 죽고**(Function URL의 응답 스트리밍은 Node.js 런타임 전용), WebSocket은 커넥션 저장소를 둔 전면 재작성이 필요하다. 워커와 lifespan 주기 작업도 각각 SQS·EventBridge로 쪼개야 한다. 그러고도 RDS·ElastiCache(+커넥션 폭증 방지용 RDS Proxy)를 사야 해 **월 $40~55** |
 | **EC2 t4g.small** | 구조는 지금과 똑같은데 월 ~$22다. 고정 IP·디스크·전송이 요금에 포함된 Lightsail이 절반값이다. 대가로 IAM 인스턴스 롤을 잃었다(아래) |
-| Fly/Render + Neon + Upstash 조합 | Celery 브로커 폴링과 SSE pub/sub이 Upstash 무료 명령 한도를 빠르게 소진한다. 피하려면 `CELERY_ENABLED=false`로 두어야 하는데, 그러면 이 프로젝트의 핵심 경로를 데모에서 못 보여준다 |
+| Fly/Render + Neon + Upstash 조합 | 워커 큐 폴링과 SSE pub/sub이 Upstash 무료 명령 한도를 빠르게 소진한다. 피하려면 `WORKER_ENABLED=false`로 두어야 하는데, 그러면 이 프로젝트의 핵심 경로를 데모에서 못 보여준다 |
 
 > 정리하면 **VM 한 대에 다 몰면 PostgreSQL·Redis 비용이 0이 된다.** 실행 계층을 종량제로 바꾸는
 > 모든 대안은 이 둘을 유료 관리형으로 되사야 해서, 더 비싸지거나(Fargate·Lambda) 무료 한도에

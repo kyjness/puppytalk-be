@@ -1,5 +1,5 @@
 # 알림 REST + SSE. 목록/읽음은 ApiResponse, 스트림은 text/event-stream.
-# 오프라인 배송(SNS)은 알림 생성 시 서비스가 Celery로 오프로드한다 — 별도 재전달 API 없음.
+# 오프라인 배송(SNS)은 알림 생성 시 서비스가 워커 큐로 오프로드한다 — 별도 재전달 API 없음.
 
 from typing import Annotated
 
