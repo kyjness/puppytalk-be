@@ -53,6 +53,12 @@
 
 이 ADR의 메트릭·헬스 분리를 Ops 단계에서 구현하며, 결정 문구를 아래처럼 구체화했다.
 
+- **프로브는 Host 검사를 건너뛴다.** `/livez`·`/readyz`·`/metrics`를 부르는 것은 사용자가 아니라
+  인프라다 — Docker `HEALTHCHECK`는 컨테이너 안에서 `localhost`로, ALB·kubelet은 파드 IP로
+  때린다. 그 값들은 `TRUSTED_HOSTS`(공개 도메인 목록)에 들어갈 이유가 없고, 넣으면 Host 검사
+  범위만 넓어진다. 제외하지 않으면 **앱이 정상인데도 프로브가 400을 받아 영구 unhealthy**가
+  된다 — 첫 데모 배포에서 실제로 그랬다(`Host: api.puppytalk.shop` 200 / `Host: localhost` 400).
+  rate limit·관측 미들웨어가 이미 쓰던 `INFRA_PROBE_PATHS` 상수를 공유한다.
 - **헬스 분리 — DB=hard·Redis=soft.** `/livez`는 의존성 체크 없이 프로세스 생존만(실패=재시작),
   `/readyz`는 DB 실패 시에만 503(라우팅 제외)한다. 결정 문구는 readiness를 "DB·Redis ping"으로
   적었으나, **Redis는 fail-open**([ADR 0003](0003-distributed-rate-limit.md)·
