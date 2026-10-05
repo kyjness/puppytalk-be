@@ -24,7 +24,7 @@ dependencies = [
     "gunicorn>=21.0.0",
     # 상한은 arq가 강제한다(`redis[hiredis]<6`). 풀어 두면 락이 6.x를 잡아 arq 설치가 깨진다.
     "redis>=5.0.0,<6",
-    "pyjwt>=2.12.0,<3",
+    "pyjwt>=2.15.0,<3",
     "alembic>=1.13.0",
     "python-ulid>=2.7.0",
     "uuid7>=0.1.0",
@@ -74,7 +74,8 @@ ignore_names = ["nx", "ex", "seconds", "script", "numkeys", "field", "amount"]
 [tool.uv]
 constraint-dependencies = [
     "mako>=1.3.12",
-    "urllib3>=2.7.0",
+    "anyio>=4.14.2",
+    "urllib3>=2.8.0",
 ]
 
 # Poe the Poet: `uv sync --extra dev` 후 `uv run poe <task>` 로 실행 (내부는 python -m 고정).
