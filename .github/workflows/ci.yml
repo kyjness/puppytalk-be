@@ -71,12 +71,14 @@ jobs:
       AWS_REGION: ap-northeast-2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # 공식 minio 이미지는 `server /data` 인자가 필요해 GH service로 못 띄우므로 docker run으로 기동.
+      # minio 이미지는 `server /data` 인자가 필요해 GH service로 못 띄우므로 docker run으로 기동.
+      # 공식 minio/minio는 2026-09 Docker Hub·quay.io에서 내려갔다 → MinIO 소스를 그대로 빌드한
+      # Chainguard 이미지를 쓴다(무료 티어는 latest 태그만 제공).
       - name: Start MinIO
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data
+            cgr.dev/chainguard/minio:latest server /data
           for i in $(seq 1 30); do
             curl -sf http://localhost:9000/minio/health/ready && break
             sleep 1
