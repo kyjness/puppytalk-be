@@ -1,6 +1,6 @@
 """ADR 0010 — 실제 S3 API 경로를 MinIO에 태워 검증.
 
-S3_ENDPOINT_URL/S3_BUCKET_NAME이 없으면 skip → 로컬 pytest는 건너뛰고, CI(bitnami/minio 서비스 +
+S3_ENDPOINT_URL/S3_BUCKET_NAME이 없으면 skip → 로컬 pytest는 건너뛰고, CI(MinIO 컨테이너 +
 S3_* env)에서 실행된다. local 디스크 백엔드가 가리던 presign·copy 승격·키 프리픽스·path-style
 주소를 dev/CI가 비로소 자동 검증한다.
 """

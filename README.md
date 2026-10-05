@@ -212,6 +212,11 @@ docker compose down -v                # 중지 + 볼륨 초기화
 (minioadmin/minioadmin), 미디어 버킷(`puppytalk`)은 `minio-init`가 자동 생성·공개. 실 배포 이미지도
 같은 `Dockerfile`을 ECS/PaaS가 사용합니다.
 
+> MinIO 이미지는 Chainguard 빌드(`cgr.dev/chainguard/minio`, 비root)입니다 — 공식 `minio/minio`가
+> 2026-09 레지스트리에서 내려갔기 때문입니다. 공식 이미지(root) 시절의 `minio_data` 볼륨이 남아 있으면
+> 권한 오류로 기동하지 못하니 한 번 지우고 다시 띄우세요(로컬 업로드 이미지는 사라집니다):
+> `docker compose rm -sf minio && docker volume rm puppytalk_minio_data && docker compose up -d minio minio-init`
+
 **B. 수동 실행** — `dev.sh`가 하는 일을 손으로. Python 3.11+ 필요.
 
 ```bash
