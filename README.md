@@ -171,6 +171,7 @@ Dockerfile             # uv 멀티스테이지 · 비루트 · Gunicorn+Uvicorn
 - **CI/CD** (`.github/workflows/ci.yml`) — quality(lint·format·type·vulture) · test(`postgres:15`+`minio`로
   unit+integration) · security(`pip-audit`) · docker(통과 시 build, `main` push면 **GHCR** push)를 병렬 잡으로.
   실제 배포 대상(ECS)·인프라(ALB·RDS·ElastiCache·CloudWatch)는 인프라 레포(Terraform)에서 관리합니다.
+  `dependency-graph.yml`은 `main`의 `uv.lock`을 의존성 그래프에 제출해 보안 알림이 실제 버전을 따르게 합니다.
 
 ---
 
