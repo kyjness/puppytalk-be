@@ -39,8 +39,10 @@ services:
       timeout: 3s
       retries: 5
 
+  # 공식 minio/minio·minio/mc는 2026-09 Docker Hub·quay.io에서 내려갔다 → MinIO 소스를 그대로
+  # 빌드한 Chainguard 이미지로 대체. 무료 티어는 latest 태그만 제공한다.
   minio:
-    image: minio/minio:latest
+    image: cgr.dev/chainguard/minio:latest
     container_name: puppytalk-minio
     restart: unless-stopped
     ports:
@@ -57,7 +59,8 @@ services:
   # + pending/ 만료 1일 — confirm 안 된 presign 잔존물은 DB 행이 없어 앱 sweeper가 못 지운다.
   #   prod S3 lifecycle rule의 dev 등가(ADR 0010).
   minio-init:
-    image: minio/mc:latest
+    # latest는 셸이 없어 아래 sh 스크립트가 못 돈다 — 셸이 든 -dev 변형을 쓴다.
+    image: cgr.dev/chainguard/minio-client:latest-dev
     container_name: puppytalk-minio-init
     depends_on:
       - minio
