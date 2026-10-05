@@ -1,0 +1,27 @@
+name: Dependency Graph
+
+# uv.lock을 의존성 그래프에 직접 제출한다. Dependabot을 끈 뒤로는 그래프가 uv.lock 변경을
+# 따라오지 않아, 고친 취약점의 알림이 낡은 버전 기준으로 열려 있었다.
+# 알림은 기본 브랜치 기준이라 main만 제출한다.
+on:
+  push:
+    branches: [main]
+    paths: [uv.lock]
+  workflow_dispatch:
+
+permissions:
+  contents: write # Dependency submission API가 요구한다
+
+jobs:
+  submit:
+    name: uv.lock 제출
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: 스냅샷 생성·제출
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/uv_lock_snapshot.py \
+            | gh api -X POST "repos/${{ github.repository }}/dependency-graph/snapshots" --input -
