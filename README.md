@@ -1,8 +1,5 @@
 # PuppyTalk Backend
 
-> 🐕 **라이브 데모 — [puppytalk.shop](https://puppytalk.shop)**
-> API: [api.puppytalk.shop/v1/docs](https://api.puppytalk.shop/v1/docs) · 데모 계정은 로그인 화면의 *"데모 계정으로 둘러보기"*
-
 반려견 커뮤니티 서비스의 백엔드. **FastAPI(Full-Async)** 기반 REST API에 **WebSocket(DM)**·
 **SSE(알림)** 를 더한 서버입니다.
 
@@ -270,7 +267,6 @@ docker run -d --name pg -e POSTGRES_PASSWORD=PASSWORD -e POSTGRES_DB=puppytalk_t
 | 환경 | Swagger UI | ReDoc | OpenAPI JSON |
 |------|-----------|-------|--------------|
 | 로컬 | `/v1/docs` | `/v1/redoc` | `/v1/openapi.json` |
-| 프로덕션 | `https://api.puppytalk.shop/v1/docs` | `/v1/redoc` | `/v1/openapi.json` |
 
 응답·스펙 필드는 프론트 OpenAPI codegen 계약을 위해 **camelCase**로 노출됩니다.
 
